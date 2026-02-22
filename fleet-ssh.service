@@ -1,0 +1,20 @@
+[Unit]
+Description=fleet-ssh MCP server (streamable-http)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rmstxrx
+Group=rmstxrx
+WorkingDirectory=/home/rmstxrx/Development/mcp-ssh-fleet
+EnvironmentFile=/home/rmstxrx/Development/mcp-ssh-fleet/.env
+ExecStart=/home/rmstxrx/Development/mcp-ssh-fleet/.venv/bin/python server.py --transport streamable-http --port 8222 --host 127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+# SSH agent / ControlMaster needs HOME
+Environment=HOME=/home/rmstxrx
+
+[Install]
+WantedBy=multi-user.target

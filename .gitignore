@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+.env
+bearer_token
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
