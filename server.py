@@ -357,6 +357,16 @@ def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     return "\n".join(parts) or "[no output]"
 
 
+def _local_host_hint(tool_name: str) -> str:
+    """Soft guardrail: nudge agents to prefer native tools for local ops."""
+    return (
+        f"[NOTE: '{tool_name}' targeted apollyon, which is the LOCAL hub. "
+        "If you have native shell/file tools (e.g. bash_tool), prefer those "
+        "for local operations. If fleet-ssh is your only interface, disregard.]\n"
+    )
+
+
+
 async def _ssh_run(
     host_name: str,
     ssh_args: list[str],
@@ -526,7 +536,7 @@ async def ssh_exec(
             parts.append("sudo")
         parts.append(command)
         full_cmd = " ".join(parts)
-        return await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+        return _local_host_hint("ssh_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
     full_cmd = _wrap_command(config, command, cwd, sudo)
     return await _ssh_run(host, [full_cmd], timeout=timeout)
 
@@ -550,7 +560,7 @@ async def ssh_script(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+        return _local_host_hint("ssh_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
     lines = []
     if config.shell == HostShell.POWERSHELL:
         lines.append("$ErrorActionPreference = 'Stop'")
@@ -587,7 +597,7 @@ async def ssh_read_file(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_read_file(path, head=head, tail=tail)
+        return _local_host_hint("ssh_read_file") + _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
             cmd = f"Get-Content {shlex.quote(path)} -TotalCount {head}"
@@ -625,7 +635,7 @@ async def ssh_write_file(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_write_file(path, content, append=append, sudo=sudo)
+        return _local_host_hint("ssh_write_file") + _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
             cmd = f"$input | Out-File -Append -FilePath {shlex.quote(path)}"
@@ -658,7 +668,7 @@ async def ssh_upload(host: str, local_path: str, remote_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_copy(local_path, remote_path, upload=True)
+        return _local_host_hint("ssh_upload") + _local_copy(local_path, remote_path, upload=True)
     return await _scp_run(host, local_path, remote_path, upload=True)
 
 
@@ -675,7 +685,7 @@ async def ssh_download(host: str, remote_path: str, local_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_copy(remote_path, local_path, upload=False)
+        return _local_host_hint("ssh_download") + _local_copy(remote_path, local_path, upload=False)
     return await _scp_run(host, remote_path, local_path, upload=False)
 
 
@@ -728,6 +738,16 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+
+    # Audit logger — JSON-lines to ~/.fleet-ssh/audit.log
+    _audit_log_path = Path.home() / ".fleet-ssh" / "audit.log"
+    _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _audit_handler = logging.FileHandler(_audit_log_path)
+    _audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    _audit_logger = logging.getLogger("fleet-audit")
+    _audit_logger.addHandler(_audit_handler)
+    _audit_logger.setLevel(logging.INFO)
+    _audit_logger.propagate = False
 
     parser = argparse.ArgumentParser(description="fleet-ssh MCP server (Apollyon edition)")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")

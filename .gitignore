@@ -6,6 +6,7 @@ __pycache__/
 # Secrets
 .env
 bearer_token
+audit.log
 
 # IDE
 .vscode/
