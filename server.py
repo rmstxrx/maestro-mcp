@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-fleet v5 (Apollyon edition): MCP server for Rômulo's machine fleet + agent orchestra.
+Agent Orchestrator MCP (Apollyon edition).
 
-This is the Apollyon-hosted variant — designed to run as a persistent
+Multi-host fleet management + AI agent orchestra. Runs as a persistent
 streamable-http service behind a Cloudflare Tunnel, so Cowork (cloud VM)
 can reach the fleet over HTTPS.
 
-Differences from the Judas edition:
-  - Apollyon is the local host (direct subprocess, no SSH)
-  - Judas is a remote host (SSH to judas.home)
-  - Bearer token authentication for public-facing endpoint
+Topology:
+  - Apollyon is the local hub (direct subprocess, no SSH)
+  - Eden / Eden-WSL are remote (SSH)
+  - Judas is remote (SSH to judas.home)
+  - Bearer token + OAuth 2.0 authentication for public-facing endpoint
 """
 
 import asyncio
@@ -490,9 +491,9 @@ async def fleet_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "fleet",
+    "agent-orchestrator",
     instructions=(
-        "Unified multi-host server for Rômulo's machine fleet.\n"
+        "Agent Orchestrator MCP — multi-host fleet + AI agent dispatch.\n"
         "\n"
         "Available hosts:\n"
         "  apollyon  — DGX Spark GB10, 128GB. LOCAL (direct execution, no SSH).\n"
@@ -1434,7 +1435,7 @@ if __name__ == "__main__":
     _audit_logger.setLevel(logging.INFO)
     _audit_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="fleet MCP server (Apollyon edition)")
+    parser = argparse.ArgumentParser(description="Agent Orchestrator MCP (Apollyon edition)")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")
@@ -1481,7 +1482,7 @@ if __name__ == "__main__":
         app = FleetOAuthMiddleware(
             app=app,
             bearer_token=_expected_token,
-            issuer_url="https://fleet.rmstxrx.dev",
+            issuer_url="https://maestro.rmstxrx.dev",
         )
 
         logger.info(f"fleet: starting HTTP server on {args.host}:{args.port}")

@@ -1,5 +1,5 @@
 """
-fleet_oauth.py — OAuth 2.0 Authorization Code + PKCE for fleet-ssh.
+fleet_oauth.py — OAuth 2.0 Authorization Code + PKCE for Agent Orchestrator MCP.
 
 Single-user OAuth server designed for MCP connector authentication.
 The "authorize" page shows a simple approve/deny form since Rômulo is
@@ -233,7 +233,7 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>fleet-ssh — Authorize</title>
+    <title>Agent Orchestrator — Authorize</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{
@@ -314,8 +314,8 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
 </head>
 <body>
     <div class="card">
-        <h1>⚡ fleet-ssh</h1>
-        <p><span class="client">{client_name or client_id}</span> wants access to your fleet.</p>
+        <h1>⚡ Agent Orchestrator</h1>
+        <p><span class="client">{client_name or client_id}</span> wants access to the orchestrator.</p>
         <div class="perms">
             <strong>This will allow:</strong>
             <ul>
@@ -358,7 +358,7 @@ def _error_page(title: str, message: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>fleet-ssh — {title}</title>
+    <title>Agent Orchestrator — {title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{
@@ -394,7 +394,7 @@ def _success_page(redirect_url: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>fleet-ssh — Authorized</title>
+    <title>Agent Orchestrator — Authorized</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{
@@ -423,7 +423,7 @@ def _success_page(redirect_url: str) -> str:
 <body>
     <div class="card">
         <h1>\u2705 Authorized</h1>
-        <p>fleet-ssh access granted.</p>
+        <p>Agent Orchestrator access granted.</p>
         <p style="margin-top:1rem; color:#888;">
             <span class="spinner"></span>Completing handshake...
         </p>
@@ -447,7 +447,7 @@ def _success_page(redirect_url: str) -> str:
 
 
 class FleetOAuthMiddleware:
-    """ASGI middleware implementing OAuth 2.0 for fleet-ssh.
+    """ASGI middleware implementing OAuth 2.0 for Agent Orchestrator MCP.
 
     Intercepts OAuth-related paths before they reach the MCP app.
     All other paths require a valid Bearer token.

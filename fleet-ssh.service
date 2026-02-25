@@ -1,5 +1,5 @@
 [Unit]
-Description=fleet-ssh MCP server (streamable-http)
+Description=Agent Orchestrator MCP (streamable-http)
 After=network-online.target
 Wants=network-online.target
 
