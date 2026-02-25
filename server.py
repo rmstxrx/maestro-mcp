@@ -909,7 +909,7 @@ async def codex_execute(
 
     model_flag = f"--model {shlex.quote(model)} " if model else ""
     escaped_prompt = shlex.quote(prompt)
-    cli_cmd = f"codex exec --approval-mode full-auto --quiet {model_flag}{escaped_prompt}"
+    cli_cmd = f"codex exec --full-auto --json {model_flag}{escaped_prompt}"
 
     logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
 
