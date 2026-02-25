@@ -509,9 +509,14 @@ mcp = FastMCP(
         "  fleet_status   — Check connectivity of all hosts.\n"
         "\n"
         "Agent tools (dispatch tasks to AI coding agents):\n"
-        "  codex_execute      — Dispatch code task to OpenAI Codex CLI.\n"
-        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI.\n"
-        "  gemini_research    — Web research via Gemini + Google Search.\n"
+        "  codex_execute      — Dispatch code task to OpenAI Codex CLI (blocking).\n"
+        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI (blocking).\n"
+        "  gemini_research    — Web research via Gemini + Google Search (blocking).\n"
+        "  claude_execute     — Dispatch code task to Claude Code CLI (blocking).\n"
+        "  codex_dispatch     — Async Codex dispatch; returns task_id immediately.\n"
+        "  gemini_dispatch    — Async Gemini dispatch; returns task_id immediately.\n"
+        "  claude_dispatch    — Async Claude Code dispatch; returns task_id immediately.\n"
+        "  agent_poll         — Check status / retrieve result of an async task.\n"
         "  agent_read_output  — Read full output from a previous dispatch.\n"
         "  agent_status       — Check CLI availability on a host.\n"
         "\n"
@@ -521,7 +526,8 @@ mcp = FastMCP(
         "Prefer fleet_script over chained && commands.\n"
         "\n"
         "Agent principles: output saved to disk, summary returned inline.\n"
-        "Codex = executor (code changes). Gemini = analyst (comprehension).\n"
+        "Codex = executor (code). Gemini = analyst (comprehension). Claude = architect (reasoning).\n"
+        "Use *_execute for quick bounded tasks. Use *_dispatch + agent_poll for long tasks.\n"
     ),
     # NOTE: No per-session lifespan — SSH lifecycle is managed at the server
     # level by _serve_with_fleet_lifecycle(). A per-session lifespan would
@@ -763,6 +769,40 @@ CODEX_TIMEOUT = 300   # 5 min for code tasks
 GEMINI_TIMEOUT = 180  # 3 min for analysis
 MAX_INLINE_OUTPUT = 4000  # chars returned inline; rest stays on disk
 DEFAULT_REPO = str(Path.home() / "Development" / "relator.IA")
+
+
+CLAUDE_TIMEOUT = 300  # 5 min for Claude Code tasks
+TASK_EVICTION_SECONDS = 3600  # 1 hour
+
+
+@dataclass
+class TaskState:
+    task_id: str
+    agent: str            # "codex" | "gemini" | "claude"
+    host: str
+    prompt: str
+    status: str           # "running" | "done" | "failed" | "timeout"
+    started_at: datetime
+    finished_at: datetime | None = None
+    asyncio_task: asyncio.Task | None = None
+    output_file: Path | None = None
+    result_json: str | None = None
+
+
+TASK_REGISTRY: dict[str, TaskState] = {}
+
+
+def _evict_stale_tasks() -> None:
+    """Remove completed tasks older than TASK_EVICTION_SECONDS from registry."""
+    now = datetime.now(timezone.utc)
+    stale = [
+        tid for tid, ts in TASK_REGISTRY.items()
+        if ts.finished_at and (now - ts.finished_at).total_seconds() > TASK_EVICTION_SECONDS
+    ]
+    for tid in stale:
+        del TASK_REGISTRY[tid]
+    if stale:
+        logger.info(f"Orchestra: evicted {len(stale)} stale tasks from registry")
 
 
 def _orchestra_output_dir() -> Path:
@@ -1065,6 +1105,281 @@ async def agent_read_output(
         "has_more": start_line + max_lines < total,
         "content": "\n".join(selected),
     }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def claude_execute(
+    host: str,
+    prompt: str,
+    working_dir: str = DEFAULT_REPO,
+    max_budget_usd: float = 1.0,
+    allowed_tools: str = "Edit,Write,Bash(git:*),Read",
+    timeout: int = CLAUDE_TIMEOUT,
+) -> str:
+    """Dispatch a coding task to Claude Code CLI on a fleet host.
+
+    Claude Code runs in bypassPermissions mode with a dollar-budget cap.
+    Best for: multi-file refactoring, architectural changes, CLAUDE.md-aware
+    tasks, and anything requiring strong reasoning over large codebases.
+
+    Full output is saved to disk; a structured summary is returned.
+
+    Args:
+        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        prompt: The coding task. Be specific and scoped.
+        working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
+        max_budget_usd: Dollar cap per invocation (default $1.00).
+        allowed_tools: Comma-separated tool whitelist (default: Edit,Write,Bash(git:*),Read).
+        timeout: Max seconds to wait (default 300).
+    """
+    task_id = _orchestra_task_id(prompt)
+    output_file = _orchestra_output_path("claude", task_id)
+
+    escaped_prompt = shlex.quote(prompt)
+    escaped_tools = shlex.quote(allowed_tools)
+    escaped_dir = shlex.quote(working_dir)
+    cli_cmd = (
+        f"claude -p {escaped_prompt} --output-format json "
+        f"--permission-mode bypassPermissions "
+        f"--allowedTools {escaped_tools} "
+        f"--max-budget-usd {max_budget_usd} "
+        f"-C {escaped_dir}"
+    )
+
+    logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
+
+    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+
+    return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
+
+
+@mcp.tool()
+async def codex_dispatch(
+    host: str,
+    prompt: str,
+    working_dir: str = DEFAULT_REPO,
+    model: str = "",
+    timeout: int = CODEX_TIMEOUT,
+) -> str:
+    """Dispatch a coding task to Codex CLI asynchronously. Returns a task_id immediately.
+
+    Use agent_poll(task_id) to check progress and retrieve the result.
+    Best for long-running tasks where you don't want to block.
+
+    Args:
+        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        prompt: The coding task. Be specific and scoped.
+        working_dir: Git repo directory where Codex works.
+        model: Codex model (empty=default).
+        timeout: Max seconds for the background task (default 300).
+    """
+    task_id = secrets.token_hex(8)
+    output_file = _orchestra_output_path("codex", task_id)
+    now = datetime.now(timezone.utc)
+
+    ts = TaskState(
+        task_id=task_id,
+        agent="codex",
+        host=host,
+        prompt=prompt,
+        status="running",
+        started_at=now,
+        output_file=output_file,
+    )
+    TASK_REGISTRY[task_id] = ts
+
+    async def _run() -> None:
+        try:
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            escaped_prompt = shlex.quote(prompt)
+            cli_cmd = f"codex exec --full-auto --json {model_flag}{escaped_prompt}"
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            result = _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
+            ts.status = "done" if rc == 0 else "failed"
+            ts.result_json = result
+        except Exception as exc:
+            logger.warning(f"Orchestra: codex_dispatch [{task_id}] failed: {exc}")
+            ts.status = "failed"
+            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "codex"})
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+
+    ts.asyncio_task = asyncio.create_task(_run())
+    logger.info(f"Orchestra: codex_dispatch on {host} [{task_id}]: {prompt[:80]}...")
+    return json.dumps({"task_id": task_id, "agent": "codex", "host": host, "status": "running"})
+
+
+@mcp.tool()
+async def gemini_dispatch(
+    host: str,
+    prompt: str,
+    context_files: list[str] | None = None,
+    working_dir: str = DEFAULT_REPO,
+    model: str = "",
+    yolo: bool = False,
+    timeout: int = GEMINI_TIMEOUT,
+) -> str:
+    """Dispatch an analysis task to Gemini CLI asynchronously. Returns a task_id immediately.
+
+    Use agent_poll(task_id) to check progress and retrieve the result.
+    Best for large-context analysis where you don't want to block.
+
+    Args:
+        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        prompt: The analytical question or task.
+        context_files: File paths to include via @file syntax.
+        working_dir: Working directory for the invocation.
+        model: Gemini model (empty=default).
+        yolo: Enable write mode (default False = read-only).
+        timeout: Max seconds for the background task (default 180).
+    """
+    task_id = secrets.token_hex(8)
+    output_file = _orchestra_output_path("gemini", task_id)
+    now = datetime.now(timezone.utc)
+
+    ts = TaskState(
+        task_id=task_id,
+        agent="gemini",
+        host=host,
+        prompt=prompt,
+        status="running",
+        started_at=now,
+        output_file=output_file,
+    )
+    TASK_REGISTRY[task_id] = ts
+
+    async def _run() -> None:
+        try:
+            full_prompt = prompt
+            if context_files:
+                file_refs = " ".join(f"@{f}" for f in context_files)
+                full_prompt = f"{file_refs} {prompt}"
+            escaped_prompt = shlex.quote(full_prompt)
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            yolo_flag = "--yolo " if yolo else ""
+            cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            extracted = raw_output
+            try:
+                parsed = json.loads(raw_output)
+                if "response" in parsed:
+                    extracted = parsed["response"]
+                    if "stats" in parsed:
+                        models_info = parsed["stats"].get("models", {})
+                        token_summary = {
+                            m: {
+                                "prompt": d.get("tokens", {}).get("prompt", 0),
+                                "output": d.get("tokens", {}).get("candidates", 0),
+                            }
+                            for m, d in models_info.items()
+                        }
+                        extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+            result = _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
+            ts.status = "done" if rc == 0 else "failed"
+            ts.result_json = result
+        except Exception as exc:
+            logger.warning(f"Orchestra: gemini_dispatch [{task_id}] failed: {exc}")
+            ts.status = "failed"
+            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "gemini"})
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+
+    ts.asyncio_task = asyncio.create_task(_run())
+    logger.info(f"Orchestra: gemini_dispatch on {host} [{task_id}]: {prompt[:80]}...")
+    return json.dumps({"task_id": task_id, "agent": "gemini", "host": host, "status": "running"})
+
+
+@mcp.tool()
+async def claude_dispatch(
+    host: str,
+    prompt: str,
+    working_dir: str = DEFAULT_REPO,
+    max_budget_usd: float = 1.0,
+    allowed_tools: str = "Edit,Write,Bash(git:*),Read",
+    timeout: int = CLAUDE_TIMEOUT,
+) -> str:
+    """Dispatch a coding task to Claude Code CLI asynchronously. Returns a task_id immediately.
+
+    Use agent_poll(task_id) to check progress and retrieve the result.
+    Best for multi-file refactoring or architectural tasks that take minutes.
+
+    Args:
+        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        prompt: The coding task. Be specific and scoped.
+        working_dir: Git repo directory where Claude Code works.
+        max_budget_usd: Dollar cap per invocation (default $1.00).
+        allowed_tools: Comma-separated tool whitelist.
+        timeout: Max seconds for the background task (default 300).
+    """
+    task_id = secrets.token_hex(8)
+    output_file = _orchestra_output_path("claude", task_id)
+    now = datetime.now(timezone.utc)
+
+    ts = TaskState(
+        task_id=task_id,
+        agent="claude",
+        host=host,
+        prompt=prompt,
+        status="running",
+        started_at=now,
+        output_file=output_file,
+    )
+    TASK_REGISTRY[task_id] = ts
+
+    async def _run() -> None:
+        try:
+            escaped_prompt = shlex.quote(prompt)
+            escaped_tools = shlex.quote(allowed_tools)
+            escaped_dir = shlex.quote(working_dir)
+            cli_cmd = (
+                f"claude -p {escaped_prompt} --output-format json "
+                f"--permission-mode bypassPermissions "
+                f"--allowedTools {escaped_tools} "
+                f"--max-budget-usd {max_budget_usd} "
+                f"-C {escaped_dir}"
+            )
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+            result = _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
+            ts.status = "done" if rc == 0 else "failed"
+            ts.result_json = result
+        except Exception as exc:
+            logger.warning(f"Orchestra: claude_dispatch [{task_id}] failed: {exc}")
+            ts.status = "failed"
+            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "claude"})
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+
+    ts.asyncio_task = asyncio.create_task(_run())
+    logger.info(f"Orchestra: claude_dispatch on {host} [{task_id}]: {prompt[:80]}...")
+    return json.dumps({"task_id": task_id, "agent": "claude", "host": host, "status": "running"})
+
+
+@mcp.tool()
+async def agent_poll(task_id: str) -> str:
+    """Check the status of an async agent dispatch task.
+
+    Returns immediately with either the running status + elapsed time,
+    or the full structured result if the task has completed.
+
+    Args:
+        task_id: Task ID returned by a previous *_dispatch call.
+    """
+    _evict_stale_tasks()
+    if task_id not in TASK_REGISTRY:
+        return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
+    ts = TASK_REGISTRY[task_id]
+    if ts.status == "running":
+        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+        return json.dumps({
+            "task_id": task_id,
+            "agent": ts.agent,
+            "host": ts.host,
+            "status": "running",
+            "elapsed_seconds": round(elapsed, 1),
+        })
+    return ts.result_json
 
 
 # ---------------------------------------------------------------------------
