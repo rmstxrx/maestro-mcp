@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fleet v5 (Apollyon edition): MCP server for Rômulo's machine fleet + agent orchestra.
+fleet-ssh v4 (Apollyon edition): MCP server for Rômulo's machine fleet.
 
 This is the Apollyon-hosted variant — designed to run as a persistent
 streamable-http service behind a Cloudflare Tunnel, so Cowork (cloud VM)
@@ -16,7 +16,6 @@ import asyncio
 import argparse
 import hashlib
 import hmac
-import json
 import logging
 import os
 import secrets
@@ -26,14 +25,13 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-logger = logging.getLogger("fleet")
+logger = logging.getLogger("fleet-ssh")
 
 # ---------------------------------------------------------------------------
 # Host registry — Apollyon-centric topology
@@ -473,15 +471,15 @@ async def _scp_run(
 
 @asynccontextmanager
 async def fleet_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-    logger.info("fleet: warming up connections...")
+    logger.info("fleet-ssh: warming up connections...")
     results = await warmup_all_hosts()
     connected = sum(1 for v in results.values() if v)
     total = len(results)
-    logger.info(f"fleet: {connected}/{total} hosts connected")
+    logger.info(f"fleet-ssh: {connected}/{total} hosts connected")
     try:
         yield {"hosts": HOSTS, "warmup_results": results}
     finally:
-        logger.info("fleet: shutting down, closing connections...")
+        logger.info("fleet-ssh: shutting down, closing connections...")
         await teardown_all_hosts()
 
 
@@ -490,7 +488,7 @@ async def fleet_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "fleet",
+    "fleet-ssh",
     instructions=(
         "Unified multi-host server for Rômulo's machine fleet.\n"
         "\n"
@@ -500,28 +498,18 @@ mcp = FastMCP(
         "  eden-wsl  — Same physical machine as eden, but WSL2/Linux.\n"
         "  judas     — MacBook Pro M3 Max, 36GB. Remote (SSH).\n"
         "\n"
-        "Fleet tools (run commands on machines):\n"
-        "  fleet_exec     — Single command. Has cwd and sudo options.\n"
-        "  fleet_script   — Multi-line script piped via stdin. Use for sequences.\n"
-        "  fleet_read     — Read a text file. Supports line range slicing.\n"
-        "  fleet_write    — Write content to a file.\n"
-        "  fleet_upload / fleet_download — Transfer files between hosts.\n"
-        "  fleet_status   — Check connectivity of all hosts.\n"
-        "\n"
-        "Agent tools (dispatch tasks to AI coding agents):\n"
-        "  codex_execute      — Dispatch code task to OpenAI Codex CLI.\n"
-        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI.\n"
-        "  gemini_research    — Web research via Gemini + Google Search.\n"
-        "  agent_read_output  — Read full output from a previous dispatch.\n"
-        "  agent_status       — Check CLI availability on a host.\n"
+        "Tool guide:\n"
+        "  ssh_exec      — Single command. Has cwd and sudo options.\n"
+        "  ssh_script    — Multi-line script piped via stdin. Use for sequences.\n"
+        "  ssh_read_file — Read a text file. Supports line range slicing.\n"
+        "  ssh_write_file— Write content to a file.\n"
+        "  ssh_upload / ssh_download — SCP (remote) or copy (local) for file transfers.\n"
+        "  ssh_status    — Check connectivity of all hosts.\n"
         "\n"
         "Apollyon commands execute locally (zero overhead, no SSH).\n"
         "Use 'eden' for PowerShell, 'eden-wsl' for Linux on the same box.\n"
-        "Prefer fleet_read/fleet_write over scp for text files.\n"
-        "Prefer fleet_script over chained && commands.\n"
-        "\n"
-        "Agent principles: output saved to disk, summary returned inline.\n"
-        "Codex = executor (code changes). Gemini = analyst (comprehension).\n"
+        "Prefer ssh_read_file/ssh_write_file over scp for text files.\n"
+        "Prefer ssh_script over chained && commands.\n"
     ),
     # NOTE: No per-session lifespan — SSH lifecycle is managed at the server
     # level by _serve_with_fleet_lifecycle(). A per-session lifespan would
@@ -531,7 +519,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def fleet_exec(
+async def ssh_exec(
     host: str, command: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -551,13 +539,13 @@ async def fleet_exec(
             parts.append("sudo")
         parts.append(command)
         full_cmd = " ".join(parts)
-        return _local_host_hint("fleet_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+        return _local_host_hint("ssh_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
     full_cmd = _wrap_command(config, command, cwd, sudo)
     return await _ssh_run(host, [full_cmd], timeout=timeout)
 
 
 @mcp.tool()
-async def fleet_script(
+async def ssh_script(
     host: str, script: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -575,7 +563,7 @@ async def fleet_script(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+        return _local_host_hint("ssh_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
     lines = []
     if config.shell == HostShell.POWERSHELL:
         lines.append("$ErrorActionPreference = 'Stop'")
@@ -595,7 +583,7 @@ async def fleet_script(
 
 
 @mcp.tool()
-async def fleet_read(
+async def ssh_read_file(
     host: str, path: str, head: int | None = None,
     tail: int | None = None, timeout: int = TIMEOUT,
 ) -> str:
@@ -612,7 +600,7 @@ async def fleet_read(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_read") + _local_read_file(path, head=head, tail=tail)
+        return _local_host_hint("ssh_read_file") + _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
             cmd = f"Get-Content {shlex.quote(path)} -TotalCount {head}"
@@ -631,7 +619,7 @@ async def fleet_read(
 
 
 @mcp.tool()
-async def fleet_write(
+async def ssh_write_file(
     host: str, path: str, content: str, append: bool = False,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -650,7 +638,7 @@ async def fleet_write(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_write") + _local_write_file(path, content, append=append, sudo=sudo)
+        return _local_host_hint("ssh_write_file") + _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
             cmd = f"$input | Out-File -Append -FilePath {shlex.quote(path)}"
@@ -671,10 +659,10 @@ async def fleet_write(
 
 
 @mcp.tool()
-async def fleet_upload(host: str, local_path: str, remote_path: str) -> str:
+async def ssh_upload(host: str, local_path: str, remote_path: str) -> str:
     """Upload a file to a remote host via SCP.
 
-    Use for binary files or large transfers. For text files, prefer fleet_write.
+    Use for binary files or large transfers. For text files, prefer ssh_write_file.
 
     Args:
         host: Target host. One of: apollyon, eden, eden-wsl, judas
@@ -683,15 +671,15 @@ async def fleet_upload(host: str, local_path: str, remote_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_upload") + _local_copy(local_path, remote_path, upload=True)
+        return _local_host_hint("ssh_upload") + _local_copy(local_path, remote_path, upload=True)
     return await _scp_run(host, local_path, remote_path, upload=True)
 
 
 @mcp.tool()
-async def fleet_download(host: str, remote_path: str, local_path: str) -> str:
+async def ssh_download(host: str, remote_path: str, local_path: str) -> str:
     """Download a file from a remote host via SCP.
 
-    Use for binary files or large transfers. For text files, prefer fleet_read.
+    Use for binary files or large transfers. For text files, prefer ssh_read_file.
 
     Args:
         host: Target host. One of: apollyon, eden, eden-wsl, judas
@@ -700,12 +688,12 @@ async def fleet_download(host: str, remote_path: str, local_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_download") + _local_copy(remote_path, local_path, upload=False)
+        return _local_host_hint("ssh_download") + _local_copy(remote_path, local_path, upload=False)
     return await _scp_run(host, remote_path, local_path, upload=False)
 
 
 @mcp.tool()
-async def fleet_status() -> str:
+async def ssh_status() -> str:
     """Check connectivity status of all SSH hosts.
 
     Tests each host's ControlMaster socket and re-warms connections
@@ -745,329 +733,6 @@ async def fleet_status() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agent Orchestra — CLI agent dispatch tools
-#
-# Higher-level tools that dispatch tasks to Codex CLI and Gemini CLI.
-# Claude acts as stateful coordinator; these CLIs are stateless executors.
-#
-# Design principles:
-#   - Output discipline: full output saved to disk, structured summary returned
-#   - Fat prompt in, structured result out (CLIs are stateless)
-#   - Scope discipline: tight, bounded prompts for Codex
-#   - File-mediated handoffs: large outputs on disk, read selectively
-# ---------------------------------------------------------------------------
-
-# Orchestra constants
-ORCHESTRA_OUTPUT_DIR = Path.home() / ".agent-orchestra" / "outputs"
-CODEX_TIMEOUT = 300   # 5 min for code tasks
-GEMINI_TIMEOUT = 180  # 3 min for analysis
-MAX_INLINE_OUTPUT = 4000  # chars returned inline; rest stays on disk
-DEFAULT_REPO = str(Path.home() / "Development" / "relator.IA")
-
-
-def _orchestra_output_dir() -> Path:
-    """Ensure orchestra output directory exists."""
-    ORCHESTRA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return ORCHESTRA_OUTPUT_DIR
-
-
-def _orchestra_output_path(agent: str, task_id: str) -> Path:
-    """Generate a unique output file path for a CLI invocation."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return _orchestra_output_dir() / f"{agent}_{ts}_{task_id}.txt"
-
-
-def _orchestra_task_id(prompt: str) -> str:
-    """Short hash of prompt for file naming."""
-    return hashlib.sha256(prompt.encode()).hexdigest()[:8]
-
-
-def _orchestra_truncate(text: str, max_len: int = MAX_INLINE_OUTPUT) -> tuple[str, bool]:
-    """Truncate text, return (text, was_truncated)."""
-    if len(text) <= max_len:
-        return text, False
-    return text[:max_len] + "\n... [truncated]", True
-
-
-def _orchestra_build_result(
-    agent: str,
-    host: str,
-    prompt: str,
-    raw_output: str,
-    return_code: int,
-    output_file: Path,
-) -> str:
-    """
-    Build structured result. Full output saved to disk, summary returned inline.
-    This is the key output-discipline mechanism.
-    """
-    output_file.write_text(
-        f"=== AGENT: {agent} | HOST: {host} ===\n"
-        f"=== PROMPT ===\n{prompt}\n\n"
-        f"=== OUTPUT ===\n{raw_output}\n",
-        encoding="utf-8",
-    )
-
-    preview, was_truncated = _orchestra_truncate(raw_output)
-    success = return_code == 0
-
-    result = {
-        "agent": agent,
-        "host": host,
-        "success": success,
-        "return_code": return_code,
-        "output_file": str(output_file),
-        "output_preview": preview,
-        "truncated": was_truncated,
-        "output_bytes": len(raw_output),
-    }
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-async def _orchestra_run_cli(
-    host: str,
-    cli_command: str,
-    timeout: int,
-    cwd: str | None = None,
-) -> tuple[int, str]:
-    """
-    Run a CLI command on the specified host using existing fleet primitives.
-    Returns (return_code_estimate, combined_output).
-    """
-    config = _resolve_host(host)
-
-    if config.is_local:
-        result = await _local_run(cli_command, timeout=timeout, cwd=cwd)
-    else:
-        full_cmd = _wrap_command(config, cli_command, cwd, sudo=False)
-        result = await _ssh_run(host, [full_cmd], timeout=timeout)
-
-    # Estimate return code from result text
-    rc = 0
-    if "[exit code:" in result:
-        try:
-            rc = int(result.split("[exit code:")[1].split("]")[0].strip())
-        except (ValueError, IndexError):
-            rc = 1
-    if result.startswith("[SSH error") or result.startswith("[failed after"):
-        rc = 1
-    if "timeout" in result.lower() and rc == 0:
-        rc = -1
-
-    return rc, result
-
-
-@mcp.tool()
-async def agent_status(host: str = "apollyon") -> str:
-    """Check availability of Codex CLI and Gemini CLI on a fleet host.
-
-    Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
-    """
-    _resolve_host(host)
-
-    codex_rc, codex_out = await _orchestra_run_cli(host, "codex --version 2>&1", timeout=10)
-    gemini_rc, gemini_out = await _orchestra_run_cli(host, "gemini --version 2>&1", timeout=10)
-
-    output_dir = _orchestra_output_dir()
-    recent = sorted(output_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
-
-    return json.dumps({
-        "host": host,
-        "codex": {"available": codex_rc == 0, "output": codex_out.strip()[:200]},
-        "gemini": {"available": gemini_rc == 0, "output": gemini_out.strip()[:200]},
-        "output_dir": str(output_dir),
-        "recent_outputs": [{"name": f.name, "size": f.stat().st_size} for f in recent],
-    }, indent=2)
-
-
-@mcp.tool()
-async def codex_execute(
-    host: str,
-    prompt: str,
-    working_dir: str = DEFAULT_REPO,
-    model: str = "",
-    timeout: int = CODEX_TIMEOUT,
-) -> str:
-    """Dispatch a coding task to OpenAI Codex CLI on a fleet host.
-
-    Codex runs in full-auto mode. It can read files, edit code, run
-    commands, and execute tests. Best for: feature implementation,
-    refactoring, bug fixes, test generation.
-
-    Full output is saved to disk; a structured summary is returned.
-
-    Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
-        prompt: The coding task. Be specific and scoped.
-        working_dir: Git repo directory where Codex works.
-        model: Codex model (empty=default, 'gpt-5-codex-mini', 'gpt-5.1-codex-max').
-        timeout: Max seconds to wait (default 300).
-    """
-    task_id = _orchestra_task_id(prompt)
-    output_file = _orchestra_output_path("codex", task_id)
-
-    model_flag = f"--model {shlex.quote(model)} " if model else ""
-    escaped_prompt = shlex.quote(prompt)
-    cli_cmd = f"codex exec --approval-mode full-auto --quiet {model_flag}{escaped_prompt}"
-
-    logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
-
-
-@mcp.tool()
-async def gemini_analyze(
-    host: str,
-    prompt: str,
-    context_files: list[str] | None = None,
-    working_dir: str = DEFAULT_REPO,
-    model: str = "",
-    yolo: bool = False,
-    timeout: int = GEMINI_TIMEOUT,
-) -> str:
-    """Dispatch an analysis task to Google Gemini CLI on a fleet host.
-
-    Gemini runs in headless mode (read-only by default). Best for:
-    large-context codebase analysis, architectural review, document
-    comparison, pattern identification across many files.
-
-    Full output is saved to disk; a structured summary is returned.
-
-    Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
-        prompt: The analytical question or task.
-        context_files: File paths to include via @file syntax (leverages 1M context).
-        working_dir: Working directory for the invocation.
-        model: Gemini model (empty=default).
-        yolo: Enable write mode (default False = read-only, safer).
-        timeout: Max seconds to wait (default 180).
-    """
-    task_id = _orchestra_task_id(prompt)
-    output_file = _orchestra_output_path("gemini", task_id)
-
-    full_prompt = prompt
-    if context_files:
-        file_refs = " ".join(f"@{f}" for f in context_files)
-        full_prompt = f"{file_refs} {prompt}"
-
-    escaped_prompt = shlex.quote(full_prompt)
-    model_flag = f"--model {shlex.quote(model)} " if model else ""
-    yolo_flag = "--yolo " if yolo else ""
-    cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
-
-    logger.info(f"Orchestra: gemini_analyze on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    # Extract response from Gemini JSON envelope
-    extracted = raw_output
-    try:
-        parsed = json.loads(raw_output)
-        if "response" in parsed:
-            extracted = parsed["response"]
-            if "stats" in parsed:
-                models_info = parsed["stats"].get("models", {})
-                token_summary = {
-                    m: {
-                        "prompt": d.get("tokens", {}).get("prompt", 0),
-                        "output": d.get("tokens", {}).get("candidates", 0),
-                    }
-                    for m, d in models_info.items()
-                }
-                extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-
-    return _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
-
-
-@mcp.tool()
-async def gemini_research(
-    host: str,
-    query: str,
-    timeout: int = GEMINI_TIMEOUT,
-) -> str:
-    """Dispatch a web research task to Gemini CLI with Google Search grounding.
-
-    Best for: jurisprudencia research, technical documentation lookup,
-    current events, regulatory changes.
-
-    Full output is saved to disk; a structured summary is returned.
-
-    Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
-        query: Research query (Gemini uses Google Search grounding).
-        timeout: Max seconds to wait (default 180).
-    """
-    task_id = _orchestra_task_id(query)
-    output_file = _orchestra_output_path("gemini_research", task_id)
-
-    research_prompt = (
-        f"Research the following topic thoroughly using web search. "
-        f"Provide a comprehensive answer with sources.\n\n{query}"
-    )
-    escaped = shlex.quote(research_prompt)
-    cli_cmd = f"gemini -p {escaped} --output-format json"
-
-    logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {query[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
-
-    extracted = raw_output
-    try:
-        parsed = json.loads(raw_output)
-        if "response" in parsed:
-            extracted = parsed["response"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-
-    return _orchestra_build_result("gemini", host, query, extracted, rc, output_file)
-
-
-@mcp.tool()
-async def agent_read_output(
-    file_path: str,
-    start_line: int = 0,
-    max_lines: int = 200,
-) -> str:
-    """Read full or partial output from a previous agent invocation.
-
-    When a codex_execute or gemini_analyze result was truncated,
-    use this to read the full output selectively with pagination.
-
-    Args:
-        file_path: Absolute path to output file (from previous tool results).
-        start_line: Start reading from this line (0-indexed).
-        max_lines: Maximum lines to return (1-1000).
-    """
-    fp = Path(file_path)
-
-    try:
-        fp.resolve().relative_to(ORCHESTRA_OUTPUT_DIR.resolve())
-    except ValueError:
-        return json.dumps({"error": f"Access denied: only files in {ORCHESTRA_OUTPUT_DIR}"})
-
-    if not fp.exists():
-        return json.dumps({"error": f"File not found: {file_path}"})
-
-    lines = fp.read_text(encoding="utf-8").splitlines()
-    total = len(lines)
-    selected = lines[start_line : start_line + max_lines]
-
-    return json.dumps({
-        "file": str(fp),
-        "total_lines": total,
-        "start_line": start_line,
-        "lines_returned": len(selected),
-        "has_more": start_line + max_lines < total,
-        "content": "\n".join(selected),
-    }, indent=2, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1087,7 +752,7 @@ if __name__ == "__main__":
     _audit_logger.setLevel(logging.INFO)
     _audit_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="fleet MCP server (Apollyon edition)")
+    parser = argparse.ArgumentParser(description="fleet-ssh MCP server (Apollyon edition)")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")
@@ -1137,20 +802,20 @@ if __name__ == "__main__":
             issuer_url="https://fleet.rmstxrx.dev",
         )
 
-        logger.info(f"fleet: starting HTTP server on {args.host}:{args.port}")
+        logger.info(f"fleet-ssh: starting HTTP server on {args.host}:{args.port}")
 
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
         server = uvicorn.Server(config)
 
         async def _serve_with_fleet_lifecycle() -> None:
-            logger.info("fleet: warming up connections...")
+            logger.info("fleet-ssh: warming up connections...")
             results = await warmup_all_hosts()
             connected = sum(1 for v in results.values() if v)
-            logger.info(f"fleet: {connected}/{len(results)} hosts connected")
+            logger.info(f"fleet-ssh: {connected}/{len(results)} hosts connected")
             try:
                 await server.serve()
             finally:
-                logger.info("fleet: shutting down, closing connections...")
+                logger.info("fleet-ssh: shutting down, closing connections...")
                 await teardown_all_hosts()
 
         asyncio.run(_serve_with_fleet_lifecycle())
