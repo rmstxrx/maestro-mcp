@@ -773,6 +773,7 @@ DEFAULT_REPO = str(Path.home() / "Development" / "relator.IA")
 
 CLAUDE_TIMEOUT = 300  # 5 min for Claude Code tasks
 TASK_EVICTION_SECONDS = 3600  # 1 hour
+TASK_OUTPUT_RETENTION_SECONDS = 86400  # 24h before output files are deleted
 
 
 @dataclass
@@ -790,19 +791,46 @@ class TaskState:
 
 
 TASK_REGISTRY: dict[str, TaskState] = {}
+_REGISTRY_LOCK = asyncio.Lock()
+_EVICTION_TASK: asyncio.Task | None = None
 
 
-def _evict_stale_tasks() -> None:
-    """Remove completed tasks older than TASK_EVICTION_SECONDS from registry."""
+async def _evict_stale_tasks() -> None:
+    """Remove completed tasks older than TASK_EVICTION_SECONDS from registry.
+
+    Cancels any lingering asyncio tasks and cleans up old output files.
+    """
     now = datetime.now(timezone.utc)
-    stale = [
-        tid for tid, ts in TASK_REGISTRY.items()
-        if ts.finished_at and (now - ts.finished_at).total_seconds() > TASK_EVICTION_SECONDS
-    ]
-    for tid in stale:
-        del TASK_REGISTRY[tid]
+    async with _REGISTRY_LOCK:
+        stale = [
+            tid for tid, ts in TASK_REGISTRY.items()
+            if ts.finished_at and (now - ts.finished_at).total_seconds() > TASK_EVICTION_SECONDS
+        ]
+        for tid in stale:
+            ts = TASK_REGISTRY.pop(tid)
+            # Cancel lingering asyncio task (should already be done, but be safe)
+            if ts.asyncio_task and not ts.asyncio_task.done():
+                ts.asyncio_task.cancel()
+            # Delete output files older than retention period
+            if ts.output_file and ts.output_file.exists():
+                try:
+                    age = (now - ts.started_at).total_seconds()
+                    if age > TASK_OUTPUT_RETENTION_SECONDS:
+                        ts.output_file.unlink()
+                except OSError:
+                    pass
     if stale:
         logger.info(f"Orchestra: evicted {len(stale)} stale tasks from registry")
+
+
+async def _periodic_eviction() -> None:
+    """Background loop that evicts stale tasks every 10 minutes."""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await _evict_stale_tasks()
+        except Exception:
+            logger.exception("Orchestra: periodic eviction failed")
 
 
 def _orchestra_output_dir() -> Path:
@@ -949,7 +977,7 @@ async def codex_execute(
 
     model_flag = f"--model {shlex.quote(model)} " if model else ""
     escaped_prompt = shlex.quote(prompt)
-    cli_cmd = f"codex exec --full-auto --json {model_flag}{escaped_prompt}"
+    cli_cmd = f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
 
     logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
 
@@ -1186,19 +1214,20 @@ async def codex_dispatch(
         started_at=now,
         output_file=output_file,
     )
-    TASK_REGISTRY[task_id] = ts
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
 
     async def _run() -> None:
         try:
             model_flag = f"--model {shlex.quote(model)} " if model else ""
             escaped_prompt = shlex.quote(prompt)
-            cli_cmd = f"codex exec --full-auto --json {model_flag}{escaped_prompt}"
+            cli_cmd = f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             result = _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
             ts.status = "done" if rc == 0 else "failed"
             ts.result_json = result
         except Exception as exc:
-            logger.warning(f"Orchestra: codex_dispatch [{task_id}] failed: {exc}")
+            logger.exception(f"Orchestra: codex_dispatch [{task_id}] failed")
             ts.status = "failed"
             ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "codex"})
         finally:
@@ -1246,7 +1275,8 @@ async def gemini_dispatch(
         started_at=now,
         output_file=output_file,
     )
-    TASK_REGISTRY[task_id] = ts
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
 
     async def _run() -> None:
         try:
@@ -1280,7 +1310,7 @@ async def gemini_dispatch(
             ts.status = "done" if rc == 0 else "failed"
             ts.result_json = result
         except Exception as exc:
-            logger.warning(f"Orchestra: gemini_dispatch [{task_id}] failed: {exc}")
+            logger.exception(f"Orchestra: gemini_dispatch [{task_id}] failed")
             ts.status = "failed"
             ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "gemini"})
         finally:
@@ -1326,7 +1356,8 @@ async def claude_dispatch(
         started_at=now,
         output_file=output_file,
     )
-    TASK_REGISTRY[task_id] = ts
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
 
     async def _run() -> None:
         try:
@@ -1345,7 +1376,7 @@ async def claude_dispatch(
             ts.status = "done" if rc == 0 else "failed"
             ts.result_json = result
         except Exception as exc:
-            logger.warning(f"Orchestra: claude_dispatch [{task_id}] failed: {exc}")
+            logger.exception(f"Orchestra: claude_dispatch [{task_id}] failed")
             ts.status = "failed"
             ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "claude"})
         finally:
@@ -1366,10 +1397,11 @@ async def agent_poll(task_id: str) -> str:
     Args:
         task_id: Task ID returned by a previous *_dispatch call.
     """
-    _evict_stale_tasks()
-    if task_id not in TASK_REGISTRY:
+    await _evict_stale_tasks()
+    async with _REGISTRY_LOCK:
+        ts = TASK_REGISTRY.get(task_id)
+    if ts is None:
         return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
-    ts = TASK_REGISTRY[task_id]
     if ts.status == "running":
         elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
         return json.dumps({
@@ -1458,13 +1490,17 @@ if __name__ == "__main__":
         server = uvicorn.Server(config)
 
         async def _serve_with_fleet_lifecycle() -> None:
+            global _EVICTION_TASK
             logger.info("fleet: warming up connections...")
             results = await warmup_all_hosts()
             connected = sum(1 for v in results.values() if v)
             logger.info(f"fleet: {connected}/{len(results)} hosts connected")
+            _EVICTION_TASK = asyncio.create_task(_periodic_eviction())
             try:
                 await server.serve()
             finally:
+                if _EVICTION_TASK:
+                    _EVICTION_TASK.cancel()
                 logger.info("fleet: shutting down, closing connections...")
                 await teardown_all_hosts()
 
