@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent Orchestrator MCP (streamable-http)
+Description=Maestro MCP (streamable-http)
 After=network-online.target
 Wants=network-online.target
 

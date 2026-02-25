@@ -1,5 +1,5 @@
 """
-fleet_oauth.py — OAuth 2.0 Authorization Code + PKCE for fleet-ssh.
+maestro_oauth.py — OAuth 2.0 Authorization Code + PKCE for Maestro MCP.
 
 Single-user OAuth server designed for MCP connector authentication.
 The "authorize" page shows a simple approve/deny form since Rômulo is
@@ -13,12 +13,12 @@ Implements:
   /oauth/token                             — Token endpoint (code → per-client JWT)
 
 Security features:
-  - Registration gated by FLEET_REGISTRATION_SECRET env var
+  - Registration gated by MAESTRO_REGISTRATION_SECRET env var
   - Per-client JWTs with expiry (no shared static token)
   - S256-only PKCE (plain method rejected)
   - CSRF protection on authorize form
   - In-memory sliding window rate limiter on auth endpoints
-  - Structured audit logging (JSON-lines to fleet-audit logger)
+  - Structured audit logging (JSON-lines to maestro-audit logger)
   - Fail-closed when no signing key is configured
 
 All state (clients, auth codes, CSRF tokens) is in-memory and ephemeral.
@@ -41,8 +41,8 @@ import jwt
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-logger = logging.getLogger("fleet-oauth")
-audit_logger = logging.getLogger("fleet-audit")
+logger = logging.getLogger("maestro-oauth")
+audit_logger = logging.getLogger("maestro-audit")
 
 # ---------------------------------------------------------------------------
 # Security configuration
@@ -53,7 +53,8 @@ JWT_EXPIRY_SECONDS = 8 * 3600  # 8 hours
 MAX_REGISTERED_CLIENTS = 20
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX_REQUESTS = 10  # per window per IP per endpoint
-REGISTRATION_SECRET = os.environ.get("FLEET_REGISTRATION_SECRET")
+REGISTRATION_SECRET = os.environ.get("MAESTRO_REGISTRATION_SECRET")
+AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")  # SHA-256 of the PIN
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,14 @@ def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
     return hmac.compare_digest(expected, challenge)
 
 
+def _verify_authorize_pin(pin: str) -> bool:
+    """Verify the authorize PIN against stored hash."""
+    if not AUTHORIZE_PIN_HASH:
+        return True  # No PIN configured = no gate (backward compat)
+    pin_hash = hashlib.sha256(pin.encode()).hexdigest()
+    return hmac.compare_digest(pin_hash, AUTHORIZE_PIN_HASH)
+
+
 # ---------------------------------------------------------------------------
 # Authorization page HTML
 # ---------------------------------------------------------------------------
@@ -224,7 +233,7 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>fleet-ssh — Authorize</title>
+    <title>Maestro — Authorize</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {{
@@ -294,12 +303,19 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
         .deny:hover {{
             background: #3a3a5a;
         }}
+        .pin-field {{
+            margin: 1rem 0 0.5rem 0;
+        }}
+        .pin-field label {{
+            font-size: 0.9rem;
+            color: #aaa;
+        }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>⚡ fleet-ssh</h1>
-        <p><span class="client">{client_name or client_id}</span> wants access to your fleet.</p>
+        <h1>⚡ Maestro</h1>
+        <p><span class="client">{client_name or client_id}</span> wants access to Maestro.</p>
         <div class="perms">
             <strong>This will allow:</strong>
             <ul>
@@ -315,6 +331,14 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
             <input type="hidden" name="code_challenge" value="{code_challenge}">
             <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <div class="pin-field">
+                <label for="pin">Authorization PIN:</label>
+                <input type="password" id="pin" name="pin" placeholder="Enter PIN"
+                       autocomplete="off" required
+                       style="width:100%; padding:0.6rem; border:1px solid #2a2a4a;
+                              border-radius:6px; background:#12122a; color:#e0e0e0;
+                              font-family:monospace; font-size:1rem; margin-top:0.4rem;">
+            </div>
             <div class="buttons">
                 <button type="submit" name="action" value="deny" class="deny">Deny</button>
                 <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -329,8 +353,101 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
 # FleetOAuthMiddleware
 # ---------------------------------------------------------------------------
 
-class FleetOAuthMiddleware:
-    """ASGI middleware implementing OAuth 2.0 for fleet-ssh.
+def _error_page(title: str, message: str) -> str:
+    """Render a styled error page."""
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Maestro — {title}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a1a; color: #e0e0e0;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+        }}
+        .card {{
+            background: #1a1a2e; border: 1px solid #ff4444;
+            border-radius: 12px; padding: 2rem; max-width: 400px;
+            width: 90%; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+            text-align: center;
+        }}
+        h1 {{ font-size: 1.3rem; color: #ff4444; margin: 0 0 1rem 0; }}
+        a {{ color: #00d4ff; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>\u26a0\ufe0f {title}</h1>
+        <p>{message}</p>
+        <p style="margin-top:1.5rem"><a href="javascript:window.close()">Close this tab</a></p>
+    </div>
+</body>
+</html>"""
+
+
+def _success_page(redirect_url: str) -> str:
+    """Render a success interstitial that redirects after a brief pause."""
+    import html as html_mod
+    escaped_url = html_mod.escape(redirect_url, quote=True)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Maestro — Authorized</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a1a; color: #e0e0e0;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+        }}
+        .card {{
+            background: #1a1a2e; border: 1px solid #00d4ff;
+            border-radius: 12px; padding: 2rem; max-width: 400px;
+            width: 90%; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+            text-align: center;
+        }}
+        h1 {{ font-size: 1.3rem; color: #00d4ff; margin: 0 0 1rem 0; }}
+        .spinner {{
+            display: inline-block; width: 20px; height: 20px;
+            border: 2px solid #2a2a4a; border-top: 2px solid #00d4ff;
+            border-radius: 50%; animation: spin 0.8s linear infinite;
+            vertical-align: middle; margin-right: 0.5rem;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+        a {{ color: #00d4ff; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>\u2705 Authorized</h1>
+        <p>Maestro access granted.</p>
+        <p style="margin-top:1rem; color:#888;">
+            <span class="spinner"></span>Completing handshake...
+        </p>
+        <p style="margin-top:1.5rem; font-size:0.85rem; color:#666;">
+            If nothing happens, <a href="{escaped_url}">click here</a>
+            or close this tab.
+        </p>
+    </div>
+    <script>
+        // Give the user a moment to see the success message, then redirect
+        setTimeout(function() {{
+            window.location.href = "{escaped_url}";
+        }}, 1500);
+        // Try to close the tab after the redirect has had time to process
+        setTimeout(function() {{
+            window.close();
+        }}, 4000);
+    </script>
+</body>
+</html>"""
+
+
+class MaestroOAuthMiddleware:
+    """ASGI middleware implementing OAuth 2.0 for Maestro MCP.
 
     Intercepts OAuth-related paths before they reach the MCP app.
     All other paths require a valid Bearer token.
@@ -339,9 +456,15 @@ class FleetOAuthMiddleware:
     # Paths that don't require authentication
     OPEN_PATHS = {
         "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
         "/oauth/authorize",
         "/oauth/token",
         "/oauth/register",
+        "/register",
+        "/authorize",
+        "/token",
     }
 
     def __init__(self, app: ASGIApp, bearer_token: str | None, issuer_url: str):
@@ -370,7 +493,8 @@ class FleetOAuthMiddleware:
             self._last_cleanup = now
 
         # Rate limit OAuth endpoints
-        if path in ("/oauth/register", "/oauth/token", "/oauth/authorize"):
+        if path in ("/oauth/register", "/oauth/token", "/oauth/authorize",
+                     "/register", "/token", "/authorize"):
             client_ip = _get_client_ip(scope)
             if not self._rate_limiter.is_allowed(f"{path}:{client_ip}"):
                 _audit("rate_limited", ip=client_ip, path=path)
@@ -382,16 +506,22 @@ class FleetOAuthMiddleware:
 
         # --- OAuth endpoints (no auth required) ---
 
-        if path == "/.well-known/oauth-authorization-server":
+        if path in ("/.well-known/oauth-authorization-server",
+                    "/.well-known/openid-configuration"):
             await self._handle_metadata(send)
             return
 
-        if path == "/oauth/register" and method == "POST":
+        if path in ("/.well-known/oauth-protected-resource",
+                     "/.well-known/oauth-protected-resource/mcp"):
+            await self._handle_protected_resource_metadata(send)
+            return
+
+        if path in ("/oauth/register", "/register") and method == "POST":
             body = await _read_body(receive)
             await self._handle_register(send, body, scope)
             return
 
-        if path == "/oauth/authorize":
+        if path in ("/oauth/authorize", "/authorize"):
             if method == "GET":
                 qs = _parse_qs(scope.get("query_string", b"").decode())
                 await self._handle_authorize_get(send, qs)
@@ -402,7 +532,7 @@ class FleetOAuthMiddleware:
                 await _send_json(send, 405, {"error": "method_not_allowed"})
             return
 
-        if path == "/oauth/token" and method == "POST":
+        if path in ("/oauth/token", "/token") and method == "POST":
             body = await _read_body(receive)
             await self._handle_token(send, body)
             return
@@ -417,11 +547,14 @@ class FleetOAuthMiddleware:
             })
             return
 
+        _rm_url = f"{self.issuer_url}/.well-known/oauth-protected-resource"
+        _www_auth = f'Bearer resource_metadata="{_rm_url}"'.encode()
+
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
         if not auth.startswith("Bearer "):
             await _send_json(send, 401, {"error": "unauthorized"}, [
-                [b"www-authenticate", b"Bearer"],
+                [b"www-authenticate", _www_auth],
             ])
             return
 
@@ -439,12 +572,12 @@ class FleetOAuthMiddleware:
             await _send_json(send, 401, {
                 "error": "unauthorized",
                 "error_description": "Token expired.",
-            }, [[b"www-authenticate", b'Bearer error="invalid_token"']])
+            }, [[b"www-authenticate", _www_auth]])
             return
         except jwt.InvalidTokenError as e:
             _audit("token_rejected", reason=str(e))
             await _send_json(send, 401, {"error": "unauthorized"}, [
-                [b"www-authenticate", b"Bearer"],
+                [b"www-authenticate", _www_auth],
             ])
             return
 
@@ -464,14 +597,23 @@ class FleetOAuthMiddleware:
         """RFC 8414 — OAuth Authorization Server Metadata."""
         await _send_json(send, 200, {
             "issuer": self.issuer_url,
-            "authorization_endpoint": f"{self.issuer_url}/oauth/authorize",
-            "token_endpoint": f"{self.issuer_url}/oauth/token",
-            "registration_endpoint": f"{self.issuer_url}/oauth/register",
+            "authorization_endpoint": f"{self.issuer_url}/authorize",
+            "token_endpoint": f"{self.issuer_url}/token",
+            "registration_endpoint": f"{self.issuer_url}/register",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
             "code_challenge_methods_supported": ["S256"],
-            "scopes_supported": ["fleet"],
+            "scopes_supported": ["maestro"],
+        })
+
+    async def _handle_protected_resource_metadata(self, send: Send) -> None:
+        """RFC 9728 — OAuth Protected Resource Metadata."""
+        await _send_json(send, 200, {
+            "resource": f"{self.issuer_url}/mcp",
+            "authorization_servers": [self.issuer_url],
+            "scopes_supported": ["maestro"],
+            "bearer_methods_supported": ["header"],
         })
 
     async def _handle_register(self, send: Send, body: bytes, scope: Scope) -> None:
@@ -532,7 +674,7 @@ class FleetOAuthMiddleware:
             })
             return
 
-        client_id = f"fleet-{secrets.token_hex(8)}"
+        client_id = f"maestro-{secrets.token_hex(8)}"
         client_secret = secrets.token_urlsafe(32)
         client_name = data.get("client_name", "")
 
@@ -619,6 +761,16 @@ class FleetOAuthMiddleware:
         state = form.get("state", "")
         code_challenge = form.get("code_challenge", "")
         code_challenge_method = form.get("code_challenge_method", "S256")
+
+        # Validate authorize PIN (before anything else)
+        pin = form.get("pin", "")
+        if action == "approve" and not _verify_authorize_pin(pin):
+            _audit("authorize_pin_rejected", ip=client_ip, client_id=client_id)
+            await _send_html(send, 403, _error_page(
+                "Invalid PIN",
+                "The authorization PIN is incorrect. Access denied.",
+            ))
+            return
 
         # Validate CSRF token
         csrf_token = form.get("csrf_token", "")
@@ -715,7 +867,7 @@ class FleetOAuthMiddleware:
             "iss": self.issuer_url,
             "iat": int(now),
             "exp": int(now) + JWT_EXPIRY_SECONDS,
-            "scope": "fleet",
+            "scope": "maestro",
             "jti": jti,
         }
         access_token = jwt.encode(payload, self.bearer_token, algorithm=JWT_ALGORITHM)
@@ -725,5 +877,5 @@ class FleetOAuthMiddleware:
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": JWT_EXPIRY_SECONDS,
-            "scope": "fleet",
+            "scope": "maestro",
         })

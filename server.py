@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Agent Orchestrator MCP (Apollyon edition).
+Maestro MCP (Apollyon edition).
 
-Multi-host fleet management + AI agent orchestra. Runs as a persistent
+Multi-host machine fleet + AI agent orchestra. Runs as a persistent
 streamable-http service behind a Cloudflare Tunnel, so Cowork (cloud VM)
 can reach the fleet over HTTPS.
 
@@ -34,7 +34,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-logger = logging.getLogger("fleet")
+logger = logging.getLogger("maestro")
 
 # ---------------------------------------------------------------------------
 # Host registry — Apollyon-centric topology
@@ -365,7 +365,7 @@ def _local_host_hint(tool_name: str) -> str:
     return (
         f"[NOTE: '{tool_name}' targeted apollyon, which is the LOCAL hub. "
         "If you have native shell/file tools (e.g. bash_tool), prefer those "
-        "for local operations. If fleet-ssh is your only interface, disregard.]\n"
+        "for local operations. If Maestro is your only interface, disregard.]\n"
     )
 
 
@@ -473,16 +473,16 @@ async def _scp_run(
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def fleet_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-    logger.info("fleet: warming up connections...")
+async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
+    logger.info("maestro: warming up connections...")
     results = await warmup_all_hosts()
     connected = sum(1 for v in results.values() if v)
     total = len(results)
-    logger.info(f"fleet: {connected}/{total} hosts connected")
+    logger.info(f"maestro: {connected}/{total} hosts connected")
     try:
         yield {"hosts": HOSTS, "warmup_results": results}
     finally:
-        logger.info("fleet: shutting down, closing connections...")
+        logger.info("maestro: shutting down, closing connections...")
         await teardown_all_hosts()
 
 
@@ -491,9 +491,9 @@ async def fleet_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "agent-orchestrator",
+    "maestro",
     instructions=(
-        "Agent Orchestrator MCP — multi-host fleet + AI agent dispatch.\n"
+        "Maestro MCP — multi-host machine fleet + AI agent orchestra.\n"
         "\n"
         "Available hosts:\n"
         "  apollyon  — DGX Spark GB10, 128GB. LOCAL (direct execution, no SSH).\n"
@@ -501,13 +501,13 @@ mcp = FastMCP(
         "  eden-wsl  — Same physical machine as eden, but WSL2/Linux.\n"
         "  judas     — MacBook Pro M3 Max, 36GB. Remote (SSH).\n"
         "\n"
-        "Fleet tools (run commands on machines):\n"
-        "  fleet_exec     — Single command. Has cwd and sudo options.\n"
-        "  fleet_script   — Multi-line script piped via stdin. Use for sequences.\n"
-        "  fleet_read     — Read a text file. Supports line range slicing.\n"
-        "  fleet_write    — Write content to a file.\n"
-        "  fleet_upload / fleet_download — Transfer files between hosts.\n"
-        "  fleet_status   — Check connectivity of all hosts.\n"
+        "Remote tools (run commands on machines):\n"
+        "  maestro_exec     — Single command. Has cwd and sudo options.\n"
+        "  maestro_script   — Multi-line script piped via stdin. Use for sequences.\n"
+        "  maestro_read     — Read a text file. Supports line range slicing.\n"
+        "  maestro_write    — Write content to a file.\n"
+        "  maestro_upload / maestro_download — Transfer files between hosts.\n"
+        "  maestro_status   — Check connectivity of all hosts.\n"
         "\n"
         "Agent tools (dispatch tasks to AI coding agents):\n"
         "  codex_execute      — Dispatch code task to OpenAI Codex CLI (blocking).\n"
@@ -523,22 +523,22 @@ mcp = FastMCP(
         "\n"
         "Apollyon commands execute locally (zero overhead, no SSH).\n"
         "Use 'eden' for PowerShell, 'eden-wsl' for Linux on the same box.\n"
-        "Prefer fleet_read/fleet_write over scp for text files.\n"
-        "Prefer fleet_script over chained && commands.\n"
+        "Prefer maestro_read/maestro_write over scp for text files.\n"
+        "Prefer maestro_script over chained && commands.\n"
         "\n"
         "Agent principles: output saved to disk, summary returned inline.\n"
         "Codex = executor (code). Gemini = analyst (comprehension). Claude = architect (reasoning).\n"
         "Use *_execute for quick bounded tasks. Use *_dispatch + agent_poll for long tasks.\n"
     ),
     # NOTE: No per-session lifespan — SSH lifecycle is managed at the server
-    # level by _serve_with_fleet_lifecycle(). A per-session lifespan would
+    # level by _serve_with_maestro_lifecycle(). A per-session lifespan would
     # tear down ALL SSH ControlMasters when any single session disconnects,
     # breaking other sessions and requiring re-warmup.
 )
 
 
 @mcp.tool()
-async def fleet_exec(
+async def maestro_exec(
     host: str, command: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -558,13 +558,13 @@ async def fleet_exec(
             parts.append("sudo")
         parts.append(command)
         full_cmd = " ".join(parts)
-        return _local_host_hint("fleet_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+        return _local_host_hint("maestro_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
     full_cmd = _wrap_command(config, command, cwd, sudo)
     return await _ssh_run(host, [full_cmd], timeout=timeout)
 
 
 @mcp.tool()
-async def fleet_script(
+async def maestro_script(
     host: str, script: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -582,7 +582,7 @@ async def fleet_script(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+        return _local_host_hint("maestro_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
     lines = []
     if config.shell == HostShell.POWERSHELL:
         lines.append("$ErrorActionPreference = 'Stop'")
@@ -602,7 +602,7 @@ async def fleet_script(
 
 
 @mcp.tool()
-async def fleet_read(
+async def maestro_read(
     host: str, path: str, head: int | None = None,
     tail: int | None = None, timeout: int = TIMEOUT,
 ) -> str:
@@ -619,7 +619,7 @@ async def fleet_read(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_read") + _local_read_file(path, head=head, tail=tail)
+        return _local_host_hint("maestro_read") + _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
             cmd = f"Get-Content {shlex.quote(path)} -TotalCount {head}"
@@ -638,7 +638,7 @@ async def fleet_read(
 
 
 @mcp.tool()
-async def fleet_write(
+async def maestro_write(
     host: str, path: str, content: str, append: bool = False,
     sudo: bool = False, timeout: int = TIMEOUT,
 ) -> str:
@@ -657,7 +657,7 @@ async def fleet_write(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_write") + _local_write_file(path, content, append=append, sudo=sudo)
+        return _local_host_hint("maestro_write") + _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
             cmd = f"$input | Out-File -Append -FilePath {shlex.quote(path)}"
@@ -678,10 +678,10 @@ async def fleet_write(
 
 
 @mcp.tool()
-async def fleet_upload(host: str, local_path: str, remote_path: str) -> str:
+async def maestro_upload(host: str, local_path: str, remote_path: str) -> str:
     """Upload a file to a remote host via SCP.
 
-    Use for binary files or large transfers. For text files, prefer fleet_write.
+    Use for binary files or large transfers. For text files, prefer maestro_write.
 
     Args:
         host: Target host. One of: apollyon, eden, eden-wsl, judas
@@ -690,15 +690,15 @@ async def fleet_upload(host: str, local_path: str, remote_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_upload") + _local_copy(local_path, remote_path, upload=True)
+        return _local_host_hint("maestro_upload") + _local_copy(local_path, remote_path, upload=True)
     return await _scp_run(host, local_path, remote_path, upload=True)
 
 
 @mcp.tool()
-async def fleet_download(host: str, remote_path: str, local_path: str) -> str:
+async def maestro_download(host: str, remote_path: str, local_path: str) -> str:
     """Download a file from a remote host via SCP.
 
-    Use for binary files or large transfers. For text files, prefer fleet_read.
+    Use for binary files or large transfers. For text files, prefer maestro_read.
 
     Args:
         host: Target host. One of: apollyon, eden, eden-wsl, judas
@@ -707,18 +707,18 @@ async def fleet_download(host: str, remote_path: str, local_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("fleet_download") + _local_copy(remote_path, local_path, upload=False)
+        return _local_host_hint("maestro_download") + _local_copy(remote_path, local_path, upload=False)
     return await _scp_run(host, remote_path, local_path, upload=False)
 
 
 @mcp.tool()
-async def fleet_status() -> str:
+async def maestro_status() -> str:
     """Check connectivity status of all SSH hosts.
 
     Tests each host's ControlMaster socket and re-warms connections
     that have gone stale. Returns a status summary.
     """
-    lines = ["Fleet Status (Apollyon hub)", "=" * 55]
+    lines = ["Maestro Status (Apollyon hub)", "=" * 55]
 
     async def _check_one(name: str, config: HostConfig) -> str:
         config.last_check = time.time()
@@ -900,7 +900,7 @@ async def _orchestra_run_cli(
     cwd: str | None = None,
 ) -> tuple[int, str]:
     """
-    Run a CLI command on the specified host using existing fleet primitives.
+    Run a CLI command on the specified host using existing Maestro primitives.
     Returns (return_code_estimate, combined_output).
     """
     config = _resolve_host(host)
@@ -928,7 +928,7 @@ async def _orchestra_run_cli(
 
 @mcp.tool()
 async def agent_status(host: str = "apollyon") -> str:
-    """Check availability of Codex CLI and Gemini CLI on a fleet host.
+    """Check availability of Codex CLI and Gemini CLI on a Maestro host.
 
     Args:
         host: Target host. One of: apollyon, eden, eden-wsl, judas
@@ -958,7 +958,7 @@ async def codex_execute(
     model: str = "",
     timeout: int = CODEX_TIMEOUT,
 ) -> str:
-    """Dispatch a coding task to OpenAI Codex CLI on a fleet host.
+    """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
 
     Codex runs in full-auto mode. It can read files, edit code, run
     commands, and execute tests. Best for: feature implementation,
@@ -997,7 +997,7 @@ async def gemini_analyze(
     yolo: bool = False,
     timeout: int = GEMINI_TIMEOUT,
 ) -> str:
-    """Dispatch an analysis task to Google Gemini CLI on a fleet host.
+    """Dispatch an analysis task to Google Gemini CLI on a Maestro host.
 
     Gemini runs in headless mode (read-only by default). Best for:
     large-context codebase analysis, architectural review, document
@@ -1145,7 +1145,7 @@ async def claude_execute(
     allowed_tools: str = "Edit,Write,Bash(git:*),Read",
     timeout: int = CLAUDE_TIMEOUT,
 ) -> str:
-    """Dispatch a coding task to Claude Code CLI on a fleet host.
+    """Dispatch a coding task to Claude Code CLI on a Maestro host.
 
     Claude Code runs in bypassPermissions mode with a dollar-budget cap.
     Best for: multi-file refactoring, architectural changes, CLAUDE.md-aware
@@ -1430,12 +1430,12 @@ if __name__ == "__main__":
     _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     _audit_handler = logging.FileHandler(_audit_log_path)
     _audit_handler.setFormatter(logging.Formatter("%(message)s"))
-    _audit_logger = logging.getLogger("fleet-audit")
+    _audit_logger = logging.getLogger("maestro-audit")
     _audit_logger.addHandler(_audit_handler)
     _audit_logger.setLevel(logging.INFO)
     _audit_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Agent Orchestrator MCP (Apollyon edition)")
+    parser = argparse.ArgumentParser(description="Maestro MCP (Apollyon edition)")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")
@@ -1448,14 +1448,14 @@ if __name__ == "__main__":
 
         # --- Auth + proxy middleware ---
         from starlette.types import ASGIApp, Receive, Scope, Send
-        from fleet_oauth import FleetOAuthMiddleware
+        from maestro_oauth import MaestroOAuthMiddleware
 
         _token_path = Path.home() / ".fleet-ssh" / "bearer_token"
         if _token_path.exists():
             _expected_token = _token_path.read_text().strip()
             logger.info(f"Bearer auth enabled (token from {_token_path})")
         else:
-            _expected_token = os.environ.get("FLEET_SSH_TOKEN")
+            _expected_token = os.environ.get("MAESTRO_TOKEN")
             if _expected_token:
                 logger.info("Bearer auth enabled (token from env)")
             else:
@@ -1479,32 +1479,32 @@ if __name__ == "__main__":
 
         # Stack: request → OAuth/BearerAuth → HostRewrite → MCP app
         app = HostRewriteMiddleware(app)
-        app = FleetOAuthMiddleware(
+        app = MaestroOAuthMiddleware(
             app=app,
             bearer_token=_expected_token,
             issuer_url="https://maestro.rmstxrx.dev",
         )
 
-        logger.info(f"fleet: starting HTTP server on {args.host}:{args.port}")
+        logger.info(f"maestro: starting HTTP server on {args.host}:{args.port}")
 
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
         server = uvicorn.Server(config)
 
-        async def _serve_with_fleet_lifecycle() -> None:
+        async def _serve_with_maestro_lifecycle() -> None:
             global _EVICTION_TASK
-            logger.info("fleet: warming up connections...")
+            logger.info("maestro: warming up connections...")
             results = await warmup_all_hosts()
             connected = sum(1 for v in results.values() if v)
-            logger.info(f"fleet: {connected}/{len(results)} hosts connected")
+            logger.info(f"maestro: {connected}/{len(results)} hosts connected")
             _EVICTION_TASK = asyncio.create_task(_periodic_eviction())
             try:
                 await server.serve()
             finally:
                 if _EVICTION_TASK:
                     _EVICTION_TASK.cancel()
-                logger.info("fleet: shutting down, closing connections...")
+                logger.info("maestro: shutting down, closing connections...")
                 await teardown_all_hosts()
 
-        asyncio.run(_serve_with_fleet_lifecycle())
+        asyncio.run(_serve_with_maestro_lifecycle())
     else:
         mcp.run(transport="stdio")
