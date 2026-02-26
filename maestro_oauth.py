@@ -3,16 +3,19 @@ maestro_oauth.py — OAuth 2.0 Authorization Code + PKCE for Maestro MCP.
 
 Single-user OAuth server designed for MCP connector authentication.
 The "authorize" page shows a simple approve/deny form since Rômulo is
-the only user. Access tokens are per-client JWTs (HS256) signed with
-the bearer secret from ~/.fleet-ssh/bearer_token, expiring after 8 hours.
+the only user. Access tokens are per-client JWTs (RS256) signed with
+an RSA private key from ~/.fleet-ssh/jwt_signing_key.pem, expiring
+after 8 hours.  A JWKS endpoint serves the public key for verification.
 
 Implements:
   /.well-known/oauth-authorization-server  — RFC 8414 metadata
+  /oauth/jwks                              — JWKS public key endpoint
   /oauth/register                          — RFC 7591 dynamic client registration (gated)
   /oauth/authorize                         — Authorization endpoint (GET → form, POST → redirect)
   /oauth/token                             — Token endpoint (code → per-client JWT)
 
 Security features:
+  - RS256 (asymmetric) JWT signing with JWKS endpoint for verification
   - Registration gated by MAESTRO_REGISTRATION_SECRET env var
   - Per-client JWTs with expiry (no shared static token)
   - S256-only PKCE (plain method rejected)
@@ -37,7 +40,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from pathlib import Path
+
 import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -48,8 +55,45 @@ audit_logger = logging.getLogger("maestro-audit")
 # Security configuration
 # ---------------------------------------------------------------------------
 
-JWT_ALGORITHM = "HS256"
+JWT_ALGORITHM = "RS256"
 JWT_EXPIRY_SECONDS = 8 * 3600  # 8 hours
+
+# ---------------------------------------------------------------------------
+# RSA key loading for RS256 JWT signing
+# ---------------------------------------------------------------------------
+
+_RSA_KEY_PATH = Path.home() / ".fleet-ssh" / "jwt_signing_key.pem"
+_RSA_PRIVATE_KEY: rsa.RSAPrivateKey | None = None
+_RSA_PUBLIC_KEY: rsa.RSAPublicKey | None = None
+_JWKS_RESPONSE: dict | None = None  # cached JWKS JSON
+
+def _load_rsa_keys() -> None:
+    """Load RSA private key from PEM file and derive public key + JWKS."""
+    global _RSA_PRIVATE_KEY, _RSA_PUBLIC_KEY, _JWKS_RESPONSE
+    if not _RSA_KEY_PATH.exists():
+        logger.warning(f"RSA key not found at {_RSA_KEY_PATH} — JWT signing disabled")
+        return
+    pem_data = _RSA_KEY_PATH.read_bytes()
+    _RSA_PRIVATE_KEY = serialization.load_pem_private_key(pem_data, password=None)  # type: ignore[assignment]
+    _RSA_PUBLIC_KEY = _RSA_PRIVATE_KEY.public_key()
+    # Build JWKS from public key
+    pub_numbers = _RSA_PUBLIC_KEY.public_numbers()
+    def _b64url(n: int, length: int) -> str:
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
+    key_size_bytes = (_RSA_PRIVATE_KEY.key_size + 7) // 8
+    _JWKS_RESPONSE = {
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": "maestro-1",
+            "n": _b64url(pub_numbers.n, key_size_bytes),
+            "e": _b64url(pub_numbers.e, 3),
+        }]
+    }
+    logger.info(f"RS256 signing key loaded from {_RSA_KEY_PATH}")
+
+_load_rsa_keys()
 MAX_REGISTERED_CLIENTS = 20
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX_REQUESTS = 10  # per window per IP per endpoint
@@ -460,6 +504,7 @@ class MaestroOAuthMiddleware:
         "/oauth/authorize",
         "/oauth/token",
         "/oauth/register",
+        "/oauth/jwks",
         "/register",
         "/authorize",
         "/token",
@@ -494,6 +539,10 @@ class MaestroOAuthMiddleware:
 
         path = scope.get("path", "")
         method = scope.get("method", "GET")
+        _ip = _get_client_ip(scope)
+        _hdrs = dict(scope.get("headers", []))
+        _has_auth = b"authorization" in _hdrs
+        logger.info(f"recv: {method} {path} from {_ip} auth={'yes' if _has_auth else 'no'}")
 
         # Periodic cleanup (every 5 minutes)
         now = time.time()
@@ -526,6 +575,10 @@ class MaestroOAuthMiddleware:
             await self._handle_protected_resource_metadata(send)
             return
 
+        if path == "/oauth/jwks" and method == "GET":
+            await self._handle_jwks(send)
+            return
+
         if path in ("/oauth/register", "/register") and method == "POST":
             body = await _read_body(receive)
             await self._handle_register(send, body, scope)
@@ -549,7 +602,7 @@ class MaestroOAuthMiddleware:
 
         # --- All other paths: require valid JWT ---
 
-        if not self.bearer_token:
+        if not _RSA_PUBLIC_KEY:
             _audit("auth_bypass_blocked", reason="no_signing_key_configured")
             await _send_json(send, 503, {
                 "error": "server_misconfigured",
@@ -576,10 +629,10 @@ class MaestroOAuthMiddleware:
         try:
             claims = jwt.decode(
                 token,
-                self.bearer_token,
+                _RSA_PUBLIC_KEY,
                 algorithms=[JWT_ALGORITHM],
                 issuer=self.issuer_url,
-                options={"require": ["sub", "exp", "iss", "jti"]},
+                options={"require": ["sub", "exp", "iss", "jti"], "verify_aud": False},
             )
             logger.info(f"200 auth-ok: {method} {path} sub={claims.get('sub')} jti={claims.get('jti','?')[:8]}")
         except jwt.ExpiredSignatureError:
@@ -611,17 +664,26 @@ class MaestroOAuthMiddleware:
 
     async def _handle_metadata(self, send: Send) -> None:
         """RFC 8414 — OAuth Authorization Server Metadata."""
-        await _send_json(send, 200, {
+        metadata: dict = {
             "issuer": self.issuer_url,
             "authorization_endpoint": f"{self.issuer_url}/authorize",
             "token_endpoint": f"{self.issuer_url}/token",
             "registration_endpoint": f"{self.issuer_url}/register",
+            "jwks_uri": f"{self.issuer_url}/oauth/jwks",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
             "code_challenge_methods_supported": ["S256"],
             "scopes_supported": ["maestro"],
-        })
+        }
+        await _send_json(send, 200, metadata)
+
+    async def _handle_jwks(self, send: Send) -> None:
+        """Serve JWKS (JSON Web Key Set) — public key for RS256 JWT verification."""
+        if _JWKS_RESPONSE:
+            await _send_json(send, 200, _JWKS_RESPONSE)
+        else:
+            await _send_json(send, 503, {"error": "jwks_unavailable"})
 
     async def _handle_protected_resource_metadata(self, send: Send) -> None:
         """RFC 9728 — OAuth Protected Resource Metadata."""
@@ -855,10 +917,15 @@ class MaestroOAuthMiddleware:
     async def _handle_token(self, send: Send, body: bytes) -> None:
         """Exchange authorization code for per-client JWT."""
         form = _parse_form(body)
+        # Log full token exchange request (redact secrets)
+        _form_log = {k: (v[:8] + "..." if k in ("client_secret", "code_verifier", "code") else v)
+                     for k, v in form.items()}
+        logger.info(f"token-exchange request: {_form_log}")
         grant_type = form.get("grant_type", "")
         code = form.get("code", "")
         client_id = form.get("client_id", "")
         code_verifier = form.get("code_verifier", "")
+        resource = form.get("resource", "")  # RFC 8707 — also required in token request
 
         if grant_type != "authorization_code":
             _audit("token_rejected", reason="unsupported_grant_type", client_id=client_id)
@@ -936,15 +1003,24 @@ class MaestroOAuthMiddleware:
             "scope": "maestro",
             "jti": jti,
         }
-        # RFC 8707: include aud matching the requested resource
-        if auth_code.resource:
-            payload["aud"] = auth_code.resource
-        access_token = jwt.encode(payload, self.bearer_token, algorithm=JWT_ALGORITHM)
+        # RFC 8707: include aud matching the requested resource.
+        # Prefer the resource from the token request (per spec), fall back to auth code's.
+        token_resource = resource or auth_code.resource
+        if token_resource:
+            payload["aud"] = token_resource
+        access_token = jwt.encode(payload, _RSA_PRIVATE_KEY, algorithm=JWT_ALGORITHM,
+                                   headers={"kid": "maestro-1"})
         _audit("token_issued", client_id=client_id, jti=jti, expires_in=JWT_EXPIRY_SECONDS)
 
-        await _send_json(send, 200, {
+        token_response: dict = {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": JWT_EXPIRY_SECONDS,
             "scope": "maestro",
-        })
+        }
+        if token_resource:
+            token_response["resource"] = token_resource
+        # Log token response (truncate access_token)
+        _resp_log = {k: (v[:40] + "..." if k == "access_token" else v) for k, v in token_response.items()}
+        logger.info(f"token-exchange response: {_resp_log}")
+        await _send_json(send, 200, token_response)
