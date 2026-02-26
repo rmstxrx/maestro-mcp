@@ -140,6 +140,7 @@ class AuthCode:
     code_challenge_method: str
     created_at: float
     ttl: int = 300  # 5 minutes
+    resource: str = ""  # RFC 8707 resource indicator → becomes JWT aud
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,8 @@ def _verify_authorize_pin(pin: str) -> bool:
 
 def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
                     state: str, code_challenge: str, code_challenge_method: str,
-                    csrf_token: str = "", show_pin: bool = True) -> str:
+                    csrf_token: str = "", show_pin: bool = True,
+                    resource: str = "") -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -333,6 +335,7 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
             <input type="hidden" name="code_challenge" value="{code_challenge}">
             <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <input type="hidden" name="resource" value="{resource}">
             {'<div class="pin-field"><label for="pin">Authorization PIN:</label><input type="password" id="pin" name="pin" placeholder="Enter PIN" autocomplete="off" required style="width:100%; padding:0.6rem; border:1px solid #2a2a4a; border-radius:6px; background:#12122a; color:#e0e0e0; font-family:monospace; font-size:1rem; margin-top:0.4rem;"></div>' if show_pin else ''}
             <div class="buttons">
                 <button type="submit" name="action" value="deny" class="deny">Deny</button>
@@ -718,6 +721,7 @@ class MaestroOAuthMiddleware:
         state = params.get("state", "")
         code_challenge = params.get("code_challenge", "")
         code_challenge_method = params.get("code_challenge_method", "S256")
+        resource = params.get("resource", "")  # RFC 8707
 
         if not client_id or not redirect_uri:
             await _send_json(send, 400, {"error": "invalid_request",
@@ -772,6 +776,7 @@ class MaestroOAuthMiddleware:
             code_challenge_method=code_challenge_method,
             csrf_token=csrf_token,
             show_pin=not bool(client.client_secret),
+            resource=resource,
         )
         await _send_html(send, 200, html)
 
@@ -785,6 +790,7 @@ class MaestroOAuthMiddleware:
         state = form.get("state", "")
         code_challenge = form.get("code_challenge", "")
         code_challenge_method = form.get("code_challenge_method", "S256")
+        resource = form.get("resource", "")  # RFC 8707
 
         # Validate authorize PIN (before anything else).
         # Confidential clients (pre-registered with client_secret) skip the PIN:
@@ -832,6 +838,7 @@ class MaestroOAuthMiddleware:
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             created_at=time.time(),
+            resource=resource,
         )
         _audit("authorize_approved", client_id=client_id, ip=client_ip)
 
@@ -929,6 +936,9 @@ class MaestroOAuthMiddleware:
             "scope": "maestro",
             "jti": jti,
         }
+        # RFC 8707: include aud matching the requested resource
+        if auth_code.resource:
+            payload["aud"] = auth_code.resource
         access_token = jwt.encode(payload, self.bearer_token, algorithm=JWT_ALGORITHM)
         _audit("token_issued", client_id=client_id, jti=jti, expires_in=JWT_EXPIRY_SECONDS)
 
