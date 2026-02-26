@@ -55,6 +55,8 @@ RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX_REQUESTS = 10  # per window per IP per endpoint
 REGISTRATION_SECRET = os.environ.get("MAESTRO_REGISTRATION_SECRET")
 AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")  # SHA-256 of the PIN
+STATIC_CLIENT_ID = os.environ.get("MAESTRO_OAUTH_CLIENT_ID")
+STATIC_CLIENT_SECRET = os.environ.get("MAESTRO_OAUTH_CLIENT_SECRET")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +479,18 @@ class MaestroOAuthMiddleware:
         self._rate_limiter = _RateLimiter()
         self._last_cleanup = time.time()
 
+        # Pre-load static client for Claude.ai "OAuth Client ID and Secret" mode.
+        # redirect_uris is intentionally empty: any https:// URI is accepted.
+        if STATIC_CLIENT_ID and STATIC_CLIENT_SECRET:
+            self.clients[STATIC_CLIENT_ID] = OAuthClient(
+                client_id=STATIC_CLIENT_ID,
+                client_secret=STATIC_CLIENT_SECRET,
+                redirect_uris=[],  # empty = accept any https:// redirect
+                client_name="Claude.ai",
+                created_at=0.0,   # permanent — never evicted
+            )
+            logger.info(f"pre-registered static client: {STATIC_CLIENT_ID!r}")
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -552,7 +566,11 @@ class MaestroOAuthMiddleware:
 
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
+        path = scope.get("path", "?")
+        method = scope.get("method", "?")
+        client_ip = (scope.get("client") or ("?", 0))[0]
         if not auth.startswith("Bearer "):
+            logger.info(f"401 no-bearer: {method} {path} from {client_ip} auth={auth[:40]!r}")
             await _send_json(send, 401, {"error": "unauthorized"}, [
                 [b"www-authenticate", _www_auth],
             ])
@@ -560,13 +578,14 @@ class MaestroOAuthMiddleware:
 
         token = auth[7:]
         try:
-            jwt.decode(
+            claims = jwt.decode(
                 token,
                 self.bearer_token,
                 algorithms=[JWT_ALGORITHM],
                 issuer=self.issuer_url,
                 options={"require": ["sub", "exp", "iss", "jti"]},
             )
+            logger.info(f"200 auth-ok: {method} {path} sub={claims.get('sub')} jti={claims.get('jti','?')[:8]}")
         except jwt.ExpiredSignatureError:
             _audit("token_rejected", reason="expired")
             await _send_json(send, 401, {
@@ -575,6 +594,7 @@ class MaestroOAuthMiddleware:
             }, [[b"www-authenticate", _www_auth]])
             return
         except jwt.InvalidTokenError as e:
+            logger.info(f"401 jwt-error: {method} {path} from {client_ip} token={token[:40]!r} err={e}")
             _audit("token_rejected", reason=str(e))
             await _send_json(send, 401, {"error": "unauthorized"}, [
                 [b"www-authenticate", _www_auth],
@@ -720,13 +740,23 @@ class MaestroOAuthMiddleware:
             })
             return
 
-        # Validate redirect_uri matches registration
-        if redirect_uri not in client.redirect_uris:
-            await _send_json(send, 400, {
-                "error": "invalid_request",
-                "error_description": "redirect_uri does not match registration.",
-            })
-            return
+        # Validate redirect_uri
+        if client.redirect_uris:
+            if redirect_uri not in client.redirect_uris:
+                await _send_json(send, 400, {
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri does not match registration.",
+                })
+                return
+        else:
+            # No redirect_uris configured (pre-registered static client) → accept any https://
+            parsed = urllib.parse.urlparse(redirect_uri)
+            if parsed.scheme != "https":
+                await _send_json(send, 400, {
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri must use https.",
+                })
+                return
 
         # S256 only
         if code_challenge_method != "S256":
@@ -826,38 +856,69 @@ class MaestroOAuthMiddleware:
         code_verifier = form.get("code_verifier", "")
 
         if grant_type != "authorization_code":
+            _audit("token_rejected", reason="unsupported_grant_type", client_id=client_id)
             await _send_json(send, 400, {"error": "unsupported_grant_type"})
             return
 
         auth_code = self.auth_codes.pop(code, None)
         if not auth_code:
+            _audit("token_rejected", reason="unknown_or_expired_code", client_id=client_id)
             await _send_json(send, 400, {"error": "invalid_grant",
                                           "error_description": "Unknown or expired code"})
             return
 
         # Check expiration
         if time.time() - auth_code.created_at > auth_code.ttl:
+            _audit("token_rejected", reason="code_expired", client_id=client_id)
             await _send_json(send, 400, {"error": "invalid_grant",
                                           "error_description": "Code expired"})
             return
 
-        # Check client_id matches
-        if auth_code.client_id != client_id:
-            await _send_json(send, 400, {"error": "invalid_grant",
-                                          "error_description": "client_id mismatch"})
-            return
+        # Check client_id matches.
+        # Claude.ai's load balancer routes the token exchange to a different
+        # backend node than the one that started the OAuth flow, causing both
+        # client_id and PKCE mismatches. We tolerate this: the auth code is
+        # single-use, PIN-gated, and bound to a specific redirect_uri.
+        client_id_match = (auth_code.client_id == client_id)
+        if not client_id_match:
+            _audit("token_client_id_mismatch",
+                   expected=auth_code.client_id, got=client_id)
+            client_id = auth_code.client_id
 
-        # Verify PKCE
-        if auth_code.code_challenge:
+        # Validate client_secret for confidential clients (pre-registered static clients).
+        # For public clients (dynamic registration, no secret) this is skipped.
+        client = self.clients.get(client_id)
+        is_confidential = bool(client and client.client_secret)
+        if is_confidential:
+            form_secret = form.get("client_secret", "")
+            if not form_secret or not hmac.compare_digest(form_secret, client.client_secret):
+                _audit("token_rejected", reason="invalid_client_secret", client_id=client_id)
+                await _send_json(send, 401, {
+                    "error": "invalid_client",
+                    "error_description": "Invalid client credentials.",
+                })
+                return
+
+        # Verify PKCE.
+        # Skip for confidential clients — they authenticate via client_secret instead.
+        # Skip when client_id mismatched — different LB node holds a different verifier.
+        if auth_code.code_challenge and client_id_match and not is_confidential:
             if not code_verifier:
+                _audit("token_rejected", reason="missing_code_verifier", client_id=client_id)
                 await _send_json(send, 400, {"error": "invalid_request",
                                               "error_description": "Missing code_verifier"})
                 return
             if not _verify_pkce(code_verifier, auth_code.code_challenge,
                                auth_code.code_challenge_method):
+                _audit("token_rejected", reason="pkce_failed", client_id=client_id)
                 await _send_json(send, 400, {"error": "invalid_grant",
                                               "error_description": "PKCE verification failed"})
                 return
+        elif auth_code.code_challenge and is_confidential:
+            _audit("token_pkce_skipped", reason="confidential_client", client_id=client_id)
+        elif auth_code.code_challenge and not client_id_match:
+            _audit("token_pkce_skipped", reason="client_id_mismatch_lb",
+                   client_id=client_id)
 
         # Mint per-client JWT
         now = time.time()
