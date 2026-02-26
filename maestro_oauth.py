@@ -231,7 +231,7 @@ def _verify_authorize_pin(pin: str) -> bool:
 
 def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
                     state: str, code_challenge: str, code_challenge_method: str,
-                    csrf_token: str = "") -> str:
+                    csrf_token: str = "", show_pin: bool = True) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -333,14 +333,7 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
             <input type="hidden" name="code_challenge" value="{code_challenge}">
             <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <div class="pin-field">
-                <label for="pin">Authorization PIN:</label>
-                <input type="password" id="pin" name="pin" placeholder="Enter PIN"
-                       autocomplete="off" required
-                       style="width:100%; padding:0.6rem; border:1px solid #2a2a4a;
-                              border-radius:6px; background:#12122a; color:#e0e0e0;
-                              font-family:monospace; font-size:1rem; margin-top:0.4rem;">
-            </div>
+            {'<div class="pin-field"><label for="pin">Authorization PIN:</label><input type="password" id="pin" name="pin" placeholder="Enter PIN" autocomplete="off" required style="width:100%; padding:0.6rem; border:1px solid #2a2a4a; border-radius:6px; background:#12122a; color:#e0e0e0; font-family:monospace; font-size:1rem; margin-top:0.4rem;"></div>' if show_pin else ''}
             <div class="buttons">
                 <button type="submit" name="action" value="deny" class="deny">Deny</button>
                 <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -778,6 +771,7 @@ class MaestroOAuthMiddleware:
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             csrf_token=csrf_token,
+            show_pin=not bool(client.client_secret),
         )
         await _send_html(send, 200, html)
 
@@ -792,9 +786,13 @@ class MaestroOAuthMiddleware:
         code_challenge = form.get("code_challenge", "")
         code_challenge_method = form.get("code_challenge_method", "S256")
 
-        # Validate authorize PIN (before anything else)
+        # Validate authorize PIN (before anything else).
+        # Confidential clients (pre-registered with client_secret) skip the PIN:
+        # the client_secret is their authentication; the user just clicks Approve.
+        client_obj = self.clients.get(client_id)
+        is_confidential_client = bool(client_obj and client_obj.client_secret)
         pin = form.get("pin", "")
-        if action == "approve" and not _verify_authorize_pin(pin):
+        if action == "approve" and not is_confidential_client and not _verify_authorize_pin(pin):
             _audit("authorize_pin_rejected", ip=client_ip, client_id=client_id)
             await _send_html(send, 403, _error_page(
                 "Invalid PIN",
