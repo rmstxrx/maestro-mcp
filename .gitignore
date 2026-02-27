@@ -11,6 +11,10 @@ audit.log
 # User config (contains fleet topology)
 hosts.yaml
 
+# Live deployment (service files with real paths/users)
+maestro.service
+cloudflared-maestro.service
+
 # IDE
 .vscode/
 .idea/

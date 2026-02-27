@@ -1,11 +1,10 @@
 # 🎼 Maestro MCP
 
-> *A Haiku, a Sonnet, an Opus. All sound beautiful.*
-> *But an Opus deserves to be held by an Orchestra, conducted by a proper Maestro.*
+> *An Opus is a piece that deserves to be held by an Orchestra, conducted by a proper Maestro.*
 
 **Maestro** is an MCP server that turns a heterogeneous machine fleet into a unified workspace for AI agents. SSH into any host, run commands across platforms, transfer files, and dispatch coding agents — all through a single orchestration layer.
 
-Built for developers who work across multiple machines and want their AI assistant to do the same.
+Built for developers/power users in general who work across multiple machines and want their AI assistant to do the same.
 
 ---
 
