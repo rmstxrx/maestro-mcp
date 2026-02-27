@@ -1,369 +1,370 @@
 """
-maestro_oauth.py — OAuth 2.0 Authorization Code + PKCE for Maestro MCP.
+maestro_oauth.py — OAuthAuthorizationServerProvider for Maestro MCP.
 
-Single-user OAuth server designed for MCP connector authentication.
-The "authorize" page shows a simple approve/deny form since Rômulo is
-the only user. Access tokens are per-client JWTs (RS256) signed with
-an RSA private key from ~/.fleet-ssh/jwt_signing_key.pem, expiring
-after 8 hours.  A JWKS endpoint serves the public key for verification.
+Implements the FastMCP auth provider protocol. All OAuth routes, metadata,
+and bearer-token verification are handled by the SDK's built-in auth system.
 
-Implements:
-  /.well-known/oauth-authorization-server  — RFC 8414 metadata
-  /oauth/jwks                              — JWKS public key endpoint
-  /oauth/register                          — RFC 7591 dynamic client registration (gated)
-  /oauth/authorize                         — Authorization endpoint (GET → form, POST → redirect)
-  /oauth/token                             — Token endpoint (code → per-client JWT)
-
-Security features:
-  - RS256 (asymmetric) JWT signing with JWKS endpoint for verification
-  - Registration gated by MAESTRO_REGISTRATION_SECRET env var
-  - Per-client JWTs with expiry (no shared static token)
-  - S256-only PKCE (plain method rejected)
-  - CSRF protection on authorize form
-  - In-memory sliding window rate limiter on auth endpoints
-  - Structured audit logging (JSON-lines to maestro-audit logger)
-  - Fail-closed when no signing key is configured
-
-All state (clients, auth codes, CSRF tokens) is in-memory and ephemeral.
+Security layers:
+  - Dynamic registration rate-limited (10 per minute).
+  - Claude.ai (detected by redirect_uri) is auto-approved — the user is
+    already authenticated in their Anthropic account.
+  - All other MCP clients go through a consent page with PIN gate.
+  - Tokens are opaque random strings stored in-memory.
 """
 
-import base64
 import hashlib
 import hmac
+import html as html_mod
 import json
 import logging
 import os
 import secrets
 import time
-import urllib.parse
-from collections import deque
-from dataclasses import dataclass, field
 from typing import Any
 
-from pathlib import Path
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-import jwt
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
+from urllib.parse import parse_qs, urlparse
 
-from starlette.types import ASGIApp, Receive, Scope, Send
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 logger = logging.getLogger("maestro-oauth")
 audit_logger = logging.getLogger("maestro-audit")
 
-# ---------------------------------------------------------------------------
-# Security configuration
-# ---------------------------------------------------------------------------
+TOKEN_EXPIRY = 8 * 3600  # 8 hours
+REFRESH_TOKEN_EXPIRY = 30 * 86400  # 30 days
+AUTH_CODE_TTL = 300  # 5 minutes
 
-JWT_ALGORITHM = "RS256"
-JWT_EXPIRY_SECONDS = 8 * 3600  # 8 hours
+AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")
+CLAUDE_AI_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
 
-# ---------------------------------------------------------------------------
-# RSA key loading for RS256 JWT signing
-# ---------------------------------------------------------------------------
-
-_RSA_KEY_PATH = Path.home() / ".fleet-ssh" / "jwt_signing_key.pem"
-_RSA_PRIVATE_KEY: rsa.RSAPrivateKey | None = None
-_RSA_PUBLIC_KEY: rsa.RSAPublicKey | None = None
-_JWKS_RESPONSE: dict | None = None  # cached JWKS JSON
-
-def _load_rsa_keys() -> None:
-    """Load RSA private key from PEM file and derive public key + JWKS."""
-    global _RSA_PRIVATE_KEY, _RSA_PUBLIC_KEY, _JWKS_RESPONSE
-    if not _RSA_KEY_PATH.exists():
-        logger.warning(f"RSA key not found at {_RSA_KEY_PATH} — JWT signing disabled")
-        return
-    pem_data = _RSA_KEY_PATH.read_bytes()
-    _RSA_PRIVATE_KEY = serialization.load_pem_private_key(pem_data, password=None)  # type: ignore[assignment]
-    _RSA_PUBLIC_KEY = _RSA_PRIVATE_KEY.public_key()
-    # Build JWKS from public key
-    pub_numbers = _RSA_PUBLIC_KEY.public_numbers()
-    def _b64url(n: int, length: int) -> str:
-        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
-    key_size_bytes = (_RSA_PRIVATE_KEY.key_size + 7) // 8
-    _JWKS_RESPONSE = {
-        "keys": [{
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "kid": "maestro-1",
-            "n": _b64url(pub_numbers.n, key_size_bytes),
-            "e": _b64url(pub_numbers.e, 3),
-        }]
-    }
-    logger.info(f"RS256 signing key loaded from {_RSA_KEY_PATH}")
-
-_load_rsa_keys()
-MAX_REGISTERED_CLIENTS = 20
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX_REQUESTS = 10  # per window per IP per endpoint
-REGISTRATION_SECRET = os.environ.get("MAESTRO_REGISTRATION_SECRET")
-AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")  # SHA-256 of the PIN
-STATIC_CLIENT_ID = os.environ.get("MAESTRO_OAUTH_CLIENT_ID")
-STATIC_CLIENT_SECRET = os.environ.get("MAESTRO_OAUTH_CLIENT_SECRET")
-
-
-# ---------------------------------------------------------------------------
-# Audit logging
-# ---------------------------------------------------------------------------
 
 def _audit(event: str, **kwargs: Any) -> None:
-    """Emit a structured JSON audit log entry."""
     entry = {"ts": time.time(), "event": event, **kwargs}
     audit_logger.info(json.dumps(entry))
 
 
-# ---------------------------------------------------------------------------
-# Rate limiter
-# ---------------------------------------------------------------------------
+class MaestroOAuthProvider:
+    """OAuth 2.0 provider for Maestro MCP.
 
-class _RateLimiter:
-    """In-memory sliding window rate limiter."""
+    Claude.ai → auto-approve (redirect_uri gated).
+    Other clients → consent page + PIN gate.
+    Registration rate-limited to 10/min.
+    """
 
-    def __init__(self, max_requests: int = RATE_LIMIT_MAX_REQUESTS,
-                 window: int = RATE_LIMIT_WINDOW):
-        self.max_requests = max_requests
-        self.window = window
-        self._buckets: dict[str, deque[float]] = {}
+    REG_RATE_LIMIT = 10
+    REG_RATE_WINDOW = 60  # seconds
 
-    def is_allowed(self, key: str) -> bool:
+    def __init__(self, issuer_url: str):
+        self.issuer_url = issuer_url.rstrip("/")
+        self.clients: dict[str, OAuthClientInformationFull] = {}
+        self.auth_codes: dict[str, AuthorizationCode] = {}
+        self.access_tokens: dict[str, AccessToken] = {}
+        self.refresh_tokens: dict[str, RefreshToken] = {}
+        self.pending_approvals: dict[str, dict] = {}
+        self._reg_timestamps: list[float] = []
+
+    # --- OAuthAuthorizationServerProvider protocol ---
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self.clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         now = time.time()
-        cutoff = now - self.window
-        bucket = self._buckets.get(key)
-        if bucket is None:
-            bucket = deque()
-            self._buckets[key] = bucket
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= self.max_requests:
-            return False
-        bucket.append(now)
-        return True
+        self._reg_timestamps = [t for t in self._reg_timestamps
+                                if now - t < self.REG_RATE_WINDOW]
+        if len(self._reg_timestamps) >= self.REG_RATE_LIMIT:
+            _audit("register_rate_limited")
+            raise ValueError("Too many registration requests — try again later")
+        self._reg_timestamps.append(now)
 
-    def cleanup(self) -> None:
-        """Remove empty buckets."""
-        empty = [k for k, v in self._buckets.items() if not v]
-        for k in empty:
-            del self._buckets[k]
+        self.clients[client_info.client_id] = client_info
+        _audit("client_registered", client_id=client_info.client_id,
+               client_name=client_info.client_name)
+        logger.info("client_registered: %s", client_info.client_id)
+
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        redirect_str = str(params.redirect_uri).rstrip("/")
+
+        # All clients → consent page + PIN gate.
+        approval_id = secrets.token_urlsafe(24)
+        self.pending_approvals[approval_id] = {
+            "client_id": client.client_id,
+            "client_name": client.client_name or client.client_id,
+            "params": params,
+            "created_at": time.time(),
+        }
+        _audit("authorize_pending", client_id=client.client_id)
+        logger.info("authorize_consent: client=%s → /approve?id=%s",
+                     client.client_id, approval_id)
+        return f"{self.issuer_url}/approve?id={approval_id}"
+
+    async def load_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: str,
+    ) -> AuthorizationCode | None:
+        return self.auth_codes.pop(authorization_code, None)
+
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        now = int(time.time())
+        access_tok = secrets.token_urlsafe(32)
+        refresh_tok = secrets.token_urlsafe(32)
+
+        self.access_tokens[access_tok] = AccessToken(
+            token=access_tok,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes or ["maestro"],
+            expires_at=now + TOKEN_EXPIRY,
+            resource=authorization_code.resource,
+        )
+        self.refresh_tokens[refresh_tok] = RefreshToken(
+            token=refresh_tok,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes or ["maestro"],
+            expires_at=now + REFRESH_TOKEN_EXPIRY,
+        )
+        _audit("token_issued", client_id=client.client_id, expires_in=TOKEN_EXPIRY)
+        logger.info("token_issued: access=%s... stored=%d",
+                     access_tok[:20], len(self.access_tokens))
+
+        return OAuthToken(
+            access_token=access_tok,
+            token_type="Bearer",
+            expires_in=TOKEN_EXPIRY,
+            scope=" ".join(authorization_code.scopes or ["maestro"]),
+            refresh_token=refresh_tok,
+        )
+
+    async def load_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: str,
+    ) -> RefreshToken | None:
+        return self.refresh_tokens.get(refresh_token)
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        del self.refresh_tokens[refresh_token.token]
+        now = int(time.time())
+        access_tok = secrets.token_urlsafe(32)
+        new_refresh = secrets.token_urlsafe(32)
+
+        self.access_tokens[access_tok] = AccessToken(
+            token=access_tok,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=now + TOKEN_EXPIRY,
+        )
+        self.refresh_tokens[new_refresh] = RefreshToken(
+            token=new_refresh,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=now + REFRESH_TOKEN_EXPIRY,
+        )
+        _audit("token_refreshed", client_id=client.client_id)
+
+        return OAuthToken(
+            access_token=access_tok,
+            token_type="Bearer",
+            expires_in=TOKEN_EXPIRY,
+            scope=" ".join(scopes),
+            refresh_token=new_refresh,
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        logger.info("load_access_token: token=%s... stored=%d",
+                     token[:20] if token else "None", len(self.access_tokens))
+        at = self.access_tokens.get(token)
+        if at and at.expires_at and at.expires_at < time.time():
+            logger.info("load_access_token: EXPIRED for %s", at.client_id)
+            del self.access_tokens[token]
+            return None
+        if at:
+            logger.info("load_access_token: OK client=%s scopes=%s", at.client_id, at.scopes)
+        else:
+            logger.info("load_access_token: NOT FOUND (known tokens: %s)",
+                         [t[:12] + "..." for t in self.access_tokens.keys()])
+        return at
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if isinstance(token, AccessToken):
+            self.access_tokens.pop(token.token, None)
+        else:
+            self.refresh_tokens.pop(token.token, None)
+
+    # --- Internal ---
+
+    def _store_auth_code(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        code_str = secrets.token_urlsafe(32)
+        self.auth_codes[code_str] = AuthorizationCode(
+            code=code_str,
+            scopes=params.scopes or [],
+            expires_at=time.time() + AUTH_CODE_TTL,
+            client_id=client.client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+        )
+        now = time.time()
+        expired = [c for c, ac in self.auth_codes.items() if ac.expires_at < now]
+        for c in expired:
+            del self.auth_codes[c]
+        return code_str
+
+    # --- /approve consent page ---
+
+    async def handle_approve(self, request: Request) -> Response:
+        if request.method == "GET":
+            return await self._approve_get(request)
+        return await self._approve_post(request)
+
+    async def _approve_get(self, request: Request) -> Response:
+        approval_id = request.query_params.get("id", "")
+        pending = self.pending_approvals.get(approval_id)
+        if not pending or time.time() - pending["created_at"] > AUTH_CODE_TTL:
+            self.pending_approvals.pop(approval_id, None)
+            return HTMLResponse(
+                _error_page("Expired", "This authorization request has expired."),
+                status_code=400,
+            )
+
+        csrf = secrets.token_urlsafe(32)
+        pending["csrf"] = csrf
+
+        return HTMLResponse(_approve_page(
+            client_name=pending["client_name"],
+            approval_id=approval_id,
+            csrf_token=csrf,
+        ))
+
+    async def _approve_post(self, request: Request) -> Response:
+        form = await request.form()
+        approval_id = str(form.get("id", ""))
+        csrf = str(form.get("csrf_token", ""))
+        action = str(form.get("action", "approve"))
+        pin = str(form.get("pin", ""))
+
+        pending = self.pending_approvals.pop(approval_id, None)
+        if not pending:
+            return HTMLResponse(
+                _error_page("Invalid", "Unknown or expired request."),
+                status_code=400,
+            )
+
+        if csrf != pending.get("csrf", ""):
+            return HTMLResponse(
+                _error_page("CSRF Error", "Invalid CSRF token."),
+                status_code=403,
+            )
+
+        params: AuthorizationParams = pending["params"]
+
+        if action == "deny":
+            _audit("authorize_denied", client_id=pending["client_id"])
+            return RedirectResponse(
+                url=construct_redirect_uri(
+                    str(params.redirect_uri),
+                    error="access_denied",
+                    state=params.state,
+                ),
+                status_code=302,
+            )
+
+        if AUTHORIZE_PIN_HASH:
+            pin_hash = hashlib.sha256(pin.encode()).hexdigest()
+            if not hmac.compare_digest(pin_hash, AUTHORIZE_PIN_HASH):
+                _audit("authorize_pin_rejected", client_id=pending["client_id"])
+                return HTMLResponse(
+                    _error_page("Invalid PIN", "The authorization PIN is incorrect."),
+                    status_code=403,
+                )
+
+        client = self.clients.get(pending["client_id"])
+        if not client:
+            return HTMLResponse(
+                _error_page("Error", "Client no longer exists."),
+                status_code=400,
+            )
+
+        code = self._store_auth_code(client, params)
+        _audit("authorize_approved", client_id=client.client_id)
+
+        redirect_url = construct_redirect_uri(
+            str(params.redirect_uri), code=code, state=params.state,
+        )
+        logger.info("approve_redirect: %s", redirect_url)
+
+        return RedirectResponse(url=redirect_url, status_code=302)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# HTML templates
 # ---------------------------------------------------------------------------
 
-def _get_client_ip(scope: Scope) -> str:
-    """Extract real client IP, preferring CF-Connecting-IP."""
-    headers = dict(scope.get("headers", []))
-    cf_ip = headers.get(b"cf-connecting-ip")
-    if cf_ip:
-        return cf_ip.decode("ascii", errors="replace").strip()
-    client = scope.get("client")
-    if client:
-        return client[0]
-    return "unknown"
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OAuthClient:
-    client_id: str
-    client_secret: str | None = None
-    redirect_uris: list[str] = field(default_factory=list)
-    client_name: str = ""
-    created_at: float = 0.0
-
-
-@dataclass
-class AuthCode:
-    code: str
-    client_id: str
-    redirect_uri: str
-    code_challenge: str
-    code_challenge_method: str
-    created_at: float
-    ttl: int = 300  # 5 minutes
-    resource: str = ""  # RFC 8707 resource indicator → becomes JWT aud
-
-
-# ---------------------------------------------------------------------------
-# ASGI helpers
-# ---------------------------------------------------------------------------
-
-async def _read_body(receive: Receive) -> bytes:
-    body = b""
-    while True:
-        message = await receive()
-        body += message.get("body", b"")
-        if not message.get("more_body", False):
-            break
-    return body
-
-
-async def _send_json(send: Send, status: int, data: dict, extra_headers: list | None = None) -> None:
-    body = json.dumps(data).encode()
-    headers = [
-        [b"content-type", b"application/json"],
-        [b"content-length", str(len(body)).encode()],
-        [b"cache-control", b"no-store"],
-    ]
-    if extra_headers:
-        headers.extend(extra_headers)
-    await send({"type": "http.response.start", "status": status, "headers": headers})
-    await send({"type": "http.response.body", "body": body})
-
-
-async def _send_html(send: Send, status: int, html: str) -> None:
-    body = html.encode()
-    await send({
-        "type": "http.response.start",
-        "status": status,
-        "headers": [
-            [b"content-type", b"text/html; charset=utf-8"],
-            [b"content-length", str(len(body)).encode()],
-        ],
-    })
-    await send({"type": "http.response.body", "body": body})
-
-
-async def _send_redirect(send: Send, location: str) -> None:
-    await send({
-        "type": "http.response.start",
-        "status": 302,
-        "headers": [
-            [b"location", location.encode()],
-            [b"content-length", b"0"],
-        ],
-    })
-    await send({"type": "http.response.body", "body": b""})
-
-
-def _parse_qs(query: str) -> dict[str, str]:
-    """Parse query string, returning first value for each key."""
-    parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
-    return {k: v[0] for k, v in parsed.items()}
-
-
-def _parse_form(body: bytes) -> dict[str, str]:
-    """Parse application/x-www-form-urlencoded body."""
-    return _parse_qs(body.decode("utf-8", errors="replace"))
-
-
-# ---------------------------------------------------------------------------
-# PKCE verification
-# ---------------------------------------------------------------------------
-
-def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
-    if method != "S256":
-        return False  # Only S256 is allowed
-    computed = hashlib.sha256(verifier.encode("ascii")).digest()
-    expected = base64.urlsafe_b64encode(computed).rstrip(b"=").decode("ascii")
-    return hmac.compare_digest(expected, challenge)
-
-
-def _verify_authorize_pin(pin: str) -> bool:
-    """Verify the authorize PIN against stored hash."""
-    if not AUTHORIZE_PIN_HASH:
-        return True  # No PIN configured = no gate (backward compat)
-    pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-    return hmac.compare_digest(pin_hash, AUTHORIZE_PIN_HASH)
-
-
-# ---------------------------------------------------------------------------
-# Authorization page HTML
-# ---------------------------------------------------------------------------
-
-def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
-                    state: str, code_challenge: str, code_challenge_method: str,
-                    csrf_token: str = "", show_pin: bool = True,
-                    resource: str = "") -> str:
+def _approve_page(client_name: str, approval_id: str, csrf_token: str) -> str:
+    safe_name = html_mod.escape(client_name)
+    safe_id = html_mod.escape(approval_id)
+    safe_csrf = html_mod.escape(csrf_token)
     return f"""<!DOCTYPE html>
 <html>
 <head>
     <title>Maestro — Authorize</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a1a;
-            color: #e0e0e0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-        }}
-        .card {{
-            background: #1a1a2e;
-            border: 1px solid #2a2a4a;
-            border-radius: 12px;
-            padding: 2rem;
-            max-width: 400px;
-            width: 90%;
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
-        }}
-        h1 {{
-            font-size: 1.3rem;
-            margin: 0 0 0.5rem 0;
-            color: #00d4ff;
-        }}
-        .client {{
-            color: #ff6b9d;
-            font-weight: 600;
-        }}
-        .perms {{
-            background: #12122a;
-            border: 1px solid #2a2a4a;
-            border-radius: 8px;
-            padding: 1rem;
-            margin: 1rem 0;
-            font-size: 0.9rem;
-        }}
-        .perms li {{
-            margin: 0.3rem 0;
-        }}
-        .buttons {{
-            display: flex;
-            gap: 1rem;
-            margin-top: 1.5rem;
-        }}
-        button {{
-            flex: 1;
-            padding: 0.75rem;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
-            cursor: pointer;
-            font-weight: 600;
-        }}
-        .approve {{
-            background: #00d4ff;
-            color: #0a0a1a;
-        }}
-        .approve:hover {{
-            background: #00b8e6;
-        }}
-        .deny {{
-            background: #2a2a4a;
-            color: #e0e0e0;
-        }}
-        .deny:hover {{
-            background: #3a3a5a;
-        }}
-        .pin-field {{
-            margin: 1rem 0 0.5rem 0;
-        }}
-        .pin-field label {{
-            font-size: 0.9rem;
-            color: #aaa;
-        }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a1a; color: #e0e0e0;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0; }}
+        .card {{ background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
+            padding: 2rem; max-width: 400px; width: 90%;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); }}
+        h1 {{ font-size: 1.3rem; margin: 0 0 0.5rem 0; color: #00d4ff; }}
+        .client {{ color: #ff6b9d; font-weight: 600; }}
+        .perms {{ background: #12122a; border: 1px solid #2a2a4a; border-radius: 8px;
+            padding: 1rem; margin: 1rem 0; font-size: 0.9rem; }}
+        .perms li {{ margin: 0.3rem 0; }}
+        .buttons {{ display: flex; gap: 1rem; margin-top: 1.5rem; }}
+        button {{ flex: 1; padding: 0.75rem; border: none; border-radius: 8px;
+            font-size: 1rem; cursor: pointer; font-weight: 600; }}
+        .approve {{ background: #00d4ff; color: #0a0a1a; }}
+        .approve:hover {{ background: #00b8e6; }}
+        .deny {{ background: #2a2a4a; color: #e0e0e0; }}
+        .deny:hover {{ background: #3a3a5a; }}
+        .pin-field {{ margin: 1rem 0 0.5rem 0; }}
+        .pin-field label {{ font-size: 0.9rem; color: #aaa; }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>⚡ Maestro</h1>
-        <p><span class="client">{client_name or client_id}</span> wants access to Maestro.</p>
+        <h1>Maestro</h1>
+        <p><span class="client">{safe_name}</span> wants access to Maestro.</p>
         <div class="perms">
             <strong>This will allow:</strong>
             <ul>
@@ -372,15 +373,17 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
                 <li>Transfer files between machines</li>
             </ul>
         </div>
-        <form method="POST" action="/oauth/authorize">
-            <input type="hidden" name="client_id" value="{client_id}">
-            <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-            <input type="hidden" name="state" value="{state}">
-            <input type="hidden" name="code_challenge" value="{code_challenge}">
-            <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <input type="hidden" name="resource" value="{resource}">
-            {'<div class="pin-field"><label for="pin">Authorization PIN:</label><input type="password" id="pin" name="pin" placeholder="Enter PIN" autocomplete="off" required style="width:100%; padding:0.6rem; border:1px solid #2a2a4a; border-radius:6px; background:#12122a; color:#e0e0e0; font-family:monospace; font-size:1rem; margin-top:0.4rem;"></div>' if show_pin else ''}
+        <form method="POST" action="/approve">
+            <input type="hidden" name="id" value="{safe_id}">
+            <input type="hidden" name="csrf_token" value="{safe_csrf}">
+            <div class="pin-field">
+                <label for="pin">Authorization PIN:</label>
+                <input type="password" id="pin" name="pin" placeholder="Enter PIN"
+                    autocomplete="off" required
+                    style="width:100%; padding:0.6rem; border:1px solid #2a2a4a;
+                    border-radius:6px; background:#12122a; color:#e0e0e0;
+                    font-family:monospace; font-size:1rem; margin-top:0.4rem;">
+            </div>
             <div class="buttons">
                 <button type="submit" name="action" value="deny" class="deny">Deny</button>
                 <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -391,636 +394,31 @@ def _authorize_page(client_name: str, client_id: str, redirect_uri: str,
 </html>"""
 
 
-# ---------------------------------------------------------------------------
-# FleetOAuthMiddleware
-# ---------------------------------------------------------------------------
-
 def _error_page(title: str, message: str) -> str:
-    """Render a styled error page."""
+    safe_title = html_mod.escape(title)
+    safe_msg = html_mod.escape(message)
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Maestro — {title}</title>
+    <title>Maestro — {safe_title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: #0a0a1a; color: #e0e0e0;
             display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; margin: 0;
-        }}
-        .card {{
-            background: #1a1a2e; border: 1px solid #ff4444;
-            border-radius: 12px; padding: 2rem; max-width: 400px;
-            width: 90%; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
-            text-align: center;
-        }}
+            min-height: 100vh; margin: 0; }}
+        .card {{ background: #1a1a2e; border: 1px solid #ff4444; border-radius: 12px;
+            padding: 2rem; max-width: 400px; width: 90%;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); text-align: center; }}
         h1 {{ font-size: 1.3rem; color: #ff4444; margin: 0 0 1rem 0; }}
         a {{ color: #00d4ff; }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>\u26a0\ufe0f {title}</h1>
-        <p>{message}</p>
+        <h1>{safe_title}</h1>
+        <p>{safe_msg}</p>
         <p style="margin-top:1.5rem"><a href="javascript:window.close()">Close this tab</a></p>
     </div>
 </body>
 </html>"""
-
-
-def _success_page(redirect_url: str) -> str:
-    """Render a success interstitial that redirects after a brief pause."""
-    import html as html_mod
-    escaped_url = html_mod.escape(redirect_url, quote=True)
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Maestro — Authorized</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a1a; color: #e0e0e0;
-            display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; margin: 0;
-        }}
-        .card {{
-            background: #1a1a2e; border: 1px solid #00d4ff;
-            border-radius: 12px; padding: 2rem; max-width: 400px;
-            width: 90%; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
-            text-align: center;
-        }}
-        h1 {{ font-size: 1.3rem; color: #00d4ff; margin: 0 0 1rem 0; }}
-        .spinner {{
-            display: inline-block; width: 20px; height: 20px;
-            border: 2px solid #2a2a4a; border-top: 2px solid #00d4ff;
-            border-radius: 50%; animation: spin 0.8s linear infinite;
-            vertical-align: middle; margin-right: 0.5rem;
-        }}
-        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-        a {{ color: #00d4ff; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>\u2705 Authorized</h1>
-        <p>Maestro access granted.</p>
-        <p style="margin-top:1rem; color:#888;">
-            <span class="spinner"></span>Completing handshake...
-        </p>
-        <p style="margin-top:1.5rem; font-size:0.85rem; color:#666;">
-            If nothing happens, <a href="{escaped_url}">click here</a>
-            or close this tab.
-        </p>
-    </div>
-    <script>
-        // Give the user a moment to see the success message, then redirect
-        setTimeout(function() {{
-            window.location.href = "{escaped_url}";
-        }}, 1500);
-        // Try to close the tab after the redirect has had time to process
-        setTimeout(function() {{
-            window.close();
-        }}, 4000);
-    </script>
-</body>
-</html>"""
-
-
-class MaestroOAuthMiddleware:
-    """ASGI middleware implementing OAuth 2.0 for Maestro MCP.
-
-    Intercepts OAuth-related paths before they reach the MCP app.
-    All other paths require a valid Bearer token.
-    """
-
-    # Paths that don't require authentication
-    OPEN_PATHS = {
-        "/.well-known/oauth-authorization-server",
-        "/.well-known/openid-configuration",
-        "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp",
-        "/oauth/authorize",
-        "/oauth/token",
-        "/oauth/register",
-        "/oauth/jwks",
-        "/register",
-        "/authorize",
-        "/token",
-    }
-
-    def __init__(self, app: ASGIApp, bearer_token: str | None, issuer_url: str):
-        self.app = app
-        self.bearer_token = bearer_token  # Used as JWT signing key
-        self.issuer_url = issuer_url.rstrip("/")
-        self.clients: dict[str, OAuthClient] = {}
-        self.auth_codes: dict[str, AuthCode] = {}
-        self.csrf_tokens: dict[str, float] = {}  # token -> created_at
-        self._rate_limiter = _RateLimiter()
-        self._last_cleanup = time.time()
-
-        # Pre-load static client for Claude.ai "OAuth Client ID and Secret" mode.
-        # redirect_uris is intentionally empty: any https:// URI is accepted.
-        if STATIC_CLIENT_ID and STATIC_CLIENT_SECRET:
-            self.clients[STATIC_CLIENT_ID] = OAuthClient(
-                client_id=STATIC_CLIENT_ID,
-                client_secret=STATIC_CLIENT_SECRET,
-                redirect_uris=[],  # empty = accept any https:// redirect
-                client_name="Claude.ai",
-                created_at=0.0,   # permanent — never evicted
-            )
-            logger.info(f"pre-registered static client: {STATIC_CLIENT_ID!r}")
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = scope.get("path", "")
-        method = scope.get("method", "GET")
-        _ip = _get_client_ip(scope)
-        _hdrs = dict(scope.get("headers", []))
-        _has_auth = b"authorization" in _hdrs
-        logger.info(f"recv: {method} {path} from {_ip} auth={'yes' if _has_auth else 'no'}")
-
-        # Periodic cleanup (every 5 minutes)
-        now = time.time()
-        if now - self._last_cleanup > 300:
-            self._rate_limiter.cleanup()
-            self._purge_csrf_tokens()
-            self._last_cleanup = now
-
-        # Rate limit OAuth endpoints
-        if path in ("/oauth/register", "/oauth/token", "/oauth/authorize",
-                     "/register", "/token", "/authorize"):
-            client_ip = _get_client_ip(scope)
-            if not self._rate_limiter.is_allowed(f"{path}:{client_ip}"):
-                _audit("rate_limited", ip=client_ip, path=path)
-                await _send_json(send, 429, {
-                    "error": "too_many_requests",
-                    "error_description": "Rate limit exceeded. Try again later.",
-                }, [[b"retry-after", b"60"]])
-                return
-
-        # --- OAuth endpoints (no auth required) ---
-
-        if path in ("/.well-known/oauth-authorization-server",
-                    "/.well-known/openid-configuration"):
-            await self._handle_metadata(send)
-            return
-
-        if path in ("/.well-known/oauth-protected-resource",
-                     "/.well-known/oauth-protected-resource/mcp"):
-            await self._handle_protected_resource_metadata(send)
-            return
-
-        if path == "/oauth/jwks" and method == "GET":
-            await self._handle_jwks(send)
-            return
-
-        if path in ("/oauth/register", "/register") and method == "POST":
-            body = await _read_body(receive)
-            await self._handle_register(send, body, scope)
-            return
-
-        if path in ("/oauth/authorize", "/authorize"):
-            if method == "GET":
-                qs = _parse_qs(scope.get("query_string", b"").decode())
-                await self._handle_authorize_get(send, qs)
-            elif method == "POST":
-                body = await _read_body(receive)
-                await self._handle_authorize_post(send, body, scope)
-            else:
-                await _send_json(send, 405, {"error": "method_not_allowed"})
-            return
-
-        if path in ("/oauth/token", "/token") and method == "POST":
-            body = await _read_body(receive)
-            await self._handle_token(send, body)
-            return
-
-        # --- All other paths: require valid JWT ---
-
-        if not _RSA_PUBLIC_KEY:
-            _audit("auth_bypass_blocked", reason="no_signing_key_configured")
-            await _send_json(send, 503, {
-                "error": "server_misconfigured",
-                "error_description": "Authentication not configured.",
-            })
-            return
-
-        _rm_url = f"{self.issuer_url}/.well-known/oauth-protected-resource"
-        _www_auth = f'Bearer resource_metadata="{_rm_url}"'.encode()
-
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
-        path = scope.get("path", "?")
-        method = scope.get("method", "?")
-        client_ip = (scope.get("client") or ("?", 0))[0]
-        if not auth.startswith("Bearer "):
-            logger.info(f"401 no-bearer: {method} {path} from {client_ip} auth={auth[:40]!r}")
-            await _send_json(send, 401, {"error": "unauthorized"}, [
-                [b"www-authenticate", _www_auth],
-            ])
-            return
-
-        token = auth[7:]
-        try:
-            claims = jwt.decode(
-                token,
-                _RSA_PUBLIC_KEY,
-                algorithms=[JWT_ALGORITHM],
-                issuer=self.issuer_url,
-                options={"require": ["sub", "exp", "iss", "jti"], "verify_aud": False},
-            )
-            logger.info(f"200 auth-ok: {method} {path} sub={claims.get('sub')} jti={claims.get('jti','?')[:8]}")
-        except jwt.ExpiredSignatureError:
-            _audit("token_rejected", reason="expired")
-            await _send_json(send, 401, {
-                "error": "unauthorized",
-                "error_description": "Token expired.",
-            }, [[b"www-authenticate", _www_auth]])
-            return
-        except jwt.InvalidTokenError as e:
-            logger.info(f"401 jwt-error: {method} {path} from {client_ip} token={token[:40]!r} err={e}")
-            _audit("token_rejected", reason=str(e))
-            await _send_json(send, 401, {"error": "unauthorized"}, [
-                [b"www-authenticate", _www_auth],
-            ])
-            return
-
-        await self.app(scope, receive, send)
-
-    # --- Internal helpers ---
-
-    def _purge_csrf_tokens(self) -> None:
-        now = time.time()
-        expired = [t for t, ts in self.csrf_tokens.items() if now - ts > 300]
-        for t in expired:
-            del self.csrf_tokens[t]
-
-    # --- Endpoint handlers ---
-
-    async def _handle_metadata(self, send: Send) -> None:
-        """RFC 8414 — OAuth Authorization Server Metadata."""
-        metadata: dict = {
-            "issuer": self.issuer_url,
-            "authorization_endpoint": f"{self.issuer_url}/authorize",
-            "token_endpoint": f"{self.issuer_url}/token",
-            "registration_endpoint": f"{self.issuer_url}/register",
-            "jwks_uri": f"{self.issuer_url}/oauth/jwks",
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
-            "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
-            "code_challenge_methods_supported": ["S256"],
-            "scopes_supported": ["maestro"],
-        }
-        await _send_json(send, 200, metadata)
-
-    async def _handle_jwks(self, send: Send) -> None:
-        """Serve JWKS (JSON Web Key Set) — public key for RS256 JWT verification."""
-        if _JWKS_RESPONSE:
-            await _send_json(send, 200, _JWKS_RESPONSE)
-        else:
-            await _send_json(send, 503, {"error": "jwks_unavailable"})
-
-    async def _handle_protected_resource_metadata(self, send: Send) -> None:
-        """RFC 9728 — OAuth Protected Resource Metadata."""
-        await _send_json(send, 200, {
-            "resource": f"{self.issuer_url}/mcp",
-            "authorization_servers": [self.issuer_url],
-            "scopes_supported": ["maestro"],
-            "bearer_methods_supported": ["header"],
-        })
-
-    async def _handle_register(self, send: Send, body: bytes, scope: Scope) -> None:
-        """RFC 7591 — Dynamic Client Registration (gated)."""
-        client_ip = _get_client_ip(scope)
-
-        # Gate 1: Require registration secret
-        if REGISTRATION_SECRET:
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if not hmac.compare_digest(auth, f"Bearer {REGISTRATION_SECRET}"):
-                _audit("register_rejected", ip=client_ip, reason="bad_secret")
-                await _send_json(send, 401, {
-                    "error": "unauthorized",
-                    "error_description": "Valid registration secret required.",
-                })
-                return
-
-        # Gate 2: Cap number of clients
-        if len(self.clients) >= MAX_REGISTERED_CLIENTS:
-            _audit("register_rejected", ip=client_ip, reason="max_clients")
-            await _send_json(send, 403, {
-                "error": "client_limit_reached",
-                "error_description": f"Maximum {MAX_REGISTERED_CLIENTS} clients.",
-            })
-            return
-
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            await _send_json(send, 400, {"error": "invalid_request"})
-            return
-
-        # Gate 3: Validate redirect_uris
-        redirect_uris = data.get("redirect_uris", [])
-        if not isinstance(redirect_uris, list) or not redirect_uris:
-            await _send_json(send, 400, {
-                "error": "invalid_request",
-                "error_description": "At least one redirect_uri is required.",
-            })
-            return
-
-        for uri in redirect_uris:
-            if not isinstance(uri, str):
-                await _send_json(send, 400, {
-                    "error": "invalid_request",
-                    "error_description": "redirect_uris must be strings.",
-                })
-                return
-            parsed = urllib.parse.urlparse(uri)
-            if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
-                continue
-            if parsed.scheme == "https":
-                continue
-            await _send_json(send, 400, {
-                "error": "invalid_request",
-                "error_description": f"Invalid redirect_uri scheme: {uri}",
-            })
-            return
-
-        client_id = f"maestro-{secrets.token_hex(8)}"
-        client_secret = secrets.token_urlsafe(32)
-        client_name = data.get("client_name", "")
-
-        client = OAuthClient(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uris=redirect_uris,
-            client_name=client_name,
-            created_at=time.time(),
-        )
-        self.clients[client_id] = client
-        _audit("client_registered", client_id=client_id, client_name=client_name, ip=client_ip)
-
-        await _send_json(send, 201, {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "client_name": client_name,
-            "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "client_secret_post",
-        })
-
-    async def _handle_authorize_get(self, send: Send, params: dict) -> None:
-        """Show the approve/deny page."""
-        client_id = params.get("client_id", "")
-        redirect_uri = params.get("redirect_uri", "")
-        state = params.get("state", "")
-        code_challenge = params.get("code_challenge", "")
-        code_challenge_method = params.get("code_challenge_method", "S256")
-        resource = params.get("resource", "")  # RFC 8707
-
-        if not client_id or not redirect_uri:
-            await _send_json(send, 400, {"error": "invalid_request",
-                                          "error_description": "Missing client_id or redirect_uri"})
-            return
-
-        # Require registered client
-        client = self.clients.get(client_id)
-        if not client:
-            await _send_json(send, 400, {
-                "error": "unauthorized_client",
-                "error_description": "Unknown client_id. Register first.",
-            })
-            return
-
-        # Validate redirect_uri
-        if client.redirect_uris:
-            if redirect_uri not in client.redirect_uris:
-                await _send_json(send, 400, {
-                    "error": "invalid_request",
-                    "error_description": "redirect_uri does not match registration.",
-                })
-                return
-        else:
-            # No redirect_uris configured (pre-registered static client) → accept any https://
-            parsed = urllib.parse.urlparse(redirect_uri)
-            if parsed.scheme != "https":
-                await _send_json(send, 400, {
-                    "error": "invalid_request",
-                    "error_description": "redirect_uri must use https.",
-                })
-                return
-
-        # S256 only
-        if code_challenge_method != "S256":
-            await _send_json(send, 400, {
-                "error": "invalid_request",
-                "error_description": "Only S256 code_challenge_method is supported.",
-            })
-            return
-
-        # Generate CSRF token
-        csrf_token = secrets.token_urlsafe(32)
-        self.csrf_tokens[csrf_token] = time.time()
-
-        html = _authorize_page(
-            client_name=client.client_name or client_id,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            state=state,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-            csrf_token=csrf_token,
-            show_pin=not bool(client.client_secret),
-            resource=resource,
-        )
-        await _send_html(send, 200, html)
-
-    async def _handle_authorize_post(self, send: Send, body: bytes, scope: Scope) -> None:
-        """Process the approve/deny form submission."""
-        form = _parse_form(body)
-        client_ip = _get_client_ip(scope)
-        action = form.get("action", "deny")
-        client_id = form.get("client_id", "")
-        redirect_uri = form.get("redirect_uri", "")
-        state = form.get("state", "")
-        code_challenge = form.get("code_challenge", "")
-        code_challenge_method = form.get("code_challenge_method", "S256")
-        resource = form.get("resource", "")  # RFC 8707
-
-        # Validate authorize PIN (before anything else).
-        # Confidential clients (pre-registered with client_secret) skip the PIN:
-        # the client_secret is their authentication; the user just clicks Approve.
-        client_obj = self.clients.get(client_id)
-        is_confidential_client = bool(client_obj and client_obj.client_secret)
-        pin = form.get("pin", "")
-        if action == "approve" and not is_confidential_client and not _verify_authorize_pin(pin):
-            _audit("authorize_pin_rejected", ip=client_ip, client_id=client_id)
-            await _send_html(send, 403, _error_page(
-                "Invalid PIN",
-                "The authorization PIN is incorrect. Access denied.",
-            ))
-            return
-
-        # Validate CSRF token
-        csrf_token = form.get("csrf_token", "")
-        stored_time = self.csrf_tokens.pop(csrf_token, None)
-        if stored_time is None or (time.time() - stored_time > 300):
-            _audit("csrf_rejected", ip=client_ip, client_id=client_id)
-            await _send_json(send, 403, {"error": "invalid_csrf_token"})
-            return
-
-        # Validate client exists
-        if client_id not in self.clients:
-            _audit("authorize_rejected", reason="unknown_client", client_id=client_id, ip=client_ip)
-            sep = "&" if "?" in redirect_uri else "?"
-            location = f"{redirect_uri}{sep}error=unauthorized_client&state={urllib.parse.quote(state)}"
-            await _send_redirect(send, location)
-            return
-
-        if action == "deny":
-            _audit("authorize_denied", client_id=client_id, ip=client_ip)
-            sep = "&" if "?" in redirect_uri else "?"
-            location = f"{redirect_uri}{sep}error=access_denied&state={urllib.parse.quote(state)}"
-            await _send_redirect(send, location)
-            return
-
-        # Generate authorization code
-        code = secrets.token_urlsafe(32)
-        self.auth_codes[code] = AuthCode(
-            code=code,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-            created_at=time.time(),
-            resource=resource,
-        )
-        _audit("authorize_approved", client_id=client_id, ip=client_ip)
-
-        # Purge expired codes
-        now = time.time()
-        expired = [c for c, ac in self.auth_codes.items() if now - ac.created_at > ac.ttl]
-        for c in expired:
-            del self.auth_codes[c]
-
-        sep = "&" if "?" in redirect_uri else "?"
-        location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}&state={urllib.parse.quote(state)}"
-        await _send_redirect(send, location)
-
-    async def _handle_token(self, send: Send, body: bytes) -> None:
-        """Exchange authorization code for per-client JWT."""
-        form = _parse_form(body)
-        # Log full token exchange request (redact secrets)
-        _form_log = {k: (v[:8] + "..." if k in ("client_secret", "code_verifier", "code") else v)
-                     for k, v in form.items()}
-        logger.info(f"token-exchange request: {_form_log}")
-        grant_type = form.get("grant_type", "")
-        code = form.get("code", "")
-        client_id = form.get("client_id", "")
-        code_verifier = form.get("code_verifier", "")
-        resource = form.get("resource", "")  # RFC 8707 — also required in token request
-
-        if grant_type != "authorization_code":
-            _audit("token_rejected", reason="unsupported_grant_type", client_id=client_id)
-            await _send_json(send, 400, {"error": "unsupported_grant_type"})
-            return
-
-        auth_code = self.auth_codes.pop(code, None)
-        if not auth_code:
-            _audit("token_rejected", reason="unknown_or_expired_code", client_id=client_id)
-            await _send_json(send, 400, {"error": "invalid_grant",
-                                          "error_description": "Unknown or expired code"})
-            return
-
-        # Check expiration
-        if time.time() - auth_code.created_at > auth_code.ttl:
-            _audit("token_rejected", reason="code_expired", client_id=client_id)
-            await _send_json(send, 400, {"error": "invalid_grant",
-                                          "error_description": "Code expired"})
-            return
-
-        # Check client_id matches.
-        # Claude.ai's load balancer routes the token exchange to a different
-        # backend node than the one that started the OAuth flow, causing both
-        # client_id and PKCE mismatches. We tolerate this: the auth code is
-        # single-use, PIN-gated, and bound to a specific redirect_uri.
-        client_id_match = (auth_code.client_id == client_id)
-        if not client_id_match:
-            _audit("token_client_id_mismatch",
-                   expected=auth_code.client_id, got=client_id)
-            client_id = auth_code.client_id
-
-        # Validate client_secret for confidential clients (pre-registered static clients).
-        # For public clients (dynamic registration, no secret) this is skipped.
-        client = self.clients.get(client_id)
-        is_confidential = bool(client and client.client_secret)
-        if is_confidential:
-            form_secret = form.get("client_secret", "")
-            if not form_secret or not hmac.compare_digest(form_secret, client.client_secret):
-                _audit("token_rejected", reason="invalid_client_secret", client_id=client_id)
-                await _send_json(send, 401, {
-                    "error": "invalid_client",
-                    "error_description": "Invalid client credentials.",
-                })
-                return
-
-        # Verify PKCE.
-        # Skip for confidential clients — they authenticate via client_secret instead.
-        # Skip when client_id mismatched — different LB node holds a different verifier.
-        if auth_code.code_challenge and client_id_match and not is_confidential:
-            if not code_verifier:
-                _audit("token_rejected", reason="missing_code_verifier", client_id=client_id)
-                await _send_json(send, 400, {"error": "invalid_request",
-                                              "error_description": "Missing code_verifier"})
-                return
-            if not _verify_pkce(code_verifier, auth_code.code_challenge,
-                               auth_code.code_challenge_method):
-                _audit("token_rejected", reason="pkce_failed", client_id=client_id)
-                await _send_json(send, 400, {"error": "invalid_grant",
-                                              "error_description": "PKCE verification failed"})
-                return
-        elif auth_code.code_challenge and is_confidential:
-            _audit("token_pkce_skipped", reason="confidential_client", client_id=client_id)
-        elif auth_code.code_challenge and not client_id_match:
-            _audit("token_pkce_skipped", reason="client_id_mismatch_lb",
-                   client_id=client_id)
-
-        # Mint per-client JWT
-        now = time.time()
-        jti = secrets.token_hex(16)
-        payload = {
-            "sub": client_id,
-            "iss": self.issuer_url,
-            "iat": int(now),
-            "exp": int(now) + JWT_EXPIRY_SECONDS,
-            "scope": "maestro",
-            "jti": jti,
-        }
-        # RFC 8707: include aud matching the requested resource.
-        # Prefer the resource from the token request (per spec), fall back to auth code's.
-        token_resource = resource or auth_code.resource
-        if token_resource:
-            payload["aud"] = token_resource
-        access_token = jwt.encode(payload, _RSA_PRIVATE_KEY, algorithm=JWT_ALGORITHM,
-                                   headers={"kid": "maestro-1"})
-        _audit("token_issued", client_id=client_id, jti=jti, expires_in=JWT_EXPIRY_SECONDS)
-
-        token_response: dict = {
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": JWT_EXPIRY_SECONDS,
-            "scope": "maestro",
-        }
-        if token_resource:
-            token_response["resource"] = token_resource
-        # Log token response (truncate access_token)
-        _resp_log = {k: (v[:40] + "..." if k == "access_token" else v) for k, v in token_response.items()}
-        logger.info(f"token-exchange response: {_resp_log}")
-        await _send_json(send, 200, token_response)

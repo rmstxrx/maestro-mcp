@@ -32,9 +32,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import Response
+
+from maestro_oauth import MaestroOAuthProvider
 
 logger = logging.getLogger("maestro")
+
+# ---------------------------------------------------------------------------
+# OAuth provider (shared instance — must exist before FastMCP constructor)
+# ---------------------------------------------------------------------------
+_oauth_provider = MaestroOAuthProvider(issuer_url="https://maestro.rmstxrx.dev")
 
 # ---------------------------------------------------------------------------
 # Host registry — Apollyon-centric topology
@@ -492,6 +504,23 @@ async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 mcp = FastMCP(
     "maestro",
+    auth_server_provider=_oauth_provider,
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl("https://maestro.rmstxrx.dev"),
+        resource_server_url=AnyHttpUrl("https://maestro.rmstxrx.dev/mcp"),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["maestro"],
+            default_scopes=["maestro"],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=["maestro"],
+    ),
+    # Disable DNS rebinding protection — we're behind Cloudflare Tunnel,
+    # so the Host header is the public domain, not localhost.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
     instructions=(
         "Maestro MCP — multi-host machine fleet + AI agent orchestra.\n"
         "\n"
@@ -535,6 +564,12 @@ mcp = FastMCP(
     # tear down ALL SSH ControlMasters when any single session disconnects,
     # breaking other sessions and requiring re-warmup.
 )
+
+
+@mcp.custom_route("/approve", methods=["GET", "POST"])
+async def _approve_route(request: Request) -> Response:
+    """Consent page + PIN gate for non-Claude.ai OAuth clients."""
+    return await _oauth_provider.handle_approve(request)
 
 
 @mcp.tool()
@@ -1166,18 +1201,16 @@ async def claude_execute(
 
     escaped_prompt = shlex.quote(prompt)
     escaped_tools = shlex.quote(allowed_tools)
-    escaped_dir = shlex.quote(working_dir)
     cli_cmd = (
         f"claude -p {escaped_prompt} --output-format json "
         f"--permission-mode bypassPermissions "
         f"--allowedTools {escaped_tools} "
-        f"--max-budget-usd {max_budget_usd} "
-        f"-C {escaped_dir}"
+        f"--max-budget-usd {max_budget_usd}"
     )
 
     logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
 
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
 
     return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
@@ -1364,15 +1397,13 @@ async def claude_dispatch(
         try:
             escaped_prompt = shlex.quote(prompt)
             escaped_tools = shlex.quote(allowed_tools)
-            escaped_dir = shlex.quote(working_dir)
             cli_cmd = (
                 f"claude -p {escaped_prompt} --output-format json "
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools} "
-                f"--max-budget-usd {max_budget_usd} "
-                f"-C {escaped_dir}"
+                f"--max-budget-usd {max_budget_usd}"
             )
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             result = _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
             ts.status = "done" if rc == 0 else "failed"
             ts.result_json = result
@@ -1444,46 +1475,33 @@ if __name__ == "__main__":
     if args.transport == "streamable-http":
         import uvicorn
 
+        # FastMCP's streamable_http_app() includes all OAuth routes,
+        # metadata endpoints, and bearer auth middleware automatically.
         app = mcp.streamable_http_app()
 
-        # --- Auth + proxy middleware ---
-        from starlette.types import ASGIApp, Receive, Scope, Send
-        from maestro_oauth import MaestroOAuthMiddleware
+        # ASGI middleware: request logging + registration rate-limit enforcement
+        from starlette.types import ASGIApp as _ASGIApp, Receive as _Recv, Scope as _Scp, Send as _Snd
 
-        _token_path = Path.home() / ".fleet-ssh" / "bearer_token"
-        if _token_path.exists():
-            _expected_token = _token_path.read_text().strip()
-            logger.info(f"Bearer auth enabled (token from {_token_path})")
-        else:
-            _expected_token = os.environ.get("MAESTRO_TOKEN")
-            if _expected_token:
-                logger.info("Bearer auth enabled (token from env)")
-            else:
-                logger.warning("No bearer token — endpoint is UNPROTECTED")
+        class _MaestroMiddleware:
+            def __init__(self, inner: _ASGIApp):
+                self.inner = inner
 
-        # Host header rewrite for reverse proxy
-        class HostRewriteMiddleware:
-            def __init__(self, app: ASGIApp):
-                self.app = app
-            async def __call__(self, scope: Scope, receive: Receive, send: Send):
-                if scope['type'] in ('http', 'websocket'):
-                    new_headers = []
-                    for k, v in scope.get('headers', []):
-                        if k == b'host':
-                            new_headers.append((b'host', b'127.0.0.1:8222'))
-                        else:
-                            new_headers.append((k, v))
-                    scope = dict(scope)
-                    scope['headers'] = new_headers
-                await self.app(scope, receive, send)
+            async def __call__(self, scope: _Scp, receive: _Recv, send: _Snd) -> None:
+                if scope["type"] != "http":
+                    await self.inner(scope, receive, send)
+                    return
 
-        # Stack: request → OAuth/BearerAuth → HostRewrite → MCP app
-        app = HostRewriteMiddleware(app)
-        app = MaestroOAuthMiddleware(
-            app=app,
-            bearer_token=_expected_token,
-            issuer_url="https://maestro.rmstxrx.dev",
-        )
+                hdrs = dict(scope.get("headers", []))
+                path = scope.get("path", "?")
+                method = scope.get("method", "?")
+                auth = hdrs.get(b"authorization", b"").decode(errors="replace")
+                ua = hdrs.get(b"user-agent", b"").decode(errors="replace")
+                logger.info("recv: %s %s auth=%s ua=%s", method, path,
+                            auth[:40] + "..." if len(auth) > 40 else (auth or "none"),
+                            ua[:60])
+                await self.inner(scope, receive, send)
+
+        app = _MaestroMiddleware(app)
 
         logger.info(f"maestro: starting HTTP server on {args.host}:{args.port}")
 
