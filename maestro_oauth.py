@@ -288,14 +288,12 @@ class MaestroOAuthProvider:
 
         if action == "deny":
             _audit("authorize_denied", client_id=pending["client_id"])
-            return RedirectResponse(
-                url=construct_redirect_uri(
-                    str(params.redirect_uri),
-                    error="access_denied",
-                    state=params.state,
-                ),
-                status_code=302,
+            deny_url = construct_redirect_uri(
+                str(params.redirect_uri),
+                error="access_denied",
+                state=params.state,
             )
+            return HTMLResponse(_redirect_page(deny_url))
 
         if AUTHORIZE_PIN_HASH:
             pin_hash = hashlib.sha256(pin.encode()).hexdigest()
@@ -321,7 +319,9 @@ class MaestroOAuthProvider:
         )
         logger.info("approve_redirect: %s", redirect_url)
 
-        return RedirectResponse(url=redirect_url, status_code=302)
+        # Use HTML redirect instead of bare 302 — more reliable through
+        # Cloudflare Tunnel which can interfere with Location headers.
+        return HTMLResponse(_redirect_page(redirect_url))
 
 
 # ---------------------------------------------------------------------------
@@ -385,11 +385,47 @@ def _approve_page(client_name: str, approval_id: str, csrf_token: str) -> str:
                     font-family:monospace; font-size:1rem; margin-top:0.4rem;">
             </div>
             <div class="buttons">
-                <button type="submit" name="action" value="deny" class="deny">Deny</button>
                 <button type="submit" name="action" value="approve" class="approve">Approve</button>
+                <button type="submit" name="action" value="deny" class="deny">Deny</button>
             </div>
         </form>
     </div>
+</body>
+</html>"""
+
+
+def _redirect_page(url: str) -> str:
+    # HTML-escaped URL for attributes (href, meta content) where the
+    # browser decodes &amp; → &.
+    html_url = html_mod.escape(url, quote=True)
+    # JSON-encoded URL for <script> context where HTML entities are NOT
+    # decoded — use json.dumps to produce a safe JS string literal.
+    js_url = json.dumps(url)  # includes surrounding quotes
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Maestro — Redirecting</title>
+    <meta http-equiv="refresh" content="0;url={html_url}">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a1a; color: #e0e0e0;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0; }}
+        .card {{ background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
+            padding: 2rem; max-width: 400px; width: 90%;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); text-align: center; }}
+        h1 {{ font-size: 1.3rem; color: #00d4ff; margin: 0 0 1rem 0; }}
+        a {{ color: #00d4ff; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Approved</h1>
+        <p>Redirecting...</p>
+        <p style="margin-top:1rem"><a href="{html_url}">Click here if not redirected</a></p>
+    </div>
+    <script>window.location.replace({js_url});</script>
 </body>
 </html>"""
 
