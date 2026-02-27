@@ -439,12 +439,12 @@ def _ps_quote(value: str) -> str:
 
 
 def _local_host_hint(tool_name: str, host_name: str) -> str:
-    """Soft guardrail: nudge agents to prefer native tools for local ops."""
-    return (
-        f"[NOTE: '{tool_name}' targeted {host_name}, which is the LOCAL hub. "
-        "If you have native shell/file tools (e.g. bash_tool), prefer those "
-        "for local operations. If Maestro is your only interface, disregard.]\n"
-    )
+    """Soft guardrail — kept as no-op to avoid touching 6 call sites.
+
+    The local-tool-preference guidance lives in _build_instructions() instead,
+    where it's seen once per session rather than on every single tool result.
+    """
+    return ""
 
 
 
