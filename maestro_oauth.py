@@ -12,6 +12,7 @@ Security layers:
   - Tokens are opaque random strings stored in-memory.
 """
 
+import asyncio
 import hashlib
 import hmac
 import html as html_mod
@@ -73,6 +74,10 @@ class MaestroOAuthProvider:
         self.refresh_tokens: dict[str, RefreshToken] = {}
         self.pending_approvals: dict[str, dict] = {}
         self._reg_timestamps: list[float] = []
+        self._reg_lock = asyncio.Lock()
+        self._pin_fail_timestamps: list[float] = []
+        self._PIN_FAIL_LIMIT = 5
+        self._PIN_FAIL_WINDOW = 300  # 5 minutes
 
     # --- OAuthAuthorizationServerProvider protocol ---
 
@@ -80,13 +85,20 @@ class MaestroOAuthProvider:
         return self.clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        now = time.time()
-        self._reg_timestamps = [t for t in self._reg_timestamps
-                                if now - t < self.REG_RATE_WINDOW]
-        if len(self._reg_timestamps) >= self.REG_RATE_LIMIT:
-            _audit("register_rate_limited")
-            raise ValueError("Too many registration requests — try again later")
-        self._reg_timestamps.append(now)
+        # Validate client metadata lengths
+        if client_info.client_name and len(client_info.client_name) > 256:
+            raise ValueError("client_name exceeds maximum length of 256 characters")
+        if client_info.client_uri and len(str(client_info.client_uri)) > 2048:
+            raise ValueError("client_uri exceeds maximum length of 2048 characters")
+
+        async with self._reg_lock:
+            now = time.time()
+            self._reg_timestamps = [t for t in self._reg_timestamps
+                                    if now - t < self.REG_RATE_WINDOW]
+            if len(self._reg_timestamps) >= self.REG_RATE_LIMIT:
+                _audit("register_rate_limited")
+                raise ValueError("Too many registration requests — try again later")
+            self._reg_timestamps.append(now)
 
         self.clients[client_info.client_id] = client_info
         _audit("client_registered", client_id=client_info.client_id,
@@ -100,7 +112,27 @@ class MaestroOAuthProvider:
     ) -> str:
         redirect_str = str(params.redirect_uri).rstrip("/")
 
-        # All clients → consent page + PIN gate.
+        # Sweep expired pending approvals to prevent memory leaks
+        now = time.time()
+        expired = [
+            aid for aid, data in self.pending_approvals.items()
+            if now - data["created_at"] > AUTH_CODE_TTL
+        ]
+        for aid in expired:
+            del self.pending_approvals[aid]
+
+        # Claude.ai auto-approval: user is already authenticated in their
+        # Anthropic account, so we skip the PIN gate.
+        if redirect_str == CLAUDE_AI_CALLBACK:
+            code = self._store_auth_code(client, params)
+            _audit("authorize_auto_approved", client_id=client.client_id,
+                   reason="claude_ai_redirect")
+            logger.info("authorize_auto: client=%s (Claude.ai)", client.client_id)
+            return construct_redirect_uri(
+                redirect_str, code=code, state=params.state,
+            )
+
+        # All other clients → consent page + PIN gate.
         approval_id = secrets.token_urlsafe(24)
         self.pending_approvals[approval_id] = {
             "client_id": client.client_id,
@@ -200,6 +232,7 @@ class MaestroOAuthProvider:
         at = self.access_tokens.get(token)
         if at and at.expires_at and at.expires_at < time.time():
             logger.info("load_access_token: EXPIRED for %s", at.client_id)
+            _audit("token_expired", client_id=at.client_id)
             del self.access_tokens[token]
             return None
         if at:
@@ -210,6 +243,8 @@ class MaestroOAuthProvider:
         return at
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        token_type = "access" if isinstance(token, AccessToken) else "refresh"
+        _audit("token_revoked", client_id=token.client_id, token_type=token_type)
         if isinstance(token, AccessToken):
             self.access_tokens.pop(token.token, None)
         else:
@@ -281,6 +316,9 @@ class MaestroOAuthProvider:
             )
 
         if csrf != pending.get("csrf", ""):
+            client_ip = request.client.host if request.client else "unknown"
+            _audit("csrf_rejected", client_id=pending.get("client_id", "unknown"),
+                   ip=client_ip)
             return HTMLResponse(
                 _error_page("CSRF Error", "Invalid CSRF token."),
                 status_code=403,
@@ -298,9 +336,26 @@ class MaestroOAuthProvider:
             return HTMLResponse(_redirect_page(deny_url))
 
         if AUTHORIZE_PIN_HASH:
+            # Rate-limit failed PIN attempts globally
+            now = time.time()
+            self._pin_fail_timestamps = [
+                t for t in self._pin_fail_timestamps
+                if now - t < self._PIN_FAIL_WINDOW
+            ]
+            if len(self._pin_fail_timestamps) >= self._PIN_FAIL_LIMIT:
+                _audit("pin_rate_limited")
+                return HTMLResponse(
+                    _error_page("Rate Limited",
+                                "Too many failed PIN attempts. Try again later."),
+                    status_code=429,
+                )
+
             pin_hash = hashlib.sha256(pin.encode()).hexdigest()
             if not hmac.compare_digest(pin_hash, AUTHORIZE_PIN_HASH):
-                _audit("authorize_pin_rejected", client_id=pending["client_id"])
+                self._pin_fail_timestamps.append(now)
+                client_ip = request.client.host if request.client else "unknown"
+                _audit("authorize_pin_rejected", client_id=pending["client_id"],
+                       ip=client_ip)
                 return HTMLResponse(
                     _error_page("Invalid PIN", "The authorization PIN is incorrect."),
                     status_code=403,
