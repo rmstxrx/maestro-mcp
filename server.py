@@ -1132,6 +1132,68 @@ async def gemini_research(
 
 
 @mcp.tool()
+async def gemini_execute(
+    host: str,
+    prompt: str,
+    context_files: list[str] | None = None,
+    working_dir: str = DEFAULT_REPO,
+    model: str = "",
+    timeout: int = GEMINI_TIMEOUT,
+) -> str:
+    """Dispatch a coding task to Google Gemini CLI on a Maestro host.
+
+    Gemini runs in write mode (--yolo). Best for: code generation,
+    refactoring, bug fixes, and implementation tasks that benefit from
+    Gemini's 1M-token context window across many files.
+
+    Full output is saved to disk; a structured summary is returned.
+
+    Args:
+        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        prompt: The coding task. Be specific and scoped.
+        context_files: File paths to include via @file syntax (leverages 1M context).
+        working_dir: Git repo directory where Gemini works.
+        model: Gemini model (empty=default).
+        timeout: Max seconds to wait (default 180).
+    """
+    task_id = _orchestra_task_id(prompt)
+    output_file = _orchestra_output_path("gemini", task_id)
+
+    full_prompt = prompt
+    if context_files:
+        file_refs = " ".join(f"@{f}" for f in context_files)
+        full_prompt = f"{file_refs} {prompt}"
+
+    escaped_prompt = shlex.quote(full_prompt)
+    model_flag = f"--model {shlex.quote(model)} " if model else ""
+    cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}--yolo"
+
+    logger.info(f"Orchestra: gemini_execute on {host} [{task_id}]: {prompt[:80]}...")
+
+    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+
+    extracted = raw_output
+    try:
+        parsed = json.loads(raw_output)
+        if "response" in parsed:
+            extracted = parsed["response"]
+            if "stats" in parsed:
+                models_info = parsed["stats"].get("models", {})
+                token_summary = {
+                    m: {
+                        "prompt": d.get("tokens", {}).get("prompt", 0),
+                        "output": d.get("tokens", {}).get("candidates", 0),
+                    }
+                    for m, d in models_info.items()
+                }
+                extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    return _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
+
+
+@mcp.tool()
 async def agent_read_output(
     file_path: str,
     start_line: int = 0,
