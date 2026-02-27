@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
@@ -118,6 +118,21 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
 
 
 HOSTS: dict[str, HostConfig] = _load_hosts()
+_HOST_LOCKS: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in HOSTS}
+
+
+async def _update_host_status(
+    name: str,
+    status: HostStatus,
+    last_error: str = "",
+) -> None:
+    """Thread-safe update of host connection status."""
+    config = HOSTS[name]
+    async with _HOST_LOCKS[name]:
+        config.status = status
+        config.last_check = time.time()
+        if last_error:
+            config.last_error = last_error
 
 
 def _local_host_name() -> str | None:
@@ -288,8 +303,11 @@ def _local_write_file(
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if append else "w"
-        p.write_text(content) if not append else p.open(mode).write(content)
+        if append:
+            with p.open("a") as f:
+                f.write(content)
+        else:
+            p.write_text(content)
         return f"[OK] wrote {len(content)} bytes to {path}"
     except PermissionError:
         return f"[error] permission denied: {path} (try sudo=True)"
@@ -334,19 +352,17 @@ async def _teardown_connection(alias: str) -> None:
 async def warmup_all_hosts() -> dict[str, bool]:
     async def _warmup_one(name: str, config: HostConfig) -> tuple[str, bool]:
         if config.is_local:
-            config.status = HostStatus.CONNECTED
-            config.last_check = time.time()
+            await _update_host_status(name, HostStatus.CONNECTED)
             logger.info(f"{name}: local host (no SSH needed)")
             return name, True
         if await _check_control_master(config.alias):
             logger.info(f"{name}: ControlMaster already active")
-            config.status = HostStatus.CONNECTED
-            config.last_check = time.time()
+            await _update_host_status(name, HostStatus.CONNECTED)
             return name, True
         logger.info(f"{name}: warming up connection...")
         success = await _warmup_connection(config.alias)
-        config.status = HostStatus.CONNECTED if success else HostStatus.DISCONNECTED
-        config.last_check = time.time()
+        status = HostStatus.CONNECTED if success else HostStatus.DISCONNECTED
+        await _update_host_status(name, status)
         if success:
             logger.info(f"{name}: connected")
         else:
@@ -359,15 +375,20 @@ async def warmup_all_hosts() -> dict[str, bool]:
 
 
 async def teardown_all_hosts() -> None:
+    names = []
     tasks = []
     for name, config in HOSTS.items():
         if config.is_local:
             continue
         logger.info(f"{name}: tearing down ControlMaster")
+        names.append(name)
         tasks.append(_teardown_connection(config.alias))
         config.status = HostStatus.DISCONNECTED
     if tasks:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for name, result in zip(names, results):
+            if isinstance(result, Exception):
+                logger.warning(f"Teardown failed for {name}: {result}")
 
 
 # ---------------------------------------------------------------------------
@@ -389,11 +410,13 @@ def _is_transient_failure(returncode: int, stderr: str) -> bool:
     return any(ind in stderr for ind in TRANSIENT_INDICATORS)
 
 
-async def _ensure_connection(alias: str) -> bool:
-    if await _check_control_master(alias):
-        return True
-    logger.info(f"ControlMaster for {alias} is dead, re-warming...")
-    return await _warmup_connection(alias)
+async def _ensure_connection(alias: str, host_name: str) -> bool:
+    """Ensure ControlMaster is alive, serialized per host to avoid reconnection races."""
+    async with _HOST_LOCKS[host_name]:
+        if await _check_control_master(alias):
+            return True
+        logger.info(f"ControlMaster for {alias} is dead, re-warming...")
+        return await _warmup_connection(alias)
 
 
 def _format_result(stdout: str, stderr: str, returncode: int) -> str:
@@ -405,6 +428,12 @@ def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     if returncode != 0:
         parts.append(f"[exit code: {returncode}]")
     return "\n".join(parts) or "[no output]"
+
+
+def _ps_quote(value: str) -> str:
+    """Quote a value for PowerShell using double quotes with backtick escaping."""
+    escaped = value.replace('`', '``').replace('"', '`"').replace('$', '`$')
+    return f'"{escaped}"'
 
 
 def _local_host_hint(tool_name: str, host_name: str) -> str:
@@ -426,19 +455,17 @@ async def _ssh_run(
     config = _resolve_host(host_name)
     last_error = ""
     for attempt in range(1, MAX_RETRIES + 1):
-        await _ensure_connection(config.alias)
+        await _ensure_connection(config.alias, host_name)
         rc, stdout, stderr = await _async_run(
             ["ssh", config.alias, *ssh_args],
             timeout=timeout,
             stdin_data=stdin_data,
         )
         if rc not in (-1, 255):
-            config.status = HostStatus.CONNECTED
-            config.last_check = time.time()
+            await _update_host_status(host_name, HostStatus.CONNECTED)
             return _format_result(stdout, stderr, rc)
         if not _is_transient_failure(rc, stderr):
-            config.status = HostStatus.ERROR
-            config.last_error = stderr.strip()
+            await _update_host_status(host_name, HostStatus.ERROR, last_error=stderr.strip())
             return f"[SSH error on {host_name}]\n{stderr}"
         last_error = stderr.strip() or f"rc={rc}"
         logger.warning(f"{host_name}: transient failure (attempt {attempt}/{MAX_RETRIES}): {last_error}")
@@ -447,8 +474,7 @@ async def _ssh_run(
             logger.info(f"Retrying in {backoff}s...")
             await asyncio.sleep(backoff)
             await _teardown_connection(config.alias)
-    config.status = HostStatus.ERROR
-    config.last_error = last_error
+    await _update_host_status(host_name, HostStatus.ERROR, last_error=last_error)
     return f"[failed after {MAX_RETRIES} attempts on {host_name}]\nLast error: {last_error}"
 
 
@@ -463,7 +489,7 @@ def _wrap_command(config: HostConfig, command: str, cwd: str | None, sudo: bool)
     if config.shell == HostShell.POWERSHELL:
         parts = []
         if cwd:
-            parts.append(f"Set-Location {shlex.quote(cwd)};")
+            parts.append(f"Set-Location -LiteralPath {_ps_quote(cwd)};")
         parts.append(command)
         full = " ".join(parts)
         return f"sudo {full}" if sudo else full
@@ -497,10 +523,10 @@ async def _scp_run(
         action_desc = f"download {host_name}:{source} -> {destination}"
     last_error = ""
     for attempt in range(1, MAX_RETRIES + 1):
-        await _ensure_connection(config.alias)
+        await _ensure_connection(config.alias, host_name)
         rc, stdout, stderr = await _async_run(scp_args, timeout=timeout)
         if rc == 0:
-            config.status = HostStatus.CONNECTED
+            await _update_host_status(host_name, HostStatus.CONNECTED)
             return f"[OK] {action_desc}"
         if not _is_transient_failure(rc, stderr):
             return f"[scp failed on {host_name}]\n{stderr}"
@@ -510,8 +536,7 @@ async def _scp_run(
             backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
             await asyncio.sleep(backoff)
             await _teardown_connection(config.alias)
-    config.status = HostStatus.ERROR
-    config.last_error = last_error
+    await _update_host_status(host_name, HostStatus.ERROR, last_error=last_error)
     return f"[scp failed after {MAX_RETRIES} attempts on {host_name}]\n{last_error}"
 
 
@@ -529,8 +554,11 @@ async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     try:
         yield {"hosts": HOSTS, "warmup_results": results}
     finally:
-        logger.info("maestro: shutting down, closing connections...")
-        await teardown_all_hosts()
+        try:
+            logger.info("maestro: shutting down, closing connections...")
+            await teardown_all_hosts()
+        except Exception:
+            logger.exception("maestro: error during teardown")
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +699,7 @@ async def maestro_script(
     if config.shell == HostShell.POWERSHELL:
         lines.append("$ErrorActionPreference = 'Stop'")
         if cwd:
-            lines.append(f"Set-Location {shlex.quote(cwd)}")
+            lines.append(f"Set-Location -LiteralPath {_ps_quote(cwd)}")
         lines.append(script)
         stdin_body = "\n".join(lines)
         interpreter = ["powershell", "-Command", "-"]
@@ -706,11 +734,11 @@ async def maestro_read(
         return _local_host_hint("maestro_read", host) + _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
-            cmd = f"Get-Content {shlex.quote(path)} -TotalCount {head}"
+            cmd = f"Get-Content -LiteralPath {_ps_quote(path)} -TotalCount {head}"
         elif tail:
-            cmd = f"Get-Content {shlex.quote(path)} -Tail {tail}"
+            cmd = f"Get-Content -LiteralPath {_ps_quote(path)} -Tail {tail}"
         else:
-            cmd = f"Get-Content {shlex.quote(path)}"
+            cmd = f"Get-Content -LiteralPath {_ps_quote(path)}"
     else:
         if head:
             cmd = f"head -n {head} {shlex.quote(path)}"
@@ -744,9 +772,9 @@ async def maestro_write(
         return _local_host_hint("maestro_write", host) + _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
-            cmd = f"$input | Out-File -Append -FilePath {shlex.quote(path)}"
+            cmd = f"$input | Out-File -Append -LiteralPath {_ps_quote(path)}"
         else:
-            cmd = f"$input | Out-File -FilePath {shlex.quote(path)}"
+            cmd = f"$input | Out-File -LiteralPath {_ps_quote(path)}"
         return await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
     else:
         parent = os.path.dirname(path)
@@ -805,20 +833,19 @@ async def maestro_status() -> str:
     lines = ["Maestro Status", "=" * 55]
 
     async def _check_one(name: str, config: HostConfig) -> str:
-        config.last_check = time.time()
         if config.is_local:
-            config.status = HostStatus.CONNECTED
+            await _update_host_status(name, HostStatus.CONNECTED)
             return f"  {name:12s} [{'local':10s}]  ✓ LOCAL"
         alive = await _check_control_master(config.alias)
         if alive:
-            config.status = HostStatus.CONNECTED
+            await _update_host_status(name, HostStatus.CONNECTED)
             status_str = "✓ CONNECTED"
         else:
             if await _warmup_connection(config.alias):
-                config.status = HostStatus.CONNECTED
+                await _update_host_status(name, HostStatus.CONNECTED)
                 status_str = "↻ RECONNECTED"
             else:
-                config.status = HostStatus.DISCONNECTED
+                await _update_host_status(name, HostStatus.DISCONNECTED)
                 status_str = "✗ OFFLINE"
         line = f"  {name:12s} [{config.shell.value:10s}]  {status_str}"
         if config.last_error and config.status != HostStatus.CONNECTED:
@@ -942,6 +969,32 @@ def _orchestra_truncate(text: str, max_len: int = MAX_INLINE_OUTPUT) -> tuple[st
     return text[:max_len] + "\n... [truncated]", True
 
 
+def _extract_gemini_response(raw_output: str) -> str:
+    """Extract response text from Gemini CLI JSON envelope.
+
+    Parses the JSON output, extracts the 'response' field, and appends
+    token usage summary if stats are available.
+    """
+    try:
+        parsed = json.loads(raw_output)
+        if "response" not in parsed:
+            return raw_output
+        extracted = parsed["response"]
+        if "stats" in parsed:
+            models_info = parsed["stats"].get("models", {})
+            token_summary = {
+                m: {
+                    "prompt": d.get("tokens", {}).get("prompt", 0),
+                    "output": d.get("tokens", {}).get("candidates", 0),
+                }
+                for m, d in models_info.items()
+            }
+            extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
+        return extracted
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return raw_output
+
+
 def _orchestra_build_result(
     agent: str,
     host: str,
@@ -977,37 +1030,81 @@ def _orchestra_build_result(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+async def _orchestra_run_cli_raw(
+    host: str,
+    cli_command: str,
+    timeout: int,
+    cwd: str | None = None,
+) -> tuple[int, str, str]:
+    """Run a CLI command and return structured (rc, stdout, stderr).
+
+    Bypasses the text-formatting layer to give callers access to the actual
+    return code, avoiding regex re-parsing of formatted output.
+    """
+    config = _resolve_host(host)
+
+    if config.is_local:
+        shell_cmd = cli_command
+        if cwd:
+            shell_cmd = f"cd {shlex.quote(cwd)} && {cli_command}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", "-c", shell_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+            return (
+                proc.returncode or 0,
+                stdout_b.decode(errors="replace"),
+                stderr_b.decode(errors="replace"),
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return -1, "", f"timeout after {timeout}s"
+        except FileNotFoundError as e:
+            return -1, "", f"binary not found: {e}"
+    else:
+        full_cmd = _wrap_command(config, cli_command, cwd, sudo=False)
+        last_stderr = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            await _ensure_connection(config.alias, host)
+            rc, stdout, stderr = await _async_run(
+                ["ssh", config.alias, full_cmd], timeout=timeout,
+            )
+            if not _is_transient_failure(rc, stderr):
+                if rc not in (-1, 255):
+                    await _update_host_status(host, HostStatus.CONNECTED)
+                elif stderr:
+                    await _update_host_status(host, HostStatus.ERROR, last_error=stderr.strip())
+                return rc, stdout, stderr
+            last_stderr = stderr.strip()
+            if attempt < MAX_RETRIES:
+                backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                await asyncio.sleep(backoff)
+                await _teardown_connection(config.alias)
+        await _update_host_status(host, HostStatus.ERROR, last_error=last_stderr)
+        return -1, "", f"failed after {MAX_RETRIES} attempts: {last_stderr}"
+
+
 async def _orchestra_run_cli(
     host: str,
     cli_command: str,
     timeout: int,
     cwd: str | None = None,
 ) -> tuple[int, str]:
+    """Run a CLI command, returning (rc, formatted_output).
+
+    Delegates to _orchestra_run_cli_raw for structured execution,
+    then formats the output for inline display.
     """
-    Run a CLI command on the specified host using existing Maestro primitives.
-    Returns (return_code_estimate, combined_output).
-    """
-    config = _resolve_host(host)
-
-    if config.is_local:
-        result = await _local_run(cli_command, timeout=timeout, cwd=cwd)
-    else:
-        full_cmd = _wrap_command(config, cli_command, cwd, sudo=False)
-        result = await _ssh_run(host, [full_cmd], timeout=timeout)
-
-    # Estimate return code from result text
-    rc = 0
-    if "[exit code:" in result:
-        try:
-            rc = int(result.split("[exit code:")[1].split("]")[0].strip())
-        except (ValueError, IndexError):
-            rc = 1
-    if result.startswith("[SSH error") or result.startswith("[failed after"):
-        rc = 1
-    if "timeout" in result.lower() and rc == 0:
-        rc = -1
-
-    return rc, result
+    rc, stdout, stderr = await _orchestra_run_cli_raw(host, cli_command, timeout, cwd)
+    combined = _format_result(stdout, stderr, rc)
+    return rc, combined
 
 
 @mcp.tool()
@@ -1117,26 +1214,7 @@ async def gemini_analyze(
 
     rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
 
-    # Extract response from Gemini JSON envelope
-    extracted = raw_output
-    try:
-        parsed = json.loads(raw_output)
-        if "response" in parsed:
-            extracted = parsed["response"]
-            if "stats" in parsed:
-                models_info = parsed["stats"].get("models", {})
-                token_summary = {
-                    m: {
-                        "prompt": d.get("tokens", {}).get("prompt", 0),
-                        "output": d.get("tokens", {}).get("candidates", 0),
-                    }
-                    for m, d in models_info.items()
-                }
-                extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-
-    return _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
+    return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
 
 @mcp.tool()
@@ -1171,15 +1249,7 @@ async def gemini_research(
 
     rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
 
-    extracted = raw_output
-    try:
-        parsed = json.loads(raw_output)
-        if "response" in parsed:
-            extracted = parsed["response"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-
-    return _orchestra_build_result("gemini", host, query, extracted, rc, output_file)
+    return _orchestra_build_result("gemini", host, query, _extract_gemini_response(raw_output), rc, output_file)
 
 
 @mcp.tool()
@@ -1223,25 +1293,7 @@ async def gemini_execute(
 
     rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
 
-    extracted = raw_output
-    try:
-        parsed = json.loads(raw_output)
-        if "response" in parsed:
-            extracted = parsed["response"]
-            if "stats" in parsed:
-                models_info = parsed["stats"].get("models", {})
-                token_summary = {
-                    m: {
-                        "prompt": d.get("tokens", {}).get("prompt", 0),
-                        "output": d.get("tokens", {}).get("candidates", 0),
-                    }
-                    for m, d in models_info.items()
-                }
-                extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-
-    return _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
+    return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
 
 @mcp.tool()
@@ -1328,6 +1380,71 @@ async def claude_execute(
     return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
 
+async def _dispatch_async(
+    agent: str,
+    host: str,
+    prompt: str,
+    build_cli_cmd: Callable[[], str],
+    post_process: Callable[[str], str] | None = None,
+    timeout: int = CODEX_TIMEOUT,
+    working_dir: str = DEFAULT_REPO,
+) -> str:
+    """Generic async dispatch for agent CLI tools.
+
+    Handles TaskState lifecycle, background execution, and structured result
+    building. Each agent tool provides only its CLI command builder.
+
+    Args:
+        agent: Agent name (codex/gemini/claude).
+        host: Target host.
+        prompt: User prompt.
+        build_cli_cmd: Callable returning the CLI command string.
+        post_process: Optional callable(raw_output) -> str for output extraction.
+        timeout: Max seconds.
+        working_dir: Working directory for CLI invocation.
+    """
+    task_id = secrets.token_hex(8)
+    output_file = _orchestra_output_path(agent, task_id)
+    now = datetime.now(timezone.utc)
+
+    ts = TaskState(
+        task_id=task_id,
+        agent=agent,
+        host=host,
+        prompt=prompt,
+        status="running",
+        started_at=now,
+        output_file=output_file,
+    )
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
+
+    async def _run() -> None:
+        try:
+            cli_cmd = build_cli_cmd()
+            rc, raw_output = await _orchestra_run_cli(
+                host, cli_cmd, timeout=timeout, cwd=working_dir,
+            )
+            output = post_process(raw_output) if post_process else raw_output
+            result = _orchestra_build_result(agent, host, prompt, output, rc, output_file)
+            ts.status = "done" if rc == 0 else "failed"
+            ts.result_json = result
+        except Exception as exc:
+            logger.exception(f"Orchestra: {agent}_dispatch [{task_id}] failed")
+            ts.status = "failed"
+            ts.result_json = json.dumps({
+                "error": str(exc), "task_id": task_id, "agent": agent,
+            })
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+
+    ts.asyncio_task = asyncio.create_task(_run())
+    logger.info(f"Orchestra: {agent}_dispatch on {host} [{task_id}]: {prompt[:80]}...")
+    return json.dumps({
+        "task_id": task_id, "agent": agent, "host": host, "status": "running",
+    })
+
+
 @mcp.tool()
 async def codex_dispatch(
     host: str,
@@ -1348,41 +1465,14 @@ async def codex_dispatch(
         model: Codex model (empty=default).
         timeout: Max seconds for the background task (default 300).
     """
-    task_id = secrets.token_hex(8)
-    output_file = _orchestra_output_path("codex", task_id)
-    now = datetime.now(timezone.utc)
+    def build_cmd() -> str:
+        model_flag = f"--model {shlex.quote(model)} " if model else ""
+        escaped = shlex.quote(prompt)
+        return f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped}"
 
-    ts = TaskState(
-        task_id=task_id,
-        agent="codex",
-        host=host,
-        prompt=prompt,
-        status="running",
-        started_at=now,
-        output_file=output_file,
+    return await _dispatch_async(
+        "codex", host, prompt, build_cmd, timeout=timeout, working_dir=working_dir,
     )
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    async def _run() -> None:
-        try:
-            model_flag = f"--model {shlex.quote(model)} " if model else ""
-            escaped_prompt = shlex.quote(prompt)
-            cli_cmd = f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-            result = _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
-            ts.status = "done" if rc == 0 else "failed"
-            ts.result_json = result
-        except Exception as exc:
-            logger.exception(f"Orchestra: codex_dispatch [{task_id}] failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "codex"})
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-
-    ts.asyncio_task = asyncio.create_task(_run())
-    logger.info(f"Orchestra: codex_dispatch on {host} [{task_id}]: {prompt[:80]}...")
-    return json.dumps({"task_id": task_id, "agent": "codex", "host": host, "status": "running"})
 
 
 @mcp.tool()
@@ -1409,63 +1499,21 @@ async def gemini_dispatch(
         yolo: Enable write mode (default False = read-only).
         timeout: Max seconds for the background task (default 180).
     """
-    task_id = secrets.token_hex(8)
-    output_file = _orchestra_output_path("gemini", task_id)
-    now = datetime.now(timezone.utc)
+    def build_cmd() -> str:
+        full_prompt = prompt
+        if context_files:
+            file_refs = " ".join(f"@{f}" for f in context_files)
+            full_prompt = f"{file_refs} {prompt}"
+        escaped = shlex.quote(full_prompt)
+        model_flag = f"--model {shlex.quote(model)} " if model else ""
+        yolo_flag = "--yolo " if yolo else ""
+        return f"gemini -p {escaped} --output-format json {model_flag}{yolo_flag}"
 
-    ts = TaskState(
-        task_id=task_id,
-        agent="gemini",
-        host=host,
-        prompt=prompt,
-        status="running",
-        started_at=now,
-        output_file=output_file,
+    return await _dispatch_async(
+        "gemini", host, prompt, build_cmd,
+        post_process=_extract_gemini_response,
+        timeout=timeout, working_dir=working_dir,
     )
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    async def _run() -> None:
-        try:
-            full_prompt = prompt
-            if context_files:
-                file_refs = " ".join(f"@{f}" for f in context_files)
-                full_prompt = f"{file_refs} {prompt}"
-            escaped_prompt = shlex.quote(full_prompt)
-            model_flag = f"--model {shlex.quote(model)} " if model else ""
-            yolo_flag = "--yolo " if yolo else ""
-            cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-            extracted = raw_output
-            try:
-                parsed = json.loads(raw_output)
-                if "response" in parsed:
-                    extracted = parsed["response"]
-                    if "stats" in parsed:
-                        models_info = parsed["stats"].get("models", {})
-                        token_summary = {
-                            m: {
-                                "prompt": d.get("tokens", {}).get("prompt", 0),
-                                "output": d.get("tokens", {}).get("candidates", 0),
-                            }
-                            for m, d in models_info.items()
-                        }
-                        extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass
-            result = _orchestra_build_result("gemini", host, prompt, extracted, rc, output_file)
-            ts.status = "done" if rc == 0 else "failed"
-            ts.result_json = result
-        except Exception as exc:
-            logger.exception(f"Orchestra: gemini_dispatch [{task_id}] failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "gemini"})
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-
-    ts.asyncio_task = asyncio.create_task(_run())
-    logger.info(f"Orchestra: gemini_dispatch on {host} [{task_id}]: {prompt[:80]}...")
-    return json.dumps({"task_id": task_id, "agent": "gemini", "host": host, "status": "running"})
 
 
 @mcp.tool()
@@ -1490,46 +1538,19 @@ async def claude_dispatch(
         allowed_tools: Comma-separated tool whitelist.
         timeout: Max seconds for the background task (default 300).
     """
-    task_id = secrets.token_hex(8)
-    output_file = _orchestra_output_path("claude", task_id)
-    now = datetime.now(timezone.utc)
+    def build_cmd() -> str:
+        escaped_prompt = shlex.quote(prompt)
+        escaped_tools = shlex.quote(allowed_tools)
+        return (
+            f"claude -p {escaped_prompt} --output-format json "
+            f"--permission-mode bypassPermissions "
+            f"--allowedTools {escaped_tools} "
+            f"--max-budget-usd {max_budget_usd}"
+        )
 
-    ts = TaskState(
-        task_id=task_id,
-        agent="claude",
-        host=host,
-        prompt=prompt,
-        status="running",
-        started_at=now,
-        output_file=output_file,
+    return await _dispatch_async(
+        "claude", host, prompt, build_cmd, timeout=timeout, working_dir=working_dir,
     )
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    async def _run() -> None:
-        try:
-            escaped_prompt = shlex.quote(prompt)
-            escaped_tools = shlex.quote(allowed_tools)
-            cli_cmd = (
-                f"claude -p {escaped_prompt} --output-format json "
-                f"--permission-mode bypassPermissions "
-                f"--allowedTools {escaped_tools} "
-                f"--max-budget-usd {max_budget_usd}"
-            )
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-            result = _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
-            ts.status = "done" if rc == 0 else "failed"
-            ts.result_json = result
-        except Exception as exc:
-            logger.exception(f"Orchestra: claude_dispatch [{task_id}] failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({"error": str(exc), "task_id": task_id, "agent": "claude"})
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-
-    ts.asyncio_task = asyncio.create_task(_run())
-    logger.info(f"Orchestra: claude_dispatch on {host} [{task_id}]: {prompt[:80]}...")
-    return json.dumps({"task_id": task_id, "agent": "claude", "host": host, "status": "running"})
 
 
 @mcp.tool()
@@ -1542,7 +1563,6 @@ async def agent_poll(task_id: str) -> str:
     Args:
         task_id: Task ID returned by a previous *_dispatch call.
     """
-    await _evict_stale_tasks()
     async with _REGISTRY_LOCK:
         ts = TASK_REGISTRY.get(task_id)
     if ts is None:
@@ -1633,8 +1653,11 @@ if __name__ == "__main__":
             finally:
                 if _EVICTION_TASK:
                     _EVICTION_TASK.cancel()
-                logger.info("maestro: shutting down, closing connections...")
-                await teardown_all_hosts()
+                try:
+                    logger.info("maestro: shutting down, closing connections...")
+                    await teardown_all_hosts()
+                except Exception:
+                    logger.exception("maestro: error during teardown")
 
         asyncio.run(_serve_with_maestro_lifecycle())
     else:
