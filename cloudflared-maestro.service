@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare Tunnel (maestro)
+After=network-online.target maestro.service
+Wants=network-online.target
+Requires=maestro.service
+
+[Service]
+Type=simple
+User=youruser
+ExecStart=/usr/local/bin/cloudflared tunnel run your-tunnel-name
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

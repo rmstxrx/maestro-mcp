@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Maestro MCP (Apollyon edition).
+Maestro MCP — multi-host machine fleet + AI agent orchestra.
 
-Multi-host machine fleet + AI agent orchestra. Runs as a persistent
-streamable-http service behind a Cloudflare Tunnel, so Cowork (cloud VM)
-can reach the fleet over HTTPS.
+Runs as an MCP server (stdio or streamable-http) that provides shell
+access, file operations, and AI agent dispatch across a heterogeneous
+machine fleet. Host definitions are loaded from hosts.yaml.
 
-Topology:
-  - Apollyon is the local hub (direct subprocess, no SSH)
-  - Eden / Eden-WSL are remote (SSH)
-  - Judas is remote (SSH to judas.home)
-  - Bearer token + OAuth 2.0 authentication for public-facing endpoint
+The hub machine (is_local: true) executes commands directly; all other
+hosts are reached via SSH ControlMaster connections.
 """
 
 import asyncio
@@ -24,6 +21,7 @@ import secrets
 import shlex
 import shutil
 import time
+import yaml
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -44,12 +42,12 @@ from maestro_oauth import MaestroOAuthProvider
 logger = logging.getLogger("maestro")
 
 # ---------------------------------------------------------------------------
-# OAuth provider (shared instance — must exist before FastMCP constructor)
+# Configuration — env vars
 # ---------------------------------------------------------------------------
-_oauth_provider = MaestroOAuthProvider(issuer_url="https://maestro.rmstxrx.dev")
+_ISSUER_URL = os.environ.get("MAESTRO_ISSUER_URL", "https://localhost:8222")
 
 # ---------------------------------------------------------------------------
-# Host registry — Apollyon-centric topology
+# Host registry
 # ---------------------------------------------------------------------------
 
 class HostStatus(Enum):
@@ -76,30 +74,67 @@ class HostConfig:
     last_error: str = ""
 
 
-HOSTS: dict[str, HostConfig] = {
-    "apollyon": HostConfig(
-        alias="mcp-apollyon",
-        display_name="apollyon",
-        description="DGX Spark GB10, 128GB unified. LOCAL (direct execution).",
-        is_local=True,  # <-- THIS is the key difference from Judas edition
-    ),
-    "eden": HostConfig(
-        alias="mcp-eden",
-        display_name="eden",
-        description="Ryzen 9900X, 96GB DDR5, RTX 5090 32GB. Windows/PowerShell.",
-        shell=HostShell.POWERSHELL,
-    ),
-    "eden-wsl": HostConfig(
-        alias="mcp-eden-wsl",
-        display_name="eden-wsl",
-        description="Same box as eden, WSL2/Linux (ProxyJump via eden).",
-    ),
-    "judas": HostConfig(
-        alias="mcp-judas",
-        display_name="judas",
-        description="MacBook Pro M3 Max, 36GB. Remote (SSH to judas.home).",
-    ),
-}
+def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
+    """Load host registry from hosts.yaml."""
+    if config_path is None:
+        config_path = Path(__file__).parent / "hosts.yaml"
+    if not config_path.exists():
+        example = Path(__file__).parent / "hosts.example.yaml"
+        msg = f"Host config not found: {config_path}"
+        if example.exists():
+            msg += f"\n  Copy the example:  cp {example} {config_path}"
+        raise SystemExit(msg)
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict) or "hosts" not in raw:
+        raise SystemExit(f"Invalid hosts.yaml: expected top-level 'hosts' key in {config_path}")
+
+    hosts: dict[str, HostConfig] = {}
+    for name, cfg in raw["hosts"].items():
+        if not isinstance(cfg, dict) or "alias" not in cfg:
+            raise SystemExit(f"Invalid host '{name}' in {config_path}: 'alias' is required")
+        shell_str = cfg.get("shell", "bash").lower()
+        try:
+            shell = HostShell(shell_str)
+        except ValueError:
+            raise SystemExit(
+                f"Invalid shell '{shell_str}' for host '{name}'. "
+                f"Valid options: {', '.join(s.value for s in HostShell)}"
+            )
+        hosts[name] = HostConfig(
+            alias=cfg["alias"],
+            display_name=cfg.get("display_name", name),
+            description=cfg.get("description", ""),
+            shell=shell,
+            is_local=cfg.get("is_local", False),
+        )
+
+    if not hosts:
+        raise SystemExit(f"No hosts defined in {config_path}")
+
+    return hosts
+
+
+HOSTS: dict[str, HostConfig] = _load_hosts()
+
+
+def _local_host_name() -> str | None:
+    """Return the name of the first host marked is_local, or None."""
+    for name, config in HOSTS.items():
+        if config.is_local:
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OAuth provider (shared instance — must exist before FastMCP constructor)
+# ---------------------------------------------------------------------------
+_oauth_provider = MaestroOAuthProvider(
+    issuer_url=_ISSUER_URL,
+    host_names=list(HOSTS.keys()),
+)
 
 TIMEOUT = int(os.environ.get("SSH_TIMEOUT", "300"))
 MAX_RETRIES = 3
@@ -139,7 +174,7 @@ async def _async_run(
 
 
 # ---------------------------------------------------------------------------
-# Local execution (apollyon — no SSH)
+# Local execution (hub — no SSH)
 # ---------------------------------------------------------------------------
 
 async def _local_run(
@@ -372,10 +407,10 @@ def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     return "\n".join(parts) or "[no output]"
 
 
-def _local_host_hint(tool_name: str) -> str:
+def _local_host_hint(tool_name: str, host_name: str) -> str:
     """Soft guardrail: nudge agents to prefer native tools for local ops."""
     return (
-        f"[NOTE: '{tool_name}' targeted apollyon, which is the LOCAL hub. "
+        f"[NOTE: '{tool_name}' targeted {host_name}, which is the LOCAL hub. "
         "If you have native shell/file tools (e.g. bash_tool), prefer those "
         "for local operations. If Maestro is your only interface, disregard.]\n"
     )
@@ -502,33 +537,26 @@ async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    "maestro",
-    auth_server_provider=_oauth_provider,
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl("https://maestro.rmstxrx.dev"),
-        resource_server_url=AnyHttpUrl("https://maestro.rmstxrx.dev/mcp"),
-        client_registration_options=ClientRegistrationOptions(
-            enabled=True,
-            valid_scopes=["maestro"],
-            default_scopes=["maestro"],
-        ),
-        revocation_options=RevocationOptions(enabled=True),
-        required_scopes=["maestro"],
-    ),
-    # Disable DNS rebinding protection — we're behind Cloudflare Tunnel,
-    # so the Host header is the public domain, not localhost.
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    ),
-    instructions=(
+def _build_instructions() -> str:
+    """Generate MCP instructions dynamically from loaded hosts."""
+    host_lines = []
+    for name, cfg in HOSTS.items():
+        local_tag = " LOCAL (direct execution, no SSH)." if cfg.is_local else ""
+        desc = f" {cfg.description}" if cfg.description else ""
+        host_lines.append(f"  {name:12s} —{desc}{local_tag}")
+    hosts_block = "\n".join(host_lines)
+
+    local_name = _local_host_name()
+    local_note = (
+        f"{local_name} commands execute locally (zero overhead, no SSH).\n"
+        if local_name else ""
+    )
+
+    return (
         "Maestro MCP — multi-host machine fleet + AI agent orchestra.\n"
         "\n"
         "Available hosts:\n"
-        "  apollyon  — DGX Spark GB10, 128GB. LOCAL (direct execution, no SSH).\n"
-        "  eden      — Ryzen 9900X, 96GB DDR5, RTX 5090. Windows/PowerShell.\n"
-        "  eden-wsl  — Same physical machine as eden, but WSL2/Linux.\n"
-        "  judas     — MacBook Pro M3 Max, 36GB. Remote (SSH).\n"
+        f"{hosts_block}\n"
         "\n"
         "Remote tools (run commands on machines):\n"
         "  maestro_exec     — Single command. Has cwd and sudo options.\n"
@@ -550,15 +578,36 @@ mcp = FastMCP(
         "  agent_read_output  — Read full output from a previous dispatch.\n"
         "  agent_status       — Check CLI availability on a host.\n"
         "\n"
-        "Apollyon commands execute locally (zero overhead, no SSH).\n"
-        "Use 'eden' for PowerShell, 'eden-wsl' for Linux on the same box.\n"
+        f"{local_note}"
         "Prefer maestro_read/maestro_write over scp for text files.\n"
         "Prefer maestro_script over chained && commands.\n"
         "\n"
         "Agent principles: output saved to disk, summary returned inline.\n"
         "Codex = executor (code). Gemini = analyst (comprehension). Claude = architect (reasoning).\n"
         "Use *_execute for quick bounded tasks. Use *_dispatch + agent_poll for long tasks.\n"
+    )
+
+
+mcp = FastMCP(
+    "maestro",
+    auth_server_provider=_oauth_provider,
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(_ISSUER_URL),
+        resource_server_url=AnyHttpUrl(f"{_ISSUER_URL}/mcp"),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["maestro"],
+            default_scopes=["maestro"],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=["maestro"],
     ),
+    # Disable DNS rebinding protection — we're behind Cloudflare Tunnel,
+    # so the Host header is the public domain, not localhost.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+    instructions=_build_instructions(),
     # NOTE: No per-session lifespan — SSH lifecycle is managed at the server
     # level by _serve_with_maestro_lifecycle(). A per-session lifespan would
     # tear down ALL SSH ControlMasters when any single session disconnects,
@@ -580,7 +629,7 @@ async def maestro_exec(
     """Execute a shell command on a remote host.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         command: Shell command to execute
         cwd: Working directory to cd into before running the command
         sudo: If True, prepend sudo (assumes passwordless sudo on target)
@@ -593,7 +642,7 @@ async def maestro_exec(
             parts.append("sudo")
         parts.append(command)
         full_cmd = " ".join(parts)
-        return _local_host_hint("maestro_exec") + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+        return _local_host_hint("maestro_exec", host) + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
     full_cmd = _wrap_command(config, command, cwd, sudo)
     return await _ssh_run(host, [full_cmd], timeout=timeout)
 
@@ -605,11 +654,11 @@ async def maestro_script(
 ) -> str:
     """Execute a multi-line script on a remote host via stdin.
 
-    The script is piped to bash (or powershell on eden) via `bash -s`.
+    The script is piped to bash (or powershell on Windows hosts) via `bash -s`.
     Use this instead of chaining commands with &&.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         script: Multi-line script body (no shebang needed)
         cwd: Working directory — a `cd` is prepended to the script
         sudo: If True, run the whole script under sudo
@@ -617,7 +666,7 @@ async def maestro_script(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_script") + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+        return _local_host_hint("maestro_script", host) + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
     lines = []
     if config.shell == HostShell.POWERSHELL:
         lines.append("$ErrorActionPreference = 'Stop'")
@@ -646,7 +695,7 @@ async def maestro_read(
     Returns the file contents. For large files, use head/tail to slice.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         path: Absolute path to the file on the remote host
         head: If set, return only the first N lines
         tail: If set, return only the last N lines
@@ -654,7 +703,7 @@ async def maestro_read(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_read") + _local_read_file(path, head=head, tail=tail)
+        return _local_host_hint("maestro_read", host) + _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
             cmd = f"Get-Content {shlex.quote(path)} -TotalCount {head}"
@@ -683,7 +732,7 @@ async def maestro_write(
     Creates parent directories automatically.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         path: Absolute path to the file on the remote host
         content: Text content to write
         append: If True, append instead of overwrite
@@ -692,7 +741,7 @@ async def maestro_write(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_write") + _local_write_file(path, content, append=append, sudo=sudo)
+        return _local_host_hint("maestro_write", host) + _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
             cmd = f"$input | Out-File -Append -FilePath {shlex.quote(path)}"
@@ -719,13 +768,13 @@ async def maestro_upload(host: str, local_path: str, remote_path: str) -> str:
     Use for binary files or large transfers. For text files, prefer maestro_write.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         local_path: Local file path to upload
         remote_path: Destination path on remote host
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_upload") + _local_copy(local_path, remote_path, upload=True)
+        return _local_host_hint("maestro_upload", host) + _local_copy(local_path, remote_path, upload=True)
     return await _scp_run(host, local_path, remote_path, upload=True)
 
 
@@ -736,13 +785,13 @@ async def maestro_download(host: str, remote_path: str, local_path: str) -> str:
     Use for binary files or large transfers. For text files, prefer maestro_read.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         remote_path: File path on remote host
         local_path: Local destination path
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_download") + _local_copy(remote_path, local_path, upload=False)
+        return _local_host_hint("maestro_download", host) + _local_copy(remote_path, local_path, upload=False)
     return await _scp_run(host, remote_path, local_path, upload=False)
 
 
@@ -753,7 +802,7 @@ async def maestro_status() -> str:
     Tests each host's ControlMaster socket and re-warms connections
     that have gone stale. Returns a status summary.
     """
-    lines = ["Maestro Status (Apollyon hub)", "=" * 55]
+    lines = ["Maestro Status", "=" * 55]
 
     async def _check_one(name: str, config: HostConfig) -> str:
         config.last_check = time.time()
@@ -804,7 +853,7 @@ ORCHESTRA_OUTPUT_DIR = Path.home() / ".agent-orchestra" / "outputs"
 CODEX_TIMEOUT = 300   # 5 min for code tasks
 GEMINI_TIMEOUT = 180  # 3 min for analysis
 MAX_INLINE_OUTPUT = 4000  # chars returned inline; rest stays on disk
-DEFAULT_REPO = str(Path.home() / "Development" / "relator.IA")
+DEFAULT_REPO = os.environ.get("MAESTRO_DEFAULT_REPO", str(Path.home() / "workspace"))
 
 
 CLAUDE_TIMEOUT = 300  # 5 min for Claude Code tasks
@@ -962,12 +1011,14 @@ async def _orchestra_run_cli(
 
 
 @mcp.tool()
-async def agent_status(host: str = "apollyon") -> str:
+async def agent_status(host: str = "") -> str:
     """Check availability of Codex CLI and Gemini CLI on a Maestro host.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
     """
+    if not host:
+        host = _local_host_name() or next(iter(HOSTS))
     _resolve_host(host)
 
     codex_rc, codex_out = await _orchestra_run_cli(host, "codex --version 2>&1", timeout=10)
@@ -1002,7 +1053,7 @@ async def codex_execute(
     Full output is saved to disk; a structured summary is returned.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default, 'gpt-5-codex-mini', 'gpt-5.1-codex-max').
@@ -1041,7 +1092,7 @@ async def gemini_analyze(
     Full output is saved to disk; a structured summary is returned.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The analytical question or task.
         context_files: File paths to include via @file syntax (leverages 1M context).
         working_dir: Working directory for the invocation.
@@ -1102,7 +1153,7 @@ async def gemini_research(
     Full output is saved to disk; a structured summary is returned.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         query: Research query (Gemini uses Google Search grounding).
         timeout: Max seconds to wait (default 180).
     """
@@ -1149,7 +1200,7 @@ async def gemini_execute(
     Full output is saved to disk; a structured summary is returned.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         context_files: File paths to include via @file syntax (leverages 1M context).
         working_dir: Git repo directory where Gemini works.
@@ -1251,7 +1302,7 @@ async def claude_execute(
     Full output is saved to disk; a structured summary is returned.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
         max_budget_usd: Dollar cap per invocation (default $1.00).
@@ -1291,7 +1342,7 @@ async def codex_dispatch(
     Best for long-running tasks where you don't want to block.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default).
@@ -1350,7 +1401,7 @@ async def gemini_dispatch(
     Best for large-context analysis where you don't want to block.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The analytical question or task.
         context_files: File paths to include via @file syntax.
         working_dir: Working directory for the invocation.
@@ -1432,7 +1483,7 @@ async def claude_dispatch(
     Best for multi-file refactoring or architectural tasks that take minutes.
 
     Args:
-        host: Target host. One of: apollyon, eden, eden-wsl, judas
+        host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Claude Code works.
         max_budget_usd: Dollar cap per invocation (default $1.00).
@@ -1518,8 +1569,8 @@ if __name__ == "__main__":
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    # Audit logger — JSON-lines to ~/.fleet-ssh/audit.log
-    _audit_log_path = Path.home() / ".fleet-ssh" / "audit.log"
+    # Audit logger — JSON-lines to ~/.maestro/audit.log
+    _audit_log_path = Path.home() / ".maestro" / "audit.log"
     _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     _audit_handler = logging.FileHandler(_audit_log_path)
     _audit_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -1528,7 +1579,7 @@ if __name__ == "__main__":
     _audit_logger.setLevel(logging.INFO)
     _audit_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Maestro MCP (Apollyon edition)")
+    parser = argparse.ArgumentParser(description="Maestro MCP server")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")

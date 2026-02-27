@@ -1,20 +1,20 @@
 [Unit]
-Description=Maestro MCP (streamable-http)
+Description=Maestro MCP Server (streamable-http)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=rmstxrx
-Group=rmstxrx
-WorkingDirectory=/home/rmstxrx/Development/mcp-ssh-fleet
-EnvironmentFile=/home/rmstxrx/Development/mcp-ssh-fleet/.env
-ExecStart=/home/rmstxrx/Development/mcp-ssh-fleet/.venv/bin/python server.py --transport streamable-http --port 8222 --host 127.0.0.1
+User=youruser
+Group=youruser
+WorkingDirectory=/path/to/maestro-mcp
+EnvironmentFile=/path/to/maestro-mcp/.env
+ExecStart=/path/to/maestro-mcp/.venv/bin/python server.py --transport streamable-http --port 8222 --host 127.0.0.1
 Restart=on-failure
 RestartSec=5
 
 # SSH agent / ControlMaster needs HOME
-Environment=HOME=/home/rmstxrx
+Environment=HOME=/home/youruser
 
 [Install]
 WantedBy=multi-user.target

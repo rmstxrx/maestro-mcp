@@ -130,6 +130,8 @@ cp .env.example .env
 # .env
 MAESTRO_AUTHORIZE_PIN_HASH="your_sha256_hash_here"
 SSH_TIMEOUT=300
+MAESTRO_ISSUER_URL=https://your-domain.example.com  # Required for HTTP transport
+# MAESTRO_DEFAULT_REPO=~/workspace                  # Default working dir for agent tools
 ```
 
 ### 4. Run
@@ -282,15 +284,17 @@ Or as a persistent named tunnel — see [Cloudflare's documentation](https://dev
 
 ```
 maestro-mcp/
-├── server.py              # Main MCP server — fleet tools + agent orchestra
-├── maestro_oauth.py       # OAuth 2.1 provider with PIN-gated consent
-├── hosts.yaml             # Your fleet definition (git-ignored)
-├── hosts.example.yaml     # Example fleet config
-├── .env                   # Secrets — PIN hash, tokens (git-ignored)
-├── .env.example           # Template for .env
-├── maestro.service        # systemd unit file (example)
-├── requirements.txt       # Python dependencies
-└── LICENSE                # Apache 2.0
+├── server.py                  # Main MCP server — fleet tools + agent orchestra
+├── maestro_oauth.py           # OAuth 2.1 provider with PIN-gated consent
+├── hosts.yaml                 # Your fleet definition (git-ignored)
+├── hosts.example.yaml         # Example fleet config
+├── .env                       # Secrets — PIN hash, tokens (git-ignored)
+├── .env.example               # Template for .env
+├── pyproject.toml             # Project metadata
+├── requirements.txt           # Python dependencies
+├── maestro.service            # systemd unit file (example)
+├── cloudflared-maestro.service # Cloudflare Tunnel unit (example)
+└── LICENSE                    # Apache 2.0
 ```
 
 ---

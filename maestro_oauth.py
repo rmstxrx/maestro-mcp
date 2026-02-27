@@ -64,8 +64,9 @@ class MaestroOAuthProvider:
     REG_RATE_LIMIT = 10
     REG_RATE_WINDOW = 60  # seconds
 
-    def __init__(self, issuer_url: str):
+    def __init__(self, issuer_url: str, host_names: list[str] | None = None):
         self.issuer_url = issuer_url.rstrip("/")
+        self.host_names = host_names or []
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
@@ -262,6 +263,7 @@ class MaestroOAuthProvider:
             client_name=pending["client_name"],
             approval_id=approval_id,
             csrf_token=csrf,
+            host_names=self.host_names,
         ))
 
     async def _approve_post(self, request: Request) -> Response:
@@ -328,10 +330,11 @@ class MaestroOAuthProvider:
 # HTML templates
 # ---------------------------------------------------------------------------
 
-def _approve_page(client_name: str, approval_id: str, csrf_token: str) -> str:
+def _approve_page(client_name: str, approval_id: str, csrf_token: str, host_names: list[str] | None = None) -> str:
     safe_name = html_mod.escape(client_name)
     safe_id = html_mod.escape(approval_id)
     safe_csrf = html_mod.escape(csrf_token)
+    hosts_str = html_mod.escape(", ".join(host_names)) if host_names else "configured hosts"
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -368,7 +371,7 @@ def _approve_page(client_name: str, approval_id: str, csrf_token: str) -> str:
         <div class="perms">
             <strong>This will allow:</strong>
             <ul>
-                <li>Execute commands on apollyon, eden, judas</li>
+                <li>Execute commands on {hosts_str}</li>
                 <li>Read and write files on all hosts</li>
                 <li>Transfer files between machines</li>
             </ul>

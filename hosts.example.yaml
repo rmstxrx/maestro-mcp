@@ -1,0 +1,35 @@
+# hosts.yaml — define your machine fleet
+# Copy this file:  cp hosts.example.yaml hosts.yaml
+# Then edit with your real host definitions.
+#
+# Each host needs:
+#   alias: must match a Host entry in ~/.ssh/config
+#   description: human-readable description (shown in tool instructions)
+#
+# Optional:
+#   shell: bash (default) or powershell
+#   is_local: true if this is the hub machine (direct execution, no SSH)
+#   display_name: override the display name (defaults to the YAML key)
+
+hosts:
+  workstation:
+    alias: ssh-workstation
+    description: "Main dev box, Arch Linux"
+    is_local: true
+
+  gpu-box:
+    alias: ssh-gpu
+    description: "Training rig, Ubuntu 24.04"
+
+  macbook:
+    alias: ssh-macbook
+    description: "MacBook Pro, on the go"
+
+  windows-pc:
+    alias: ssh-winpc
+    description: "Windows 11, PowerShell"
+    shell: powershell
+
+  windows-wsl:
+    alias: ssh-winpc-wsl
+    description: "WSL2 on windows-pc (ProxyJump)"
