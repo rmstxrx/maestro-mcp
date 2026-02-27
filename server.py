@@ -21,6 +21,7 @@ import secrets
 import shlex
 import shutil
 import time
+import tempfile
 import yaml
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -35,7 +36,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 
 from maestro_oauth import MaestroOAuthProvider
 
@@ -648,6 +650,162 @@ async def _approve_route(request: Request) -> Response:
     """Consent page + PIN gate for non-Claude.ai OAuth clients."""
     return await _oauth_provider.handle_approve(request)
 
+
+# --- FILE TRANSFER RELAY ---
+# Zero-context-cost file push/pull for sandboxed agents (e.g. Claude.ai).
+# Bytes flow over HTTP, never entering the LLM context window.
+#
+# Auth: Bearer token from MAESTRO_TRANSFER_TOKEN env var (constant-time comparison).
+#
+#   POST /transfer/push?host=<host>&remote_path=<path>  (multipart upload)
+#   GET  /transfer/pull?host=<host>&remote_path=<path>  (file download)
+# ---------------------------------------------------------------------------
+
+_TRANSFER_TOKEN = os.environ.get("MAESTRO_TRANSFER_TOKEN", "")
+_MAX_TRANSFER_SIZE = int(os.environ.get("MAESTRO_MAX_TRANSFER_MB", "100")) * 1024 * 1024
+
+
+def _transfer_auth_ok(request: Request) -> bool:
+    """Validate Bearer token for transfer endpoints (constant-time)."""
+    if not _TRANSFER_TOKEN:
+        return False
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    return hmac.compare_digest(auth[7:], _TRANSFER_TOKEN)
+
+
+def _auth_error() -> JSONResponse:
+    return JSONResponse(
+        {"error": "unauthorized", "detail": "valid Bearer token required"},
+        status_code=401,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@mcp.custom_route("/transfer/push", methods=["POST"])
+async def _transfer_push(request: Request) -> Response:
+    """Receive a file upload and write it to the target host."""
+    if not _transfer_auth_ok(request):
+        return _auth_error()
+
+    host = request.query_params.get("host")
+    remote_path = request.query_params.get("remote_path")
+    if not host or not remote_path:
+        return JSONResponse(
+            {"error": "bad_request", "detail": "host and remote_path query params required"},
+            status_code=400,
+        )
+
+    try:
+        config = _resolve_host(host)
+    except Exception as e:
+        return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
+
+    form = await request.form()
+    uploaded = form.get("file")
+    if uploaded is None:
+        return JSONResponse(
+            {"error": "bad_request", "detail": "multipart 'file' field required"},
+            status_code=400,
+        )
+
+    content_bytes = await uploaded.read()
+    if len(content_bytes) > _MAX_TRANSFER_SIZE:
+        return JSONResponse(
+            {"error": "too_large", "detail": f"file exceeds {_MAX_TRANSFER_SIZE // (1024*1024)}MB limit"},
+            status_code=413,
+        )
+
+    if config.is_local:
+        try:
+            p = Path(remote_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(content_bytes)
+            logger.info(f"transfer/push: {len(content_bytes)} bytes -> {host}:{remote_path}")
+            return JSONResponse({
+                "status": "ok", "host": host,
+                "path": remote_path, "bytes": len(content_bytes),
+            })
+        except Exception as e:
+            return JSONResponse({"error": "write_failed", "detail": str(e)}, status_code=500)
+    else:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_path).suffix) as tmp:
+            tmp.write(content_bytes)
+            tmp_path = tmp.name
+        try:
+            result = await _scp_run(host, tmp_path, remote_path, upload=True)
+            if result.startswith("[OK]"):
+                logger.info(f"transfer/push: {len(content_bytes)} bytes -> {host}:{remote_path} (scp)")
+                return JSONResponse({
+                    "status": "ok", "host": host,
+                    "path": remote_path, "bytes": len(content_bytes),
+                })
+            else:
+                return JSONResponse({"error": "scp_failed", "detail": result}, status_code=502)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+
+@mcp.custom_route("/transfer/pull", methods=["GET"])
+async def _transfer_pull(request: Request) -> Response:
+    """Stream a file from the target host back to the caller."""
+    if not _transfer_auth_ok(request):
+        return _auth_error()
+
+    host = request.query_params.get("host")
+    remote_path = request.query_params.get("remote_path")
+    if not host or not remote_path:
+        return JSONResponse(
+            {"error": "bad_request", "detail": "host and remote_path query params required"},
+            status_code=400,
+        )
+
+    try:
+        config = _resolve_host(host)
+    except Exception as e:
+        return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
+
+    if config.is_local:
+        p = Path(remote_path)
+        if not p.is_file():
+            return JSONResponse(
+                {"error": "not_found", "detail": f"{remote_path} not found"},
+                status_code=404,
+            )
+        if p.stat().st_size > _MAX_TRANSFER_SIZE:
+            return JSONResponse(
+                {"error": "too_large", "detail": f"file exceeds {_MAX_TRANSFER_SIZE // (1024*1024)}MB limit"},
+                status_code=413,
+            )
+        logger.info(f"transfer/pull: {host}:{remote_path} -> caller")
+        return FileResponse(remote_path, filename=p.name, media_type="application/octet-stream")
+    else:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_path).suffix) as tmp:
+            tmp_path = tmp.name
+        try:
+            result = await _scp_run(host, remote_path, tmp_path, upload=False)
+            if not result.startswith("[OK]"):
+                Path(tmp_path).unlink(missing_ok=True)
+                return JSONResponse({"error": "scp_failed", "detail": result}, status_code=502)
+            if Path(tmp_path).stat().st_size > _MAX_TRANSFER_SIZE:
+                Path(tmp_path).unlink(missing_ok=True)
+                return JSONResponse(
+                    {"error": "too_large", "detail": f"file exceeds {_MAX_TRANSFER_SIZE // (1024*1024)}MB limit"},
+                    status_code=413,
+                )
+            logger.info(f"transfer/pull: {host}:{remote_path} -> caller (scp)")
+            return FileResponse(
+                tmp_path, filename=Path(remote_path).name,
+                media_type="application/octet-stream",
+                background=BackgroundTask(lambda: Path(tmp_path).unlink(missing_ok=True)),
+            )
+        except Exception as e:
+            Path(tmp_path).unlink(missing_ok=True)
+            return JSONResponse({"error": "pull_failed", "detail": str(e)}, status_code=500)
+
+
+# --- END FILE TRANSFER RELAY ---
 
 @mcp.tool()
 async def maestro_exec(
