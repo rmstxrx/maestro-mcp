@@ -50,12 +50,12 @@ Levels: `low` → `medium` → `high` → `xhigh`
 
 | Reasoning Effort | Use When |
 |---|---|
-| `xhigh` | Long-running autonomous tasks (Ralph-loop style), complex refactors, anything where correctness matters more than speed. This is what OpenAI benchmarks at. |
-| `high` | Default for dispatched tasks via Maestro. Strong reasoning, good autonomy. |
+| `xhigh` | **Default.** Long-running autonomous tasks, complex refactors, anything where correctness matters more than speed. This is what OpenAI benchmarks at. We pay for Pro — use the ceiling. |
+| `high` | Fallback when xhigh latency is unacceptable but strong reasoning is still needed. |
 | `medium` | Interactive pairing, fast feedback loops. OpenAI's recommended "daily driver." |
 | `low` | Mechanical/batch tasks (formatting, boilerplate generation). |
 
-**Maestro default: `high`**. Escalate to `xhigh` for tasks expected to run >30 min or requiring multi-context-window compaction. Drop to `medium` for Spark-like interactive use.
+**Maestro default: `xhigh`**. We pay for Pro — use the ceiling. Drop to `high` for moderate tasks, `medium` for Spark-like interactive use.
 
 #### Gemini 3.1 Pro
 
@@ -83,7 +83,7 @@ Claude Code exposes High/Medium/Low effort settings. Anthropic manages model sel
 | Maestro SSH PATH | Minimal (`/usr/bin:/bin`) | Source `.zshrc` or set `SendEnv`/`AcceptEnv` | Judas |
 | Maestro default Codex model | `gpt-5.1-codex-max` | `gpt-5.3-codex` | All (tool definition) |
 | Maestro default Codex fallback | `gpt-5-codex-mini` | Keep as cost fallback | — |
-| Maestro default Codex reasoning | (none) | `high` | All (tool definition) |
+| Maestro default Codex reasoning | (none) | `xhigh` | All (tool definition) |
 | Maestro default Gemini thinking | (none) | `high` (Deep Think Mini) | All (tool definition) |
 
 ### 5. Delegation Principle

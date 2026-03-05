@@ -1454,7 +1454,7 @@ async def codex_execute(
     prompt: str,
     working_dir: str = DEFAULT_REPO,
     model: str = "",
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "xhigh",
     timeout: int = CODEX_TIMEOUT,
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
@@ -1470,7 +1470,7 @@ async def codex_execute(
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default, 'gpt-5.3-codex').
-        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'high'.
+        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
         timeout: Max seconds to wait (default 300).
     """
     task_id = _orchestra_task_id(prompt)
@@ -1772,7 +1772,7 @@ async def codex_dispatch(
     prompt: str,
     working_dir: str = DEFAULT_REPO,
     model: str = "",
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "xhigh",
     timeout: int = CODEX_TIMEOUT,
 ) -> str:
     """Dispatch a coding task to Codex CLI asynchronously. Returns a task_id immediately.
@@ -1785,7 +1785,7 @@ async def codex_dispatch(
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default, 'gpt-5.3-codex').
-        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'high'.
+        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
         timeout: Max seconds for the background task (default 300).
     """
     def build_cmd() -> str:
