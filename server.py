@@ -871,6 +871,163 @@ async def maestro_script(
     return await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
 
 
+# ---------------------------------------------------------------------------
+# Background command dispatch — fire-and-forget shell commands
+# ---------------------------------------------------------------------------
+
+BG_OUTPUT_DIR = Path.home() / ".maestro" / "bg-outputs"
+BG_DEFAULT_TIMEOUT = 300  # 5 min default for background commands
+
+
+def _bg_output_dir() -> Path:
+    """Ensure bg output directory exists."""
+    BG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return BG_OUTPUT_DIR
+
+
+def _bg_output_path(task_id: str) -> Path:
+    """Generate output file path for a background command."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return _bg_output_dir() / f"bg_{ts}_{task_id}.txt"
+
+
+@mcp.tool()
+async def maestro_bg(
+    host: str,
+    command: str,
+    cwd: str | None = None,
+    sudo: bool = False,
+    timeout: int = BG_DEFAULT_TIMEOUT,
+) -> str:
+    """Run a shell command in the background. Returns a task_id immediately.
+
+    Use agent_poll(task_id) to check status and get the result.
+    Use maestro_bg_log(task_id) to tail the output while still running.
+
+    Best for: docker pull, model downloads, long builds, anything that
+    takes more than a few seconds. Prevents tool-call timeouts.
+
+    Args:
+        host: Target host (see maestro_status for available hosts)
+        command: Shell command to execute
+        cwd: Working directory to cd into before running the command
+        sudo: If True, prepend sudo (assumes passwordless sudo on target)
+        timeout: Max seconds before the background task is killed (default 300)
+    """
+    config = _resolve_host(host)
+    task_id = secrets.token_hex(8)
+    output_file = _bg_output_path(task_id)
+    now = datetime.now(timezone.utc)
+
+    ts = TaskState(
+        task_id=task_id,
+        agent="bg",
+        host=host,
+        prompt=command,
+        status="running",
+        started_at=now,
+        output_file=output_file,
+    )
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
+
+    async def _run() -> None:
+        try:
+            if config.is_local:
+                full_cmd = command
+                if sudo:
+                    full_cmd = f"sudo {command}"
+                result_text = await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+            else:
+                full_cmd = _wrap_command(config, command, cwd, sudo)
+                result_text = await _ssh_run(host, [full_cmd], timeout=timeout)
+
+            # Save full output to disk
+            output_file.write_text(result_text, encoding="utf-8")
+
+            # Build inline result (truncated if needed)
+            truncated, was_truncated = _orchestra_truncate(result_text)
+            result = {
+                "task_id": task_id,
+                "host": host,
+                "command": command[:200],
+                "status": "done",
+                "output": truncated,
+                "output_file": str(output_file) if was_truncated else None,
+            }
+            ts.status = "done"
+            ts.result_json = json.dumps(result)
+        except asyncio.CancelledError:
+            ts.status = "failed"
+            ts.result_json = json.dumps({
+                "task_id": task_id, "host": host, "status": "timeout",
+                "error": f"Killed after {timeout}s timeout",
+            })
+        except Exception as exc:
+            logger.exception(f"maestro_bg [{task_id}] failed on {host}")
+            ts.status = "failed"
+            ts.result_json = json.dumps({
+                "task_id": task_id, "host": host, "status": "failed",
+                "error": str(exc),
+            })
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+
+    ts.asyncio_task = asyncio.create_task(_run())
+    logger.info(f"maestro_bg on {host} [{task_id}]: {command[:80]}...")
+
+    return json.dumps({
+        "task_id": task_id,
+        "host": host,
+        "status": "running",
+        "poll_with": f"agent_poll(task_id='{task_id}')",
+        "log_with": f"maestro_bg_log(task_id='{task_id}')",
+    })
+
+
+@mcp.tool()
+async def maestro_bg_log(
+    task_id: str,
+    tail: int = 50,
+) -> str:
+    """Read recent output from a background command (running or finished).
+
+    Note: Output is captured after the command completes (SSH collects all
+    output before returning). For real-time visibility into long commands,
+    have the command write its own log file and read it with maestro_read:
+        maestro_bg(host, "docker pull image > /tmp/pull.log 2>&1")
+        maestro_read(host, "/tmp/pull.log", tail=20)
+
+    Args:
+        task_id: Task ID returned by maestro_bg.
+        tail: Number of lines from the end to return (default 50).
+    """
+    async with _REGISTRY_LOCK:
+        ts = TASK_REGISTRY.get(task_id)
+    if ts is None:
+        return json.dumps({"error": f"Task '{task_id}' not found"})
+    if ts.output_file is None or not ts.output_file.exists():
+        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+        return json.dumps({
+            "task_id": task_id,
+            "status": ts.status,
+            "elapsed_seconds": round(elapsed, 1),
+            "log": "(no output yet — command still running)",
+        })
+    try:
+        lines = ts.output_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        selected = lines[-tail:] if len(lines) > tail else lines
+        return json.dumps({
+            "task_id": task_id,
+            "status": ts.status,
+            "total_lines": len(lines),
+            "showing_last": len(selected),
+            "log": "\n".join(selected),
+        })
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "task_id": task_id})
+
+
 @mcp.tool()
 async def maestro_read(
     host: str, path: str, head: int | None = None,
@@ -1769,6 +1926,11 @@ if __name__ == "__main__":
         # FastMCP's streamable_http_app() includes all OAuth routes,
         # metadata endpoints, and bearer auth middleware automatically.
         app = mcp.streamable_http_app()
+
+        # OAuth URL rewrite: LAN/localhost clients get metadata matching
+        # their connection URL instead of the public MAESTRO_ISSUER_URL.
+        from oauth_rewrite import OAuthURLRewriteMiddleware
+        app = OAuthURLRewriteMiddleware(app, _ISSUER_URL)
 
         # ASGI middleware: request logging + registration rate-limit enforcement
         from starlette.types import ASGIApp as _ASGIApp, Receive as _Recv, Scope as _Scp, Send as _Snd
