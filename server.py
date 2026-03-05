@@ -613,7 +613,7 @@ def _build_instructions() -> str:
         "Prefer maestro_script over chained && commands.\n"
         "\n"
         "Agent principles: output saved to disk, summary returned inline.\n"
-        "Codex = executor (code). Gemini = analyst (comprehension). Claude = architect (reasoning).\n"
+        "Codex (gpt-5.3-codex) = executor (code). Gemini (3.1 Pro + Deep Think Mini) = analyst (comprehension). Claude = architect (reasoning).\n"
         "Use *_execute for quick bounded tasks. Use *_dispatch + agent_poll for long tasks.\n"
     )
 
@@ -1454,6 +1454,7 @@ async def codex_execute(
     prompt: str,
     working_dir: str = DEFAULT_REPO,
     model: str = "",
+    reasoning_effort: str = "high",
     timeout: int = CODEX_TIMEOUT,
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
@@ -1468,15 +1469,17 @@ async def codex_execute(
         host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
-        model: Codex model (empty=default, 'gpt-5-codex-mini', 'gpt-5.1-codex-max').
+        model: Codex model (empty=default, 'gpt-5.3-codex').
+        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'high'.
         timeout: Max seconds to wait (default 300).
     """
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("codex", task_id)
 
     model_flag = f"--model {shlex.quote(model)} " if model else ""
+    effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
     escaped_prompt = shlex.quote(prompt)
-    cli_cmd = f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+    cli_cmd = f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
 
     logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
 
@@ -1497,7 +1500,8 @@ async def gemini_analyze(
 ) -> str:
     """Dispatch an analysis task to Google Gemini CLI on a Maestro host.
 
-    Gemini runs in headless mode (read-only by default). Best for:
+    Gemini 3.1 Pro runs in headless mode (read-only by default) with high
+    thinking level (Deep Think Mini) enabled by default. Best for:
     large-context codebase analysis, architectural review, document
     comparison, pattern identification across many files.
 
@@ -1540,6 +1544,7 @@ async def gemini_research(
 ) -> str:
     """Dispatch a web research task to Gemini CLI with Google Search grounding.
 
+    Gemini 3.1 Pro defaults to high thinking level (Deep Think Mini).
     Best for: jurisprudencia research, technical documentation lookup,
     current events, regulatory changes.
 
@@ -1578,7 +1583,8 @@ async def gemini_execute(
 ) -> str:
     """Dispatch a coding task to Google Gemini CLI on a Maestro host.
 
-    Gemini runs in write mode (--yolo). Best for: code generation,
+    Gemini 3.1 Pro runs in write mode (--yolo) with high thinking level
+    (Deep Think Mini) enabled by default. Best for: code generation,
     refactoring, bug fixes, and implementation tasks that benefit from
     Gemini's 1M-token context window across many files.
 
@@ -1766,6 +1772,7 @@ async def codex_dispatch(
     prompt: str,
     working_dir: str = DEFAULT_REPO,
     model: str = "",
+    reasoning_effort: str = "high",
     timeout: int = CODEX_TIMEOUT,
 ) -> str:
     """Dispatch a coding task to Codex CLI asynchronously. Returns a task_id immediately.
@@ -1777,13 +1784,15 @@ async def codex_dispatch(
         host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Codex works.
-        model: Codex model (empty=default).
+        model: Codex model (empty=default, 'gpt-5.3-codex').
+        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'high'.
         timeout: Max seconds for the background task (default 300).
     """
     def build_cmd() -> str:
         model_flag = f"--model {shlex.quote(model)} " if model else ""
+        effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
         escaped = shlex.quote(prompt)
-        return f"codex exec --full-auto --json {model_flag}-C {shlex.quote(working_dir)} {escaped}"
+        return f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped}"
 
     return await _dispatch_async(
         "codex", host, prompt, build_cmd, timeout=timeout, working_dir=working_dir,
@@ -1802,6 +1811,7 @@ async def gemini_dispatch(
 ) -> str:
     """Dispatch an analysis task to Gemini CLI asynchronously. Returns a task_id immediately.
 
+    Gemini 3.1 Pro defaults to high thinking level (Deep Think Mini).
     Use agent_poll(task_id) to check progress and retrieve the result.
     Best for large-context analysis where you don't want to block.
 

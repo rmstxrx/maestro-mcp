@@ -24,4 +24,5 @@ cloudflared-maestro.service
 
 # OS
 .DS_Store
-docs/
+docs/sessions/
+docs/eden-wsl/
