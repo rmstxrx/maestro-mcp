@@ -82,6 +82,11 @@ class MaestroOAuthProvider:
         self._PIN_FAIL_LIMIT = 5
         self._PIN_FAIL_WINDOW = 300  # 5 minutes
 
+        # Token endpoint rate limiting: max requests per minute per client_id
+        self._token_rate: dict[str, list[float]] = {}
+        self._TOKEN_RATE_LIMIT = 20
+        self._TOKEN_RATE_WINDOW = 60  # seconds
+
         # Trusted client IDs that skip the PIN gate.
         self.trusted_client_ids: set[str] = {
             cid.strip() for cid in _TRUSTED_CLIENT_IDS_RAW.split(",")
@@ -169,6 +174,7 @@ class MaestroOAuthProvider:
         client: OAuthClientInformationFull,
         authorization_code: AuthorizationCode,
     ) -> OAuthToken:
+        self._check_token_rate(client.client_id)
         now = int(time.time())
         access_tok = secrets.token_urlsafe(32)
         refresh_tok = secrets.token_urlsafe(32)
@@ -211,6 +217,7 @@ class MaestroOAuthProvider:
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
+        self._check_token_rate(client.client_id)
         del self.refresh_tokens[refresh_token.token]
         now = int(time.time())
         access_tok = secrets.token_urlsafe(32)
@@ -263,6 +270,18 @@ class MaestroOAuthProvider:
             self.refresh_tokens.pop(token.token, None)
 
     # --- Internal ---
+
+    def _check_token_rate(self, client_id: str) -> None:
+        """Enforce per-client rate limit on token exchange. Raises ValueError if exceeded."""
+        now = time.time()
+        timestamps = self._token_rate.get(client_id, [])
+        timestamps = [t for t in timestamps if now - t < self._TOKEN_RATE_WINDOW]
+        if len(timestamps) >= self._TOKEN_RATE_LIMIT:
+            self._token_rate[client_id] = timestamps
+            _audit("token_rate_limited", client_id=client_id)
+            raise ValueError("Token request rate limit exceeded — try again later")
+        timestamps.append(now)
+        self._token_rate[client_id] = timestamps
 
     def _store_auth_code(
         self,
