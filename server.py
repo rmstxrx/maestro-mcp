@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
@@ -161,6 +161,7 @@ _oauth_provider = MaestroOAuthProvider(
 )
 
 TIMEOUT = int(os.environ.get("SSH_TIMEOUT", "300"))
+BLOCK_TIMEOUT_DEFAULT = 20  # seconds before auto-promote kicks in
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0
 
@@ -604,14 +605,12 @@ def _build_instructions() -> str:
         "  maestro_status   — Check connectivity of all hosts.\n"
         "\n"
         "Agent tools (dispatch tasks to AI coding agents):\n"
-        "  codex_execute      — Dispatch code task to OpenAI Codex CLI (blocking).\n"
-        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI (blocking).\n"
-        "  gemini_research    — Web research via Gemini + Google Search (blocking).\n"
-        "  claude_execute     — Dispatch code task to Claude Code CLI (blocking).\n"
-        "  codex_dispatch     — Async Codex dispatch; returns task_id immediately.\n"
-        "  gemini_dispatch    — Async Gemini dispatch; returns task_id immediately.\n"
-        "  claude_dispatch    — Async Claude Code dispatch; returns task_id immediately.\n"
-        "  agent_poll         — Check status / retrieve result of an async task.\n"
+        "  codex_execute      — Dispatch code task to OpenAI Codex CLI.\n"
+        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI.\n"
+        "  gemini_research    — Web research via Gemini + Google Search.\n"
+        "  gemini_execute     — Dispatch coding task to Gemini CLI (write mode).\n"
+        "  claude_execute     — Dispatch code task to Claude Code CLI.\n"
+        "  agent_poll         — Check status / retrieve result. Supports wait= for long-poll.\n"
         "  agent_read_output  — Read full output from a previous dispatch.\n"
         "  agent_status       — Check CLI availability on a host.\n"
         "\n"
@@ -619,9 +618,12 @@ def _build_instructions() -> str:
         "Prefer maestro_read/maestro_write over scp for text files.\n"
         "Prefer maestro_script over chained && commands.\n"
         "\n"
+        "Auto-promote: all tools auto-promote to background after 20s (block_timeout).\n"
+        "Quick commands return inline. Long tasks return a task_id — use agent_poll(id, wait=60) to long-poll.\n"
+        "Use block_timeout=0 for immediate dispatch, block_timeout=-1 for legacy full-blocking.\n"
+        "\n"
         "Agent principles: output saved to disk, summary returned inline.\n"
         "Codex (gpt-5.3-codex) = executor (code). Gemini (3.1 Pro + Deep Think Mini) = analyst (comprehension). Claude = architect (reasoning).\n"
-        "Use *_execute for quick bounded tasks. Use *_dispatch + agent_poll for long tasks.\n"
     )
 
 
@@ -895,8 +897,13 @@ async def _transfer_pull(request: Request) -> Response:
 async def maestro_exec(
     host: str, command: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Execute a shell command on a remote host.
+
+    If the command takes longer than block_timeout seconds, it auto-promotes
+    to a background task and returns a task_id. Use agent_poll(task_id) to
+    retrieve the result.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -904,28 +911,43 @@ async def maestro_exec(
         cwd: Working directory to cd into before running the command
         sudo: If True, prepend sudo (assumes passwordless sudo on target)
         timeout: Max seconds to wait (default from SSH_TIMEOUT env, usually 300)
+        block_timeout: Max seconds to block inline before auto-promoting (default 20).
+                       Use -1 to force full blocking (legacy).
     """
-    config = _resolve_host(host)
-    if config.is_local:
-        parts = []
-        if sudo:
-            parts.append("sudo")
-        parts.append(command)
-        full_cmd = " ".join(parts)
-        return _local_host_hint("maestro_exec", host) + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
-    full_cmd = _wrap_command(config, command, cwd, sudo)
-    return await _ssh_run(host, [full_cmd], timeout=timeout)
+    async def _execute() -> str:
+        config = _resolve_host(host)
+        if config.is_local:
+            parts = []
+            if sudo:
+                parts.append("sudo")
+            parts.append(command)
+            full_cmd = " ".join(parts)
+            return _local_host_hint("maestro_exec", host) + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+        full_cmd = _wrap_command(config, command, cwd, sudo)
+        return await _ssh_run(host, [full_cmd], timeout=timeout)
+
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="exec",
+        host=host,
+        prompt=command[:200],
+    )
 
 
 @mcp.tool()
 async def maestro_script(
     host: str, script: str, cwd: str | None = None,
     sudo: bool = False, timeout: int = TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Execute a multi-line script on a remote host via stdin.
 
     The script is piped to bash (or powershell on Windows hosts) via `bash -s`.
     Use this instead of chaining commands with &&.
+
+    If the script takes longer than block_timeout seconds, it auto-promotes
+    to a background task and returns a task_id.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -933,26 +955,36 @@ async def maestro_script(
         cwd: Working directory — a `cd` is prepended to the script
         sudo: If True, run the whole script under sudo
         timeout: Max seconds to wait
+        block_timeout: Max seconds to block inline before auto-promoting (default 20).
     """
-    config = _resolve_host(host)
-    if config.is_local:
-        return _local_host_hint("maestro_script", host) + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
-    lines = []
-    if config.shell == HostShell.POWERSHELL:
-        lines.append("$ErrorActionPreference = 'Stop'")
-        if cwd:
-            lines.append(f"Set-Location -LiteralPath {_ps_quote(cwd)}")
-        lines.append(script)
-        stdin_body = "\n".join(lines)
-        interpreter = ["powershell", "-Command", "-"]
-    else:
-        lines.append("set -euo pipefail")
-        if cwd:
-            lines.append(f"cd {shlex.quote(cwd)}")
-        lines.append(script)
-        stdin_body = "\n".join(lines)
-        interpreter = ["sudo", "bash", "-s"] if sudo else ["bash", "-s"]
-    return await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
+    async def _execute() -> str:
+        config = _resolve_host(host)
+        if config.is_local:
+            return _local_host_hint("maestro_script", host) + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+        lines = []
+        if config.shell == HostShell.POWERSHELL:
+            lines.append("$ErrorActionPreference = 'Stop'")
+            if cwd:
+                lines.append(f"Set-Location -LiteralPath {_ps_quote(cwd)}")
+            lines.append(script)
+            stdin_body = "\n".join(lines)
+            interpreter = ["powershell", "-Command", "-"]
+        else:
+            lines.append("set -euo pipefail")
+            if cwd:
+                lines.append(f"cd {shlex.quote(cwd)}")
+            lines.append(script)
+            stdin_body = "\n".join(lines)
+            interpreter = ["sudo", "bash", "-s"] if sudo else ["bash", "-s"]
+        return await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
+
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="script",
+        host=host,
+        prompt=script[:200],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1088,7 @@ async def maestro_bg(
             })
         finally:
             ts.finished_at = datetime.now(timezone.utc)
+            ts._done_event.set()
 
     ts.asyncio_task = asyncio.create_task(_run())
     logger.info(f"maestro_bg on {host} [{task_id}]: {command[:80]}...")
@@ -1276,13 +1309,17 @@ async def maestro_status() -> str:
 
 # Orchestra constants
 ORCHESTRA_OUTPUT_DIR = Path.home() / ".agent-orchestra" / "outputs"
-CODEX_TIMEOUT = 300   # 5 min for code tasks
-GEMINI_TIMEOUT = 180  # 3 min for analysis
+CODEX_TIMEOUT = 600   # 10 min for code tasks (runs in background after auto-promote)
+GEMINI_TIMEOUT = 600  # 10 min for analysis (runs in background after auto-promote)
+CLAUDE_TIMEOUT = 600  # 10 min for Claude Code tasks
 MAX_INLINE_OUTPUT = 4000  # chars returned inline; rest stays on disk
 DEFAULT_REPO = os.environ.get("MAESTRO_DEFAULT_REPO", str(Path.home() / "workspace"))
 
+# Auto-promote: if a tool call doesn't finish within BLOCK_TIMEOUT_DEFAULT
+# seconds, it's promoted to a background task and returns a task_id instead
+# of blocking the conversation. The subprocess keeps running up to its
+# full timeout. Use agent_poll(task_id, wait=N) to long-poll the result.
 
-CLAUDE_TIMEOUT = 300  # 5 min for Claude Code tasks
 TASK_EVICTION_SECONDS = 3600  # 1 hour
 TASK_OUTPUT_RETENTION_SECONDS = 86400  # 24h before output files are deleted
 
@@ -1290,7 +1327,7 @@ TASK_OUTPUT_RETENTION_SECONDS = 86400  # 24h before output files are deleted
 @dataclass
 class TaskState:
     task_id: str
-    agent: str            # "codex" | "gemini" | "claude"
+    agent: str            # "codex" | "gemini" | "claude" | "exec" | "script" | "bg"
     host: str
     prompt: str
     status: str           # "running" | "done" | "failed" | "timeout"
@@ -1299,6 +1336,7 @@ class TaskState:
     asyncio_task: asyncio.Task | None = None
     output_file: Path | None = None
     result_json: str | None = None
+    _done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 TASK_REGISTRY: dict[str, TaskState] = {}
@@ -1506,6 +1544,102 @@ async def _orchestra_run_cli(
     return rc, combined
 
 
+# ---------------------------------------------------------------------------
+# Auto-promote: adaptive inline → background execution
+# ---------------------------------------------------------------------------
+
+async def _auto_promote(
+    execute_fn: Callable[[], Awaitable[str]],
+    *,
+    block_timeout: int,
+    agent: str,
+    host: str,
+    prompt: str,
+) -> str:
+    """Run execute_fn with adaptive blocking.
+
+    Tries to return the result inline. If block_timeout elapses before the
+    work completes, promotes the task to the background registry and returns
+    a task_id immediately.
+
+    Semantics of block_timeout:
+      > 0  — wait this many seconds inline, then auto-promote
+      == 0 — dispatch immediately (never block)
+      < 0  — block forever (legacy behaviour, no promotion)
+
+    Uses asyncio.shield() so that when block_timeout fires, the inner task
+    keeps running — we stop waiting, but the subprocess doesn't stop.
+    """
+    task_id = secrets.token_hex(8)
+    started_at = datetime.now(timezone.utc)
+
+    # Start work immediately as an asyncio task
+    work_task = asyncio.create_task(execute_fn())
+
+    # --- Full-blocking mode (legacy) ---
+    if block_timeout < 0:
+        return await work_task
+
+    # --- Try inline execution within block_timeout ---
+    if block_timeout > 0:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(work_task),
+                timeout=block_timeout,
+            )
+            return result  # Finished inline — no registry overhead
+        except asyncio.TimeoutError:
+            pass  # Fall through to auto-promote
+
+    # --- Auto-promote: register as background task ---
+    ts = TaskState(
+        task_id=task_id,
+        agent=agent,
+        host=host,
+        prompt=prompt[:200],
+        status="running",
+        started_at=started_at,
+        asyncio_task=work_task,
+    )
+
+    async def _monitor() -> None:
+        try:
+            result = await work_task
+            ts.status = "done"
+            ts.result_json = result
+        except asyncio.CancelledError:
+            ts.status = "failed"
+            ts.result_json = json.dumps({
+                "error": "cancelled", "task_id": task_id, "agent": agent,
+            })
+        except Exception as exc:
+            logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
+            ts.status = "failed"
+            ts.result_json = json.dumps({
+                "error": str(exc), "task_id": task_id, "agent": agent,
+            })
+        finally:
+            ts.finished_at = datetime.now(timezone.utc)
+            ts._done_event.set()
+
+    asyncio.create_task(_monitor())
+
+    async with _REGISTRY_LOCK:
+        TASK_REGISTRY[task_id] = ts
+
+    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    logger.info(f"auto_promote: {agent} on {host} [{task_id}] promoted after {elapsed:.1f}s")
+    return json.dumps({
+        "auto_promoted": True,
+        "task_id": task_id,
+        "agent": agent,
+        "host": host,
+        "status": "running",
+        "elapsed_seconds": round(elapsed, 1),
+        "poll_with": f"agent_poll(task_id='{task_id}')",
+    })
+
+
 @mcp.tool()
 async def agent_status(host: str = "") -> str:
     """Check availability of Codex CLI and Gemini CLI on a Maestro host.
@@ -1540,6 +1674,7 @@ async def codex_execute(
     model: str = "",
     reasoning_effort: str = "xhigh",
     timeout: int = CODEX_TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
 
@@ -1548,6 +1683,7 @@ async def codex_execute(
     refactoring, bug fixes, test generation.
 
     Full output is saved to disk; a structured summary is returned.
+    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -1555,21 +1691,28 @@ async def codex_execute(
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default, 'gpt-5.3-codex').
         reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
-        timeout: Max seconds to wait (default 300).
+        timeout: Max seconds to wait (default 600).
+        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("codex", task_id)
 
-    model_flag = f"--model {shlex.quote(model)} " if model else ""
-    effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
-    escaped_prompt = shlex.quote(prompt)
-    cli_cmd = f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+    async def _execute() -> str:
+        model_flag = f"--model {shlex.quote(model)} " if model else ""
+        effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
+        escaped_prompt = shlex.quote(prompt)
+        cli_cmd = f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+        logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
+        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+        return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
 
-    logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="codex",
+        host=host,
+        prompt=prompt,
+    )
 
 
 @mcp.tool()
@@ -1581,6 +1724,7 @@ async def gemini_analyze(
     model: str = "",
     yolo: bool = False,
     timeout: int = GEMINI_TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Dispatch an analysis task to Google Gemini CLI on a Maestro host.
 
@@ -1590,6 +1734,7 @@ async def gemini_analyze(
     comparison, pattern identification across many files.
 
     Full output is saved to disk; a structured summary is returned.
+    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -1598,26 +1743,32 @@ async def gemini_analyze(
         working_dir: Working directory for the invocation.
         model: Gemini model (empty=default).
         yolo: Enable write mode (default False = read-only, safer).
-        timeout: Max seconds to wait (default 180).
+        timeout: Max seconds to wait (default 600).
+        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("gemini", task_id)
 
-    full_prompt = prompt
-    if context_files:
-        file_refs = " ".join(f"@{f}" for f in context_files)
-        full_prompt = f"{file_refs} {prompt}"
+    async def _execute() -> str:
+        full_prompt = prompt
+        if context_files:
+            file_refs = " ".join(f"@{f}" for f in context_files)
+            full_prompt = f"{file_refs} {prompt}"
+        escaped_prompt = shlex.quote(full_prompt)
+        model_flag = f"--model {shlex.quote(model)} " if model else ""
+        yolo_flag = "--yolo " if yolo else ""
+        cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
+        logger.info(f"Orchestra: gemini_analyze on {host} [{task_id}]: {prompt[:80]}...")
+        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+        return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
-    escaped_prompt = shlex.quote(full_prompt)
-    model_flag = f"--model {shlex.quote(model)} " if model else ""
-    yolo_flag = "--yolo " if yolo else ""
-    cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
-
-    logger.info(f"Orchestra: gemini_analyze on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="gemini",
+        host=host,
+        prompt=prompt,
+    )
 
 
 @mcp.tool()
@@ -1625,6 +1776,7 @@ async def gemini_research(
     host: str,
     query: str,
     timeout: int = GEMINI_TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Dispatch a web research task to Gemini CLI with Google Search grounding.
 
@@ -1633,27 +1785,35 @@ async def gemini_research(
     current events, regulatory changes.
 
     Full output is saved to disk; a structured summary is returned.
+    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
         query: Research query (Gemini uses Google Search grounding).
-        timeout: Max seconds to wait (default 180).
+        timeout: Max seconds to wait (default 600).
+        block_timeout: Inline wait before auto-promote (default 20).
     """
     task_id = _orchestra_task_id(query)
     output_file = _orchestra_output_path("gemini_research", task_id)
 
-    research_prompt = (
-        f"Research the following topic thoroughly using web search. "
-        f"Provide a comprehensive answer with sources.\n\n{query}"
+    async def _execute() -> str:
+        research_prompt = (
+            f"Research the following topic thoroughly using web search. "
+            f"Provide a comprehensive answer with sources.\n\n{query}"
+        )
+        escaped = shlex.quote(research_prompt)
+        cli_cmd = f"gemini -p {escaped} --output-format json"
+        logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {query[:80]}...")
+        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+        return _orchestra_build_result("gemini", host, query, _extract_gemini_response(raw_output), rc, output_file)
+
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="gemini",
+        host=host,
+        prompt=query,
     )
-    escaped = shlex.quote(research_prompt)
-    cli_cmd = f"gemini -p {escaped} --output-format json"
-
-    logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {query[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
-
-    return _orchestra_build_result("gemini", host, query, _extract_gemini_response(raw_output), rc, output_file)
 
 
 @mcp.tool()
@@ -1664,6 +1824,7 @@ async def gemini_execute(
     working_dir: str = DEFAULT_REPO,
     model: str = "",
     timeout: int = GEMINI_TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Dispatch a coding task to Google Gemini CLI on a Maestro host.
 
@@ -1673,6 +1834,7 @@ async def gemini_execute(
     Gemini's 1M-token context window across many files.
 
     Full output is saved to disk; a structured summary is returned.
+    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -1680,25 +1842,31 @@ async def gemini_execute(
         context_files: File paths to include via @file syntax (leverages 1M context).
         working_dir: Git repo directory where Gemini works.
         model: Gemini model (empty=default).
-        timeout: Max seconds to wait (default 180).
+        timeout: Max seconds to wait (default 600).
+        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("gemini", task_id)
 
-    full_prompt = prompt
-    if context_files:
-        file_refs = " ".join(f"@{f}" for f in context_files)
-        full_prompt = f"{file_refs} {prompt}"
+    async def _execute() -> str:
+        full_prompt = prompt
+        if context_files:
+            file_refs = " ".join(f"@{f}" for f in context_files)
+            full_prompt = f"{file_refs} {prompt}"
+        escaped_prompt = shlex.quote(full_prompt)
+        model_flag = f"--model {shlex.quote(model)} " if model else ""
+        cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}--yolo"
+        logger.info(f"Orchestra: gemini_execute on {host} [{task_id}]: {prompt[:80]}...")
+        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+        return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
-    escaped_prompt = shlex.quote(full_prompt)
-    model_flag = f"--model {shlex.quote(model)} " if model else ""
-    cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}--yolo"
-
-    logger.info(f"Orchestra: gemini_execute on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="gemini",
+        host=host,
+        prompt=prompt,
+    )
 
 
 @mcp.tool()
@@ -1749,6 +1917,7 @@ async def claude_execute(
     max_budget_usd: float = 1.0,
     allowed_tools: str = "Edit,Write,Bash(git:*),Read",
     timeout: int = CLAUDE_TIMEOUT,
+    block_timeout: int = BLOCK_TIMEOUT_DEFAULT,
 ) -> str:
     """Dispatch a coding task to Claude Code CLI on a Maestro host.
 
@@ -1757,6 +1926,7 @@ async def claude_execute(
     tasks, and anything requiring strong reasoning over large codebases.
 
     Full output is saved to disk; a structured summary is returned.
+    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -1764,90 +1934,32 @@ async def claude_execute(
         working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
         max_budget_usd: Dollar cap per invocation (default $1.00).
         allowed_tools: Comma-separated tool whitelist (default: Edit,Write,Bash(git:*),Read).
-        timeout: Max seconds to wait (default 300).
+        timeout: Max seconds to wait (default 600).
+        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("claude", task_id)
 
-    escaped_prompt = shlex.quote(prompt)
-    escaped_tools = shlex.quote(allowed_tools)
-    cli_cmd = (
-        f"claude -p {escaped_prompt} --output-format json "
-        f"--permission-mode bypassPermissions "
-        f"--allowedTools {escaped_tools} "
-        f"--max-budget-usd {max_budget_usd}"
-    )
+    async def _execute() -> str:
+        escaped_prompt = shlex.quote(prompt)
+        escaped_tools = shlex.quote(allowed_tools)
+        cli_cmd = (
+            f"claude -p {escaped_prompt} --output-format json "
+            f"--permission-mode bypassPermissions "
+            f"--allowedTools {escaped_tools} "
+            f"--max-budget-usd {max_budget_usd}"
+        )
+        logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
+        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+        return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
-    logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
-
-    rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-
-    return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
-
-
-async def _dispatch_async(
-    agent: str,
-    host: str,
-    prompt: str,
-    build_cli_cmd: Callable[[], str],
-    post_process: Callable[[str], str] | None = None,
-    timeout: int = CODEX_TIMEOUT,
-    working_dir: str = DEFAULT_REPO,
-) -> str:
-    """Generic async dispatch for agent CLI tools.
-
-    Handles TaskState lifecycle, background execution, and structured result
-    building. Each agent tool provides only its CLI command builder.
-
-    Args:
-        agent: Agent name (codex/gemini/claude).
-        host: Target host.
-        prompt: User prompt.
-        build_cli_cmd: Callable returning the CLI command string.
-        post_process: Optional callable(raw_output) -> str for output extraction.
-        timeout: Max seconds.
-        working_dir: Working directory for CLI invocation.
-    """
-    task_id = secrets.token_hex(8)
-    output_file = _orchestra_output_path(agent, task_id)
-    now = datetime.now(timezone.utc)
-
-    ts = TaskState(
-        task_id=task_id,
-        agent=agent,
+    return await _auto_promote(
+        _execute,
+        block_timeout=block_timeout,
+        agent="claude",
         host=host,
         prompt=prompt,
-        status="running",
-        started_at=now,
-        output_file=output_file,
     )
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    async def _run() -> None:
-        try:
-            cli_cmd = build_cli_cmd()
-            rc, raw_output = await _orchestra_run_cli(
-                host, cli_cmd, timeout=timeout, cwd=working_dir,
-            )
-            output = post_process(raw_output) if post_process else raw_output
-            result = _orchestra_build_result(agent, host, prompt, output, rc, output_file)
-            ts.status = "done" if rc == 0 else "failed"
-            ts.result_json = result
-        except Exception as exc:
-            logger.exception(f"Orchestra: {agent}_dispatch [{task_id}] failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": str(exc), "task_id": task_id, "agent": agent,
-            })
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-
-    ts.asyncio_task = asyncio.create_task(_run())
-    logger.info(f"Orchestra: {agent}_dispatch on {host} [{task_id}]: {prompt[:80]}...")
-    return json.dumps({
-        "task_id": task_id, "agent": agent, "host": host, "status": "running",
-    })
 
 
 @mcp.tool()
@@ -1872,14 +1984,10 @@ async def codex_dispatch(
         reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
         timeout: Max seconds for the background task (default 300).
     """
-    def build_cmd() -> str:
-        model_flag = f"--model {shlex.quote(model)} " if model else ""
-        effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
-        escaped = shlex.quote(prompt)
-        return f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped}"
-
-    return await _dispatch_async(
-        "codex", host, prompt, build_cmd, timeout=timeout, working_dir=working_dir,
+    return await codex_execute(
+        host=host, prompt=prompt, working_dir=working_dir,
+        model=model, reasoning_effort=reasoning_effort,
+        timeout=timeout, block_timeout=0,
     )
 
 
@@ -1908,20 +2016,10 @@ async def gemini_dispatch(
         yolo: Enable write mode (default False = read-only).
         timeout: Max seconds for the background task (default 180).
     """
-    def build_cmd() -> str:
-        full_prompt = prompt
-        if context_files:
-            file_refs = " ".join(f"@{f}" for f in context_files)
-            full_prompt = f"{file_refs} {prompt}"
-        escaped = shlex.quote(full_prompt)
-        model_flag = f"--model {shlex.quote(model)} " if model else ""
-        yolo_flag = "--yolo " if yolo else ""
-        return f"gemini -p {escaped} --output-format json {model_flag}{yolo_flag}"
-
-    return await _dispatch_async(
-        "gemini", host, prompt, build_cmd,
-        post_process=_extract_gemini_response,
-        timeout=timeout, working_dir=working_dir,
+    return await gemini_analyze(
+        host=host, prompt=prompt, context_files=context_files,
+        working_dir=working_dir, model=model, yolo=yolo,
+        timeout=timeout, block_timeout=0,
     )
 
 
@@ -1947,23 +2045,15 @@ async def claude_dispatch(
         allowed_tools: Comma-separated tool whitelist.
         timeout: Max seconds for the background task (default 300).
     """
-    def build_cmd() -> str:
-        escaped_prompt = shlex.quote(prompt)
-        escaped_tools = shlex.quote(allowed_tools)
-        return (
-            f"claude -p {escaped_prompt} --output-format json "
-            f"--permission-mode bypassPermissions "
-            f"--allowedTools {escaped_tools} "
-            f"--max-budget-usd {max_budget_usd}"
-        )
-
-    return await _dispatch_async(
-        "claude", host, prompt, build_cmd, timeout=timeout, working_dir=working_dir,
+    return await claude_execute(
+        host=host, prompt=prompt, working_dir=working_dir,
+        max_budget_usd=max_budget_usd, allowed_tools=allowed_tools,
+        timeout=timeout, block_timeout=0,
     )
 
 
 @mcp.tool()
-async def agent_poll(task_id: str) -> str:
+async def agent_poll(task_id: str, wait: int = 0) -> str:
     """Check the status of an async agent dispatch task.
 
     Returns immediately with either the running status + elapsed time,
@@ -1971,11 +2061,21 @@ async def agent_poll(task_id: str) -> str:
 
     Args:
         task_id: Task ID returned by a previous *_dispatch call.
+        wait: Max seconds to hold connection waiting for completion (long-poll).
+              0 = return immediately (default). >0 = wait up to this many seconds.
     """
     async with _REGISTRY_LOCK:
         ts = TASK_REGISTRY.get(task_id)
     if ts is None:
         return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
+
+    # Long-poll: hold connection until task completes or wait expires
+    if ts.status == "running" and wait > 0:
+        try:
+            await asyncio.wait_for(ts._done_event.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass  # Still running — return current status below
+
     if ts.status == "running":
         elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
         return json.dumps({
