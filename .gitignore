@@ -26,3 +26,9 @@ cloudflared-maestro.service
 .DS_Store
 docs/sessions/
 docs/eden-wsl/
+
+# Model weights (accidental)
+gptqmodel_offload/
+
+# Pytest
+.pytest_cache/
