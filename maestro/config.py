@@ -43,7 +43,7 @@ class MaestroConfig:
             codex_timeout=600,
             gemini_timeout=600,
             claude_timeout=600,
-            max_inline_output=4000,
+            max_inline_output=1500,
             default_repo=os.environ.get("MAESTRO_DEFAULT_REPO", str(Path.home() / "workspace")),
             task_eviction_seconds=3600,
             task_output_retention_seconds=86400,

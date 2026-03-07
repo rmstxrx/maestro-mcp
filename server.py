@@ -55,6 +55,17 @@ def _audit(event: str, **kwargs: Any) -> None:
 # Configuration — env vars
 # ---------------------------------------------------------------------------
 CONFIG = MaestroConfig.from_env()
+MAX_INLINE_OUTPUT = CONFIG.max_inline_output
+AGENT_SCOPE_PREFIX = (
+    "SCOPE CONSTRAINTS (non-negotiable):\n"
+    "1. ONLY modify files and code directly related to the task below.\n"
+    "2. Do NOT refactor, clean up, or improve code outside the task scope.\n"
+    "3. Do NOT run tests unless explicitly asked.\n"
+    "4. Do NOT write or update documentation unless explicitly asked.\n"
+    "5. When done, output ONLY: files changed + one-sentence summary per file.\n"
+    "6. If the task is ambiguous, do the MINIMUM viable interpretation.\n\n"
+    "TASK:\n"
+)
 
 # ---------------------------------------------------------------------------
 # Host registry
@@ -573,54 +584,16 @@ async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 def _build_instructions() -> str:
     """Generate MCP instructions dynamically from loaded hosts."""
-    host_lines = []
-    for name, cfg in HOSTS.items():
-        local_tag = " LOCAL (direct execution, no SSH)." if cfg.is_local else ""
-        desc = f" {cfg.description}" if cfg.description else ""
-        host_lines.append(f"  {name:12s} —{desc}{local_tag}")
-    hosts_block = "\n".join(host_lines)
-
-    local_name = _local_host_name()
-    local_note = (
-        f"{local_name} commands execute locally (zero overhead, no SSH).\n"
-        if local_name else ""
-    )
-
-    return (
-        "Maestro MCP — multi-host machine fleet + AI agent orchestra.\n"
-        "\n"
-        "Available hosts:\n"
-        f"{hosts_block}\n"
-        "\n"
-        "Remote tools (run commands on machines):\n"
-        "  maestro_exec     — Single command. Has cwd and sudo options.\n"
-        "  maestro_script   — Multi-line script piped via stdin. Use for sequences.\n"
-        "  maestro_read     — Read a text file. Supports line range slicing.\n"
-        "  maestro_write    — Write content to a file.\n"
-        "  maestro_upload / maestro_download — Transfer files between hosts.\n"
-        "  maestro_status   — Check connectivity of all hosts.\n"
-        "\n"
-        "Agent tools (dispatch tasks to AI coding agents):\n"
-        "  codex_execute      — Dispatch code task to OpenAI Codex CLI.\n"
-        "  gemini_analyze     — Dispatch analysis to Google Gemini CLI.\n"
-        "  gemini_research    — Web research via Gemini + Google Search.\n"
-        "  gemini_execute     — Dispatch coding task to Gemini CLI (write mode).\n"
-        "  claude_execute     — Dispatch code task to Claude Code CLI.\n"
-        "  agent_poll         — Check status / retrieve result. Supports wait= for long-poll.\n"
-        "  agent_read_output  — Read full output from a previous dispatch.\n"
-        "  agent_status       — Check CLI availability on a host.\n"
-        "\n"
-        f"{local_note}"
-        "Prefer maestro_read/maestro_write over scp for text files.\n"
-        "Prefer maestro_script over chained && commands.\n"
-        "\n"
-        "Auto-promote: all tools auto-promote to background after 20s (block_timeout).\n"
-        "Quick commands return inline. Long tasks return a task_id — use agent_poll(id, wait=60) to long-poll.\n"
-        "Use block_timeout=0 for immediate dispatch, block_timeout=-1 for legacy full-blocking.\n"
-        "\n"
-        "Agent principles: output saved to disk, summary returned inline.\n"
-        "Codex (gpt-5.3-codex) = executor (code). Gemini (3.1 Pro + Deep Think Mini) = analyst (comprehension). Claude = architect (reasoning).\n"
-    )
+    dispatch_rule = "All dispatch tools return a task_id. Use poll(task_id) for results."
+    host_list = ", ".join(HOSTS.keys())
+    instructions = f"Hosts: {host_list}. {dispatch_rule}"
+    if len(instructions) <= 300:
+        return instructions
+    max_hosts_len = max(0, 300 - len("Hosts: . ") - len(dispatch_rule))
+    trimmed_hosts = host_list[:max_hosts_len]
+    if len(host_list) > max_hosts_len and max_hosts_len > 3:
+        trimmed_hosts = trimmed_hosts[:-3].rstrip(", ") + "..."
+    return f"Hosts: {trimmed_hosts}. {dispatch_rule}"[:300]
 
 
 mcp = FastMCP(
@@ -1085,8 +1058,6 @@ async def maestro_bg(
         "task_id": task_id,
         "host": host,
         "status": "running",
-        "poll_with": f"agent_poll(task_id='{task_id}')",
-        "log_with": f"maestro_bg_log(task_id='{task_id}')",
     })
 
 
@@ -1613,7 +1584,6 @@ async def _auto_promote(
         "host": host,
         "status": "running",
         "elapsed_seconds": round(elapsed, 1),
-        "poll_with": f"agent_poll(task_id='{task_id}')",
     })
 
 
@@ -1678,7 +1648,8 @@ async def codex_execute(
     async def _execute() -> str:
         model_flag = f"--model {shlex.quote(model)} " if model else ""
         effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
-        escaped_prompt = shlex.quote(prompt)
+        scoped_prompt = AGENT_SCOPE_PREFIX + prompt
+        escaped_prompt = shlex.quote(scoped_prompt)
         cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
         logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
         rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
@@ -1919,7 +1890,8 @@ async def claude_execute(
     output_file = _orchestra_output_path("claude", task_id)
 
     async def _execute() -> str:
-        escaped_prompt = shlex.quote(prompt)
+        scoped_prompt = AGENT_SCOPE_PREFIX + prompt
+        escaped_prompt = shlex.quote(scoped_prompt)
         escaped_tools = shlex.quote(allowed_tools)
         cli_cmd = (
             f"claude -p {escaped_prompt} --output-format json "
