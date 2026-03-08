@@ -40,6 +40,27 @@ from starlette.responses import Response, JSONResponse, FileResponse
 from starlette.background import BackgroundTask
 
 from maestro.config import MaestroConfig
+from maestro.local import (
+    _local_copy,
+    _local_read_file,
+    _local_run,
+    _local_script,
+    _local_write_file,
+    configure_local,
+)
+from maestro.transport import (
+    _async_run,
+    _check_control_master,
+    _ensure_connection,
+    _is_transient_failure,
+    _scp_run,
+    _ssh_run,
+    _teardown_connection,
+    _warmup_connection,
+    configure_transport,
+    teardown_all_hosts,
+    warmup_all_hosts,
+)
 from maestro_oauth import MaestroOAuthProvider
 
 logger = logging.getLogger("maestro")
@@ -173,268 +194,9 @@ _oauth_provider = MaestroOAuthProvider(
 )
 
 # ---------------------------------------------------------------------------
-# Async subprocess primitives
 # ---------------------------------------------------------------------------
-
-async def _async_run(
-    args: list[str],
-    timeout: int = 15,
-    stdin_data: str | None = None,
-) -> tuple[int, str, str]:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=stdin_data.encode() if stdin_data else None),
-            timeout=timeout,
-        )
-        return (
-            proc.returncode or 0,
-            stdout_bytes.decode(errors="replace"),
-            stderr_bytes.decode(errors="replace"),
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return -1, "", f"timeout after {timeout}s"
-    except FileNotFoundError as e:
-        return -1, "", f"binary not found: {e}"
-
-
+# Execution/transport helpers extracted to maestro.local and maestro.transport
 # ---------------------------------------------------------------------------
-# Local execution (hub — no SSH)
-# ---------------------------------------------------------------------------
-
-async def _local_run(
-    command: str,
-    timeout: int = CONFIG.ssh_timeout,
-    stdin_data: str | None = None,
-    cwd: str | None = None,
-) -> str:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
-            cwd=cwd,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=stdin_data.encode() if stdin_data else None),
-            timeout=timeout,
-        )
-        rc = proc.returncode or 0
-        stdout = stdout_bytes.decode(errors="replace")
-        stderr = stderr_bytes.decode(errors="replace")
-        return _format_result(stdout, stderr, rc)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return f"[local timeout after {timeout}s]"
-    except FileNotFoundError as e:
-        return f"[local error] binary not found: {e}"
-
-
-async def _local_script(
-    script: str,
-    timeout: int = CONFIG.ssh_timeout,
-    cwd: str | None = None,
-    sudo: bool = False,
-) -> str:
-    lines = ["set -euo pipefail"]
-    if cwd:
-        lines.append(f"cd {shlex.quote(cwd)}")
-    lines.append(script)
-    stdin_body = "\n".join(lines)
-    shell_cmd = ["sudo", "bash", "-s"] if sudo else ["bash", "-s"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *shell_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=stdin_body.encode()),
-            timeout=timeout,
-        )
-        rc = proc.returncode or 0
-        stdout = stdout_bytes.decode(errors="replace")
-        stderr = stderr_bytes.decode(errors="replace")
-        return _format_result(stdout, stderr, rc)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return f"[local timeout after {timeout}s]"
-
-
-def _local_read_file(
-    path: str,
-    head: int | None = None,
-    tail: int | None = None,
-) -> str:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return f"[error] file not found: {path}"
-        if not p.is_file():
-            return f"[error] not a file: {path}"
-        text = p.read_text(errors="replace")
-        lines = text.splitlines(keepends=True)
-        if head is not None:
-            lines = lines[:head]
-        elif tail is not None:
-            lines = lines[-tail:]
-        return "".join(lines) or "[empty file]"
-    except PermissionError:
-        return f"[error] permission denied: {path}"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def _local_write_file(
-    path: str,
-    content: str,
-    append: bool = False,
-    sudo: bool = False,
-) -> str:
-    if sudo:
-        import subprocess
-        p = Path(path)
-        parent = str(p.parent)
-        try:
-            if parent:
-                subprocess.run(["sudo", "mkdir", "-p", parent], check=True, capture_output=True, timeout=10)
-            flag = "-a" if append else ""
-            cmd = f"sudo tee {flag} {shlex.quote(path)} > /dev/null"
-            subprocess.run(cmd, shell=True, input=content.encode(), check=True, capture_output=True, timeout=30)
-            return f"[OK] wrote {len(content)} bytes to {path} (sudo)"
-        except subprocess.CalledProcessError as e:
-            return f"[error] sudo write failed: {e.stderr.decode(errors='replace')}"
-        except subprocess.TimeoutExpired:
-            return f"[error] sudo write timed out"
-    try:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if append:
-            with p.open("a") as f:
-                f.write(content)
-        else:
-            p.write_text(content)
-        return f"[OK] wrote {len(content)} bytes to {path}"
-    except PermissionError:
-        return f"[error] permission denied: {path} (try sudo=True)"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def _local_copy(source: str, destination: str, upload: bool) -> str:
-    src = source
-    dst = destination
-    try:
-        dst_path = Path(dst)
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        return f"[OK] copied {src} -> {dst}"
-    except FileNotFoundError:
-        return f"[error] source not found: {src}"
-    except PermissionError:
-        return f"[error] permission denied"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-# ---------------------------------------------------------------------------
-# SSH ControlMaster management (remote hosts)
-# ---------------------------------------------------------------------------
-
-async def _check_control_master(alias: str) -> bool:
-    rc, _, _ = await _async_run(["ssh", "-O", "check", alias], timeout=5)
-    return rc == 0
-
-
-async def _warmup_connection(alias: str) -> bool:
-    rc, _, _ = await _async_run(["ssh", alias, "true"], timeout=15)
-    return rc == 0
-
-
-async def _teardown_connection(alias: str) -> None:
-    await _async_run(["ssh", "-O", "exit", alias], timeout=5)
-
-
-async def warmup_all_hosts() -> dict[str, bool]:
-    async def _warmup_one(name: str, config: HostConfig) -> tuple[str, bool]:
-        if config.is_local:
-            await _update_host_status(name, HostStatus.CONNECTED)
-            logger.info(f"{name}: local host (no SSH needed)")
-            return name, True
-        if await _check_control_master(config.alias):
-            logger.info(f"{name}: ControlMaster already active")
-            await _update_host_status(name, HostStatus.CONNECTED)
-            return name, True
-        logger.info(f"{name}: warming up connection...")
-        success = await _warmup_connection(config.alias)
-        status = HostStatus.CONNECTED if success else HostStatus.DISCONNECTED
-        await _update_host_status(name, status)
-        if success:
-            logger.info(f"{name}: connected")
-        else:
-            logger.warning(f"{name}: warmup failed (host may be offline)")
-        return name, success
-
-    tasks = [_warmup_one(name, config) for name, config in HOSTS.items()]
-    pairs = await asyncio.gather(*tasks)
-    return dict(pairs)
-
-
-async def teardown_all_hosts() -> None:
-    names = []
-    tasks = []
-    for name, config in HOSTS.items():
-        if config.is_local:
-            continue
-        logger.info(f"{name}: tearing down ControlMaster")
-        names.append(name)
-        tasks.append(_teardown_connection(config.alias))
-        config.status = HostStatus.DISCONNECTED
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for name, result in zip(names, results):
-            if isinstance(result, Exception):
-                logger.warning(f"Teardown failed for {name}: {result}")
-
-
-# ---------------------------------------------------------------------------
-# Remote SSH execution with retry
-# ---------------------------------------------------------------------------
-
-TRANSIENT_INDICATORS = [
-    "Connection refused", "Connection timed out", "Connection reset",
-    "Broken pipe", "Control socket connect", "No route to host",
-    "Network is unreachable", "ssh_exchange_identification",
-    "Connection closed by remote host",
-    "mux_client_request_session: session request failed",
-]
-
-
-def _is_transient_failure(returncode: int, stderr: str) -> bool:
-    if returncode not in (-1, 255):
-        return False
-    return any(ind in stderr for ind in TRANSIENT_INDICATORS)
-
-
-async def _ensure_connection(alias: str, host_name: str) -> bool:
-    """Ensure ControlMaster is alive, serialized per host to avoid reconnection races."""
-    async with _HOST_LOCKS[host_name]:
-        if await _check_control_master(alias):
-            return True
-        logger.info(f"ControlMaster for {alias} is dead, re-warming...")
-        return await _warmup_connection(alias)
-
 
 def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     parts = []
@@ -462,39 +224,6 @@ def _local_host_hint(tool_name: str, host_name: str) -> str:
     return ""
 
 
-
-async def _ssh_run(
-    host_name: str,
-    ssh_args: list[str],
-    timeout: int = CONFIG.ssh_timeout,
-    stdin_data: str | None = None,
-) -> str:
-    config = _resolve_host(host_name)
-    last_error = ""
-    for attempt in range(1, CONFIG.max_retries + 1):
-        await _ensure_connection(config.alias, host_name)
-        rc, stdout, stderr = await _async_run(
-            ["ssh", config.alias, *ssh_args],
-            timeout=timeout,
-            stdin_data=stdin_data,
-        )
-        if rc not in (-1, 255):
-            await _update_host_status(host_name, HostStatus.CONNECTED)
-            return _format_result(stdout, stderr, rc)
-        if not _is_transient_failure(rc, stderr):
-            await _update_host_status(host_name, HostStatus.ERROR, last_error=stderr.strip())
-            return f"[SSH error on {host_name}]\n{stderr}"
-        last_error = stderr.strip() or f"rc={rc}"
-        logger.warning(f"{host_name}: transient failure (attempt {attempt}/{CONFIG.max_retries}): {last_error}")
-        if attempt < CONFIG.max_retries:
-            backoff = CONFIG.retry_backoff_base * (2 ** (attempt - 1))
-            logger.info(f"Retrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            await _teardown_connection(config.alias)
-    await _update_host_status(host_name, HostStatus.ERROR, last_error=last_error)
-    return f"[failed after {CONFIG.max_retries} attempts on {host_name}]\nLast error: {last_error}"
-
-
 def _resolve_host(host: str) -> HostConfig:
     if host not in HOSTS:
         available = ", ".join(sorted(HOSTS.keys()))
@@ -520,41 +249,19 @@ def _wrap_command(config: HostConfig, command: str, cwd: str | None, sudo: bool)
         return " ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# SCP with retry (remote hosts)
-# ---------------------------------------------------------------------------
-
-async def _scp_run(
-    host_name: str,
-    source: str,
-    destination: str,
-    upload: bool = True,
-    timeout: int = CONFIG.ssh_timeout,
-) -> str:
-    config = _resolve_host(host_name)
-    if upload:
-        scp_args = ["scp", source, f"{config.alias}:{destination}"]
-        action_desc = f"upload {source} -> {host_name}:{destination}"
-    else:
-        scp_args = ["scp", f"{config.alias}:{source}", destination]
-        action_desc = f"download {host_name}:{source} -> {destination}"
-    last_error = ""
-    for attempt in range(1, CONFIG.max_retries + 1):
-        await _ensure_connection(config.alias, host_name)
-        rc, stdout, stderr = await _async_run(scp_args, timeout=timeout)
-        if rc == 0:
-            await _update_host_status(host_name, HostStatus.CONNECTED)
-            return f"[OK] {action_desc}"
-        if not _is_transient_failure(rc, stderr):
-            return f"[scp failed on {host_name}]\n{stderr}"
-        last_error = stderr.strip()
-        logger.warning(f"{host_name}: scp transient failure (attempt {attempt}/{CONFIG.max_retries}): {last_error}")
-        if attempt < CONFIG.max_retries:
-            backoff = CONFIG.retry_backoff_base * (2 ** (attempt - 1))
-            await asyncio.sleep(backoff)
-            await _teardown_connection(config.alias)
-    await _update_host_status(host_name, HostStatus.ERROR, last_error=last_error)
-    return f"[scp failed after {CONFIG.max_retries} attempts on {host_name}]\n{last_error}"
+configure_transport(
+    config=CONFIG,
+    hosts=HOSTS,
+    locks=_HOST_LOCKS,
+    update_host_status=_update_host_status,
+    resolve_host=_resolve_host,
+    host_status=HostStatus,
+    format_result=_format_result,
+)
+configure_local(
+    config=CONFIG,
+    format_result=_format_result,
+)
 
 
 # ---------------------------------------------------------------------------
