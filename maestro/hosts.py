@@ -89,9 +89,11 @@ _HOST_LOCKS: dict[str, asyncio.Lock] = {}
 
 def init_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
     """Load hosts and initialise locks. Called once at import time from server.py."""
-    global HOSTS, _HOST_LOCKS
-    HOSTS = _load_hosts(config_path)
-    _HOST_LOCKS = {name: asyncio.Lock() for name in HOSTS}
+    loaded = _load_hosts(config_path)
+    HOSTS.clear()
+    HOSTS.update(loaded)
+    _HOST_LOCKS.clear()
+    _HOST_LOCKS.update({name: asyncio.Lock() for name in HOSTS})
     return HOSTS
 
 
