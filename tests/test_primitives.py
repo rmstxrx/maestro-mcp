@@ -1,4 +1,5 @@
 """Tests for pure functions across maestro modules."""
+import json
 import sys
 from pathlib import Path
 
@@ -19,7 +20,13 @@ from maestro.hosts import (
     init_hosts,
 )
 from maestro.transport import _is_transient_failure
-from maestro.tools.orchestra import _orchestra_truncate, configure_orchestra
+from maestro.tools.orchestra import (
+    TASK_REGISTRY,
+    _REGISTRY_LOCK,
+    _auto_promote,
+    _orchestra_truncate,
+    configure_orchestra,
+)
 from maestro.config import MaestroConfig
 
 _config = MaestroConfig.from_env()
@@ -248,3 +255,46 @@ class TestOrchestraTruncate:
         result, truncated = _orchestra_truncate(text, max_len=5)
         assert truncated
         assert result.startswith("hello")
+
+
+# ---------------------------------------------------------------------------
+# _auto_promote
+# ---------------------------------------------------------------------------
+
+class TestAutoPromote:
+    @pytest.mark.asyncio
+    async def test_output_file_factory_uses_random_task_id(self, monkeypatch, tmp_path):
+        task_id = "feedfacecafebeef"
+        output_holder: list[Path | None] = [None]
+        expected_output = tmp_path / f"codex_{task_id}.txt"
+
+        async def _execute() -> str:
+            output_file = output_holder[0]
+            assert output_file == expected_output
+            return json.dumps({"output_file": str(output_file)})
+
+        monkeypatch.setattr("maestro.tools.orchestra.secrets.token_hex", lambda _: task_id)
+
+        result = await _auto_promote(
+            _execute,
+            block_timeout=0,
+            agent="codex",
+            host="test-host",
+            prompt="repeatable prompt",
+            output_file_factory=lambda tid: tmp_path / f"codex_{tid}.txt",
+            output_holder=output_holder,
+        )
+
+        payload = json.loads(result)
+        assert payload["task_id"] == task_id
+        assert output_holder[0] == expected_output
+
+        async with _REGISTRY_LOCK:
+            ts = TASK_REGISTRY[task_id]
+        await ts._done_event.wait()
+
+        assert ts.output_file == expected_output
+        assert json.loads(ts.result_json)["output_file"] == str(expected_output)
+
+        async with _REGISTRY_LOCK:
+            TASK_REGISTRY.pop(task_id, None)

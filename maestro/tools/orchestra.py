@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import secrets
@@ -173,10 +172,6 @@ def _orchestra_output_path(agent: str, task_id: str) -> Path:
     return _orchestra_output_dir() / f"{agent}_{ts}_{task_id}.txt"
 
 
-def _orchestra_task_id(prompt: str) -> str:
-    return hashlib.sha256(prompt.encode()).hexdigest()[:8]
-
-
 def _orchestra_truncate(text: str, max_len: int | None = None) -> tuple[str, bool]:
     if max_len is None:
         max_len = _cfg().max_inline_output
@@ -328,6 +323,8 @@ async def _auto_promote(
     agent: str,
     host: str,
     prompt: str,
+    output_file_factory: Callable[[str], Path] | None = None,
+    output_holder: list[Path | None] | None = None,
 ) -> str:
     """Run execute_fn with adaptive blocking.
 
@@ -338,6 +335,9 @@ async def _auto_promote(
     """
     task_id = secrets.token_hex(8)
     started_at = datetime.now(timezone.utc)
+    output_file = output_file_factory(task_id) if output_file_factory else None
+    if output_holder is not None:
+        output_holder[0] = output_file
 
     work_task = asyncio.create_task(execute_fn())
 
@@ -363,6 +363,7 @@ async def _auto_promote(
         status="running",
         started_at=started_at,
         asyncio_task=work_task,
+        output_file=output_file,
     )
 
     async def _monitor() -> None:

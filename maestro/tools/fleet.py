@@ -41,7 +41,6 @@ from maestro.tools.orchestra import (
     _orchestra_output_dir,
     _orchestra_output_path,
     _orchestra_run_cli,
-    _orchestra_task_id,
 )
 from maestro.transport import (
     _check_control_master,
@@ -245,22 +244,26 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         ctx = get_client_context()
         timeout = config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
-        task_id = _orchestra_task_id(prompt)
-        output_file = _orchestra_output_path("codex", task_id)
+        output_holder: list[Path | None] = [None]
 
         async def _execute() -> str:
+            output_file = output_holder[0]
+            assert output_file is not None
             model_flag = f"--model {shlex.quote(model)} " if model else ""
             effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
             cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            logger.info(f"Orchestra: codex on {host} [{task_id}]: {prompt[:80]}...")
+            task_label = output_file.stem.rsplit("_", 1)[-1]
+            logger.info(f"Orchestra: codex on {host} [{task_label}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="codex", host=host, prompt=prompt,
+            output_file_factory=lambda tid: _orchestra_output_path("codex", tid),
+            output_holder=output_holder,
         )
 
     @mcp.tool()
@@ -286,10 +289,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         ctx = get_client_context()
         timeout = config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
-        task_id = _orchestra_task_id(prompt + resume)
-        output_file = _orchestra_output_path("gemini", task_id)
+        output_holder: list[Path | None] = [None]
 
         async def _execute() -> str:
+            output_file = output_holder[0]
+            assert output_file is not None
             full_prompt = prompt
             if context_files:
                 file_refs = " ".join(f"@{f}" for f in context_files)
@@ -304,13 +308,16 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 f"{model_flag}{approval_flag}{resume_flag}"
             )
 
-            logger.info(f"Orchestra: gemini on {host} [{task_id}]: {prompt[:80]}...")
+            task_label = output_file.stem.rsplit("_", 1)[-1]
+            logger.info(f"Orchestra: gemini on {host} [{task_label}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="gemini", host=host, prompt=prompt,
+            output_file_factory=lambda tid: _orchestra_output_path("gemini", tid),
+            output_holder=output_holder,
         )
 
     @mcp.tool()
@@ -341,10 +348,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         ctx = get_client_context()
         timeout = config.claude_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
-        task_id = _orchestra_task_id(prompt)
-        output_file = _orchestra_output_path("claude", task_id)
+        output_holder: list[Path | None] = [None]
 
         async def _execute() -> str:
+            output_file = output_holder[0]
+            assert output_file is not None
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
             escaped_tools = shlex.quote(allowed_tools)
@@ -353,13 +361,16 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools}"
             )
-            logger.info(f"Orchestra: claude on {host} [{task_id}]: {prompt[:80]}...")
+            task_label = output_file.stem.rsplit("_", 1)[-1]
+            logger.info(f"Orchestra: claude on {host} [{task_label}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="claude", host=host, prompt=prompt,
+            output_file_factory=lambda tid: _orchestra_output_path("claude", tid),
+            output_holder=output_holder,
         )
 
     @mcp.tool()
