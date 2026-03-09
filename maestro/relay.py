@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
@@ -105,18 +106,53 @@ def _validate_transfer_path(remote_path: str, is_local: bool) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Token derivation
+# ---------------------------------------------------------------------------
+
+def derive_transfer_token(master_secret: str, window_offset: int = 0) -> str:
+    """Derive a daily-rotating transfer token from a master secret.
+
+    Token = HMAC-SHA256(master_secret, str(floor(unix_time / 86400) + offset))
+    Window flips at UTC midnight. offset=0 → today, offset=-1 → yesterday.
+
+    Agent snippet (3 lines, embeddable in any prompt context)::
+
+        import hmac, hashlib, time
+        def maestro_token(s):
+            return hmac.new(s.encode(), str(int(time.time())//86400).encode(), hashlib.sha256).hexdigest()
+    """
+    window = int(time.time()) // 86400 + window_offset
+    return hmac.new(
+        master_secret.encode(),
+        str(window).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
 def _transfer_auth_ok(request: Request) -> bool:
-    """Validate Bearer token for transfer endpoints (constant-time)."""
+    """Validate Bearer token for transfer endpoints.
+
+    Accepts either the current daily-window token or the previous one,
+    so agents computing the token just before midnight are never rejected
+    mid-session.
+    """
     cfg = _cfg()
     if not cfg.transfer_token:
         return False
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return False
-    return hmac.compare_digest(auth[7:], cfg.transfer_token)
+    provided = auth[7:]
+    current  = derive_transfer_token(cfg.transfer_token, 0)
+    previous = derive_transfer_token(cfg.transfer_token, -1)
+    return (
+        hmac.compare_digest(provided, current) or
+        hmac.compare_digest(provided, previous)
+    )
 
 
 def _auth_error() -> JSONResponse:
