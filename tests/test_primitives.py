@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 # Add project root to path so we can import modules
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,6 +21,7 @@ from maestro.hosts import (
     init_hosts,
 )
 from maestro.transport import _is_transient_failure
+from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
     _REGISTRY_LOCK,
@@ -266,6 +268,56 @@ class TestMaestroConfig:
         monkeypatch.setenv("MAESTRO_ORCHESTRA_OUTPUT_DIR", str(tmp_path))
         config = MaestroConfig.from_env()
         assert config.orchestra_output_dir == tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Fleet tools
+# ---------------------------------------------------------------------------
+
+class TestGeminiSessions:
+    @pytest.mark.asyncio
+    async def test_wraps_success_output(self, monkeypatch):
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
+
+        async def _fake_run(host, command, timeout):
+            assert host == "test-host"
+            assert command == "gemini --list-sessions"
+            assert timeout == 15
+            return 0, "session-1\nsession-2"
+
+        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
+
+        result = json.loads(call_result["result"])
+        assert result == {
+            "host": "test-host",
+            "sessions": "session-1\nsession-2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_wraps_error_output(self, monkeypatch):
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
+
+        async def _fake_run(host, command, timeout):
+            assert host == "test-host"
+            assert command == "gemini --list-sessions"
+            assert timeout == 15
+            return 1, "gemini not installed"
+
+        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
+
+        result = json.loads(call_result["result"])
+        assert result == {
+            "host": "test-host",
+            "error": "gemini not installed",
+        }
 
 
 # ---------------------------------------------------------------------------

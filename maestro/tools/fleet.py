@@ -272,7 +272,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
         rc, out = await _orchestra_run_cli(h, "gemini --list-sessions", timeout=15)
-        return out
+        if rc == 0:
+            return json.dumps({"host": h, "sessions": out})
+        return json.dumps({"host": h, "error": out})
 
     @mcp.tool()
     async def gemini(
