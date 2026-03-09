@@ -24,6 +24,7 @@ class MaestroConfig:
     task_eviction_seconds: int
     task_output_retention_seconds: int
     oauth_state_path: Path
+    trusted_client_ids: frozenset[str]
 
     @classmethod
     def from_env(cls) -> "MaestroConfig":
@@ -52,5 +53,10 @@ class MaestroConfig:
             oauth_state_path=Path(
                 os.environ.get("MAESTRO_OAUTH_STATE_PATH",
                                str(Path.home() / ".maestro" / "oauth_state.json"))
+            ),
+            trusted_client_ids=frozenset(
+                c.strip()
+                for c in os.environ.get("MAESTRO_TRUSTED_CLIENT_IDS", "").split(",")
+                if c.strip()
             ),
         )

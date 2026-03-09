@@ -76,6 +76,7 @@ _oauth_provider = MaestroOAuthProvider(
     issuer_url=CONFIG.issuer_url,
     host_names=list(HOSTS.keys()),
     state_store=_oauth_state_store,
+    trusted_client_ids=CONFIG.trusted_client_ids,
 )
 
 # Wire up modules

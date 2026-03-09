@@ -269,6 +269,11 @@ class TestMaestroConfig:
         config = MaestroConfig.from_env()
         assert config.orchestra_output_dir == tmp_path
 
+    def test_trusted_client_ids_are_loaded_from_env(self, monkeypatch):
+        monkeypatch.setenv("MAESTRO_TRUSTED_CLIENT_IDS", " alpha, beta ,, gamma ")
+        config = MaestroConfig.from_env()
+        assert config.trusted_client_ids == frozenset({"alpha", "beta", "gamma"})
+
 
 # ---------------------------------------------------------------------------
 # Fleet tools

@@ -116,6 +116,13 @@ class TestClientMetadataValidation:
 # ---------------------------------------------------------------------------
 
 class TestTrustedClientAutoApproval:
+    def test_constructor_accepts_trusted_client_ids(self):
+        provider = MaestroOAuthProvider(
+            issuer_url="https://test.example.com",
+            trusted_client_ids=frozenset({"trusted-client"}),
+        )
+        assert provider.trusted_client_ids == {"trusted-client"}
+
     @pytest.mark.asyncio
     async def test_trusted_client_id_auto_approves(self, provider):
         client = _make_client_info(client_id="trusted-client")

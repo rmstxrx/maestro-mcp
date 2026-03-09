@@ -6,9 +6,9 @@ and bearer-token verification are handled by the SDK's built-in auth system.
 
 Security layers:
   - Dynamic registration rate-limited (10 per minute).
-  - Trusted client IDs (from MAESTRO_TRUSTED_CLIENT_IDS env var) are
-    auto-approved — no PIN required. Use this for clients like Claude.ai
-    where the user is already authenticated in their provider's account.
+  - Trusted client IDs passed in at startup are auto-approved — no PIN
+    required. Use this for clients like Claude.ai where the user is
+    already authenticated in their provider's account.
   - All other MCP clients go through a consent page with PIN gate.
   - Tokens are opaque random strings stored in-memory.
 """
@@ -53,9 +53,6 @@ AUTH_CODE_TTL = 300  # 5 minutes
 
 AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")
 
-# Trusted client IDs that bypass the PIN gate (comma-separated env var).
-_TRUSTED_CLIENT_IDS_RAW = os.environ.get("MAESTRO_TRUSTED_CLIENT_IDS", "")
-
 
 def _audit(event: str, **kwargs: Any) -> None:
     entry = {"ts": time.time(), "event": event, **kwargs}
@@ -65,7 +62,7 @@ def _audit(event: str, **kwargs: Any) -> None:
 class MaestroOAuthProvider:
     """OAuth 2.0 provider for Maestro MCP.
 
-    Trusted client IDs (MAESTRO_TRUSTED_CLIENT_IDS) → auto-approve.
+    Trusted client IDs → auto-approve.
     Other clients → consent page + PIN gate.
     Registration rate-limited to 10/min.
     """
@@ -73,8 +70,13 @@ class MaestroOAuthProvider:
     REG_RATE_LIMIT = 10
     REG_RATE_WINDOW = 60  # seconds
 
-    def __init__(self, issuer_url: str, host_names: list[str] | None = None,
-                 state_store: "OAuthStateStore | None" = None):
+    def __init__(
+        self,
+        issuer_url: str,
+        host_names: list[str] | None = None,
+        state_store: "OAuthStateStore | None" = None,
+        trusted_client_ids: frozenset[str] | None = None,
+    ):
         self.issuer_url = issuer_url.rstrip("/")
         self.host_names = host_names or []
         self._state_store = state_store
@@ -95,10 +97,7 @@ class MaestroOAuthProvider:
         self._TOKEN_RATE_WINDOW = 60  # seconds
 
         # Trusted client IDs that skip the PIN gate.
-        self.trusted_client_ids: set[str] = {
-            cid.strip() for cid in _TRUSTED_CLIENT_IDS_RAW.split(",")
-            if cid.strip()
-        }
+        self.trusted_client_ids: set[str] = set(trusted_client_ids or ())
         if self.trusted_client_ids:
             logger.info("trusted_client_ids: %s", self.trusted_client_ids)
 
@@ -152,8 +151,8 @@ class MaestroOAuthProvider:
         for aid in expired:
             del self.pending_approvals[aid]
 
-        # Trusted client auto-approval: clients whose client_id is in the
-        # MAESTRO_TRUSTED_CLIENT_IDS allowlist skip the PIN gate.
+        # Trusted client auto-approval: clients in the configured allowlist
+        # skip the PIN gate.
         if client.client_id in self.trusted_client_ids:
             code = self._store_auth_code(client, params)
             _audit("authorize_auto_approved", client_id=client.client_id,

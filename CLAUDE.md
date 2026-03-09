@@ -65,7 +65,7 @@ All configuration is via environment variables, typically loaded from `.env` by 
 | `MAESTRO_ISSUER_URL` | **Yes (HTTP)** | `https://localhost:8222` | Public URL for OAuth discovery. Without this, remote clients can't authenticate. |
 | `MAESTRO_AUTHORIZE_PIN_HASH` | **Yes (HTTP)** | — | SHA-256 hex digest of your approval PIN. Required for the PIN-gate consent flow. |
 | `MAESTRO_TRANSFER_TOKEN` | Yes | — | Master secret for daily-rotating HMAC transfer auth. Never used as a bearer token directly — agents must derive daily tokens from it. |
-| `MAESTRO_TRUSTED_CLIENT_IDS` | No | — | Comma-separated OAuth client IDs that auto-approve without PIN prompt. |
+| `MAESTRO_TRUSTED_CLIENT_IDS` | No | — | Comma-separated OAuth client IDs that auto-approve without PIN prompt; loaded into `MaestroConfig.trusted_client_ids`. |
 | `MAESTRO_LAN_ORIGINS` | No | — | LAN origins for OAuth URL rewriting (format: `host:port=scheme`, e.g. `10.0.0.1:8222=http`). |
 | `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Comma-separated dirs that transfer relay may read/write. |
 | `MAESTRO_DEFAULT_REPO` | No | `~/workspace` | Default working directory for agent CLI tools. |
