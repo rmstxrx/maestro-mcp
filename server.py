@@ -55,6 +55,15 @@ from maestro.oauth_state import OAuthStateStore
 
 logger = logging.getLogger("maestro")
 
+# Configure root logging early — before any module-level instantiation emits
+# log messages. Without this, loggers created before basicConfig (e.g.
+# OAuthStateStore.load() called during _oauth_provider __init__) have no
+# handler and their output is silently discarded.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
@@ -139,11 +148,6 @@ register_tools(mcp, CONFIG)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
-
     _audit_log_path = Path.home() / ".maestro" / "audit.log"
     _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
     _audit_handler = logging.FileHandler(_audit_log_path)
