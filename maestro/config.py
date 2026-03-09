@@ -15,8 +15,6 @@ class MaestroConfig:
     transfer_token: str
     max_transfer_size: int
     transfer_allowed_dirs_raw: str
-    bg_output_dir: Path
-    bg_default_timeout: int
     orchestra_output_dir: Path
     codex_timeout: int
     gemini_timeout: int
@@ -38,8 +36,6 @@ class MaestroConfig:
             transfer_token=os.environ.get("MAESTRO_TRANSFER_TOKEN", ""),
             max_transfer_size=int(os.environ.get("MAESTRO_MAX_TRANSFER_MB", "100")) * 1024 * 1024,
             transfer_allowed_dirs_raw=os.environ.get("MAESTRO_TRANSFER_ALLOWED_DIRS", "~/"),
-            bg_output_dir=Path.home() / ".maestro" / "bg-outputs",
-            bg_default_timeout=300,
             orchestra_output_dir=Path.home() / ".agent-orchestra" / "outputs",
             codex_timeout=600,
             gemini_timeout=600,
