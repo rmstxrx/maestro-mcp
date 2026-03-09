@@ -36,7 +36,12 @@ class MaestroConfig:
             transfer_token=os.environ.get("MAESTRO_TRANSFER_TOKEN", ""),
             max_transfer_size=int(os.environ.get("MAESTRO_MAX_TRANSFER_MB", "100")) * 1024 * 1024,
             transfer_allowed_dirs_raw=os.environ.get("MAESTRO_TRANSFER_ALLOWED_DIRS", "~/"),
-            orchestra_output_dir=Path.home() / ".agent-orchestra" / "outputs",
+            orchestra_output_dir=Path(
+                os.environ.get(
+                    "MAESTRO_ORCHESTRA_OUTPUT_DIR",
+                    str(Path.home() / ".agent-orchestra" / "outputs"),
+                )
+            ),
             codex_timeout=600,
             gemini_timeout=600,
             claude_timeout=600,

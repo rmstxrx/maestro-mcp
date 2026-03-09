@@ -258,6 +258,17 @@ class TestOrchestraTruncate:
 
 
 # ---------------------------------------------------------------------------
+# MaestroConfig
+# ---------------------------------------------------------------------------
+
+class TestMaestroConfig:
+    def test_orchestra_output_dir_is_env_overridable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MAESTRO_ORCHESTRA_OUTPUT_DIR", str(tmp_path))
+        config = MaestroConfig.from_env()
+        assert config.orchestra_output_dir == tmp_path
+
+
+# ---------------------------------------------------------------------------
 # _auto_promote
 # ---------------------------------------------------------------------------
 

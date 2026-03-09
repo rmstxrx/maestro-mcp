@@ -69,6 +69,7 @@ All configuration is via environment variables, typically loaded from `.env` by 
 | `MAESTRO_LAN_ORIGINS` | No | — | LAN origins for OAuth URL rewriting (format: `host:port=scheme`, e.g. `10.0.0.1:8222=http`). |
 | `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Comma-separated dirs that transfer relay may read/write. |
 | `MAESTRO_DEFAULT_REPO` | No | `~/workspace` | Default working directory for agent CLI tools. |
+| `MAESTRO_ORCHESTRA_OUTPUT_DIR` | No | `~/.agent-orchestra/outputs` | Directory where agent output files are written. |
 | `MAESTRO_OAUTH_STATE_PATH` | No | `~/.maestro/oauth_state.json` | Where OAuth state is persisted across restarts. |
 | `SSH_TIMEOUT` | No | `300` | Default SSH command timeout in seconds. |
 
