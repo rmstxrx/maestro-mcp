@@ -363,7 +363,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
-    async def poll(task_id: str) -> str:
+    async def poll(task_id: str, wait: int = 0) -> str:
         """Check task status or retrieve result."""
         async with _REGISTRY_LOCK:
             ts = TASK_REGISTRY.get(task_id)
@@ -372,16 +372,29 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if ts.status != "running":
             return ts.result_json
 
-        ctx = get_client_context()
-        cooldown = ctx.profile["poll_cooldown"]
-        now = time.time()
-        since_last = now - ts.last_polled_at
-        if ts.last_polled_at > 0 and since_last < cooldown:
-            return json.dumps({
-                "status": "cooldown", "task_id": task_id,
-                "retry_after": round(cooldown - since_last, 1),
-            })
-        ts.last_polled_at = now
+        if wait > 0:
+            try:
+                await asyncio.wait_for(ts._done_event.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+
+            async with _REGISTRY_LOCK:
+                ts = TASK_REGISTRY.get(task_id)
+            if ts is None:
+                return json.dumps({"error": f"Task '{task_id}' not found"})
+            if ts.status != "running":
+                return ts.result_json
+        else:
+            ctx = get_client_context()
+            cooldown = ctx.profile["poll_cooldown"]
+            now = time.time()
+            since_last = now - ts.last_polled_at
+            if ts.last_polled_at > 0 and since_last < cooldown:
+                return json.dumps({
+                    "status": "cooldown", "task_id": task_id,
+                    "retry_after": round(cooldown - since_last, 1),
+                })
+            ts.last_polled_at = now
 
         elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
         return json.dumps({

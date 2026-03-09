@@ -133,9 +133,11 @@ Check task status or retrieve result.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task_id` | string | yes | Task ID from a dispatch/auto-promote response |
+| `wait` | int | no | Seconds to long-poll for completion before returning (default: 0) |
 
 Returns the task result if complete, or status info if still running.
-Subject to per-client poll cooldown (remote: 10s, local: 2s, lan: 5s).
+When `wait=0`, polls are subject to the per-client cooldown (remote: 10s, local: 2s, lan: 5s).
+When `wait>0`, `poll` waits up to that many seconds and never returns a cooldown response.
 
 ### `read_output`
 Read full or partial output from a previous agent run.
