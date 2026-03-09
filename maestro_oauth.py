@@ -38,6 +38,8 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     AuthorizeError,
     RefreshToken,
+    RegistrationError,
+    TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -122,7 +124,10 @@ class MaestroOAuthProvider:
                                     if now - t < self.REG_RATE_WINDOW]
             if len(self._reg_timestamps) >= self.REG_RATE_LIMIT:
                 _audit("register_rate_limited")
-                raise ValueError("Too many registration requests — try again later")
+                raise RegistrationError(
+                    error="invalid_client_metadata",
+                    error_description="Too many registration requests — try again later",
+                )
             self._reg_timestamps.append(now)
 
         self.clients[client_info.client_id] = client_info
@@ -297,7 +302,10 @@ class MaestroOAuthProvider:
         if len(timestamps) >= self._TOKEN_RATE_LIMIT:
             self._token_rate[client_id] = timestamps
             _audit("token_rate_limited", client_id=client_id)
-            raise ValueError("Token request rate limit exceeded — try again later")
+            raise TokenError(
+                error="invalid_request",
+                error_description="Token request rate limit exceeded — try again later",
+            )
         timestamps.append(now)
         self._token_rate[client_id] = timestamps
 
