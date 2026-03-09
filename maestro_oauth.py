@@ -22,7 +22,10 @@ import logging
 import os
 import secrets
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from maestro.oauth_state import OAuthStateStore
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -68,9 +71,11 @@ class MaestroOAuthProvider:
     REG_RATE_LIMIT = 10
     REG_RATE_WINDOW = 60  # seconds
 
-    def __init__(self, issuer_url: str, host_names: list[str] | None = None):
+    def __init__(self, issuer_url: str, host_names: list[str] | None = None,
+                 state_store: "OAuthStateStore | None" = None):
         self.issuer_url = issuer_url.rstrip("/")
         self.host_names = host_names or []
+        self._state_store = state_store
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
@@ -94,6 +99,10 @@ class MaestroOAuthProvider:
         }
         if self.trusted_client_ids:
             logger.info("trusted_client_ids: %s", self.trusted_client_ids)
+
+        # Load persisted state (clients + tokens) from disk if store is configured.
+        if self._state_store is not None:
+            self._state_store.load(self)
 
     # --- OAuthAuthorizationServerProvider protocol ---
 
@@ -120,6 +129,7 @@ class MaestroOAuthProvider:
         _audit("client_registered", client_id=client_info.client_id,
                client_name=client_info.client_name)
         logger.info("client_registered: %s", client_info.client_id)
+        self._save()
 
     async def authorize(
         self,
@@ -195,6 +205,7 @@ class MaestroOAuthProvider:
         _audit("token_issued", client_id=client.client_id, expires_in=TOKEN_EXPIRY)
         logger.info("token_issued: access=%s... stored=%d",
                      access_tok[:20], len(self.access_tokens))
+        self._save()
 
         return OAuthToken(
             access_token=access_tok,
@@ -236,6 +247,7 @@ class MaestroOAuthProvider:
             expires_at=now + REFRESH_TOKEN_EXPIRY,
         )
         _audit("token_refreshed", client_id=client.client_id)
+        self._save()
 
         return OAuthToken(
             access_token=access_tok,
@@ -268,8 +280,14 @@ class MaestroOAuthProvider:
             self.access_tokens.pop(token.token, None)
         else:
             self.refresh_tokens.pop(token.token, None)
+        self._save()
 
     # --- Internal ---
+
+    def _save(self) -> None:
+        """Persist current state to disk. No-op if no state store is configured."""
+        if self._state_store is not None:
+            self._state_store.save(self)
 
     def _check_token_rate(self, client_id: str) -> None:
         """Enforce per-client rate limit on token exchange. Raises ValueError if exceeded."""

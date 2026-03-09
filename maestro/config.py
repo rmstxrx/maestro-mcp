@@ -25,6 +25,7 @@ class MaestroConfig:
     default_repo: str
     task_eviction_seconds: int
     task_output_retention_seconds: int
+    oauth_state_path: Path
 
     @classmethod
     def from_env(cls) -> "MaestroConfig":
@@ -47,4 +48,8 @@ class MaestroConfig:
             default_repo=os.environ.get("MAESTRO_DEFAULT_REPO", str(Path.home() / "workspace")),
             task_eviction_seconds=3600,
             task_output_retention_seconds=86400,
+            oauth_state_path=Path(
+                os.environ.get("MAESTRO_OAUTH_STATE_PATH",
+                               str(Path.home() / ".maestro" / "oauth_state.json"))
+            ),
         )

@@ -51,6 +51,7 @@ from maestro.transport import (
     warmup_all_hosts,
 )
 from maestro_oauth import MaestroOAuthProvider
+from maestro.oauth_state import OAuthStateStore
 
 logger = logging.getLogger("maestro")
 
@@ -61,9 +62,11 @@ logger = logging.getLogger("maestro")
 CONFIG = MaestroConfig.from_env()
 init_hosts()
 
+_oauth_state_store = OAuthStateStore(CONFIG.oauth_state_path)
 _oauth_provider = MaestroOAuthProvider(
     issuer_url=CONFIG.issuer_url,
     host_names=list(HOSTS.keys()),
+    state_store=_oauth_state_store,
 )
 
 # Wire up modules
