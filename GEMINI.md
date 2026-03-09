@@ -1,78 +1,124 @@
 # Maestro MCP — Gemini CLI Guide
 
-Maestro integrates with Gemini CLI to provide a unified interface for managing a fleet of machines and dispatching asynchronous agent tasks.
+Maestro integrates with Gemini CLI to provide fleet management and agent
+orchestration from within a Gemini chat session.
 
-## Getting Started
+---
 
-To add Maestro to your Gemini CLI session:
+## Setup
+
+### 1. Register Maestro as an MCP server
 
 ```bash
-gemini mcp add maestro /path/to/maestro-mcp/.venv/bin/python /path/to/maestro-mcp/server.py --transport stdio
+gemini mcp add maestro \
+  /path/to/maestro-mcp/.venv/bin/python \
+  /path/to/maestro-mcp/server.py \
+  --transport stdio
 ```
+
+Verify it's registered:
+
+```bash
+gemini mcp list
+```
+
+Alternatively, the repo ships a `.gemini/settings.json` that registers Maestro
+automatically when Gemini CLI is run from the repo directory. Check the path
+inside it matches your local install.
+
+### 2. Use Maestro tools from a session
+
+MCP tools are not CLI subcommands — they are only accessible from within a
+Gemini chat session (interactive or headless). There is no `gemini mcp call`
+syntax.
+
+**Interactive session:**
+```bash
+gemini
+# Then in the session:
+# > use maestro to check fleet status
+# > run `nvidia-smi` on eden via maestro
+```
+
+**Headless (non-interactive):**
+```bash
+gemini -p "Use maestro to check fleet status and report which hosts are down."
+```
+
+---
 
 ## Core Fleet Workflows
 
-### 1. Unified Execution
-Run commands across any machine in your fleet. Maestro handles SSH persistence and shell differences (Bash/PowerShell).
+All examples below are headless. The same prompts work interactively.
 
+### Check fleet status
 ```bash
-# Check status of all hosts
-gemini mcp call maestro status
-
-# Run a command on a specific host
-gemini mcp call maestro exec --host gpu-box --command "nvidia-smi"
+gemini -p "Call the maestro status tool and summarise the result."
 ```
 
-### 2. Zero-Context File Transfers
-Move files between machines without bloating your LLM context.
-
+### Execute a command on a host
 ```bash
-gemini mcp call maestro transfer --host macbook --direction upload --local_path "./src/main.py" --remote_path "~/workspace/main.py"
+gemini -p "Use maestro exec to run 'nvidia-smi' on host eden and show the output."
 ```
 
-### 3. Surgical Reads
-Avoid context exhaustion by reading only what you need.
-
+### Read a file (surgical)
 ```bash
-# Read the last 50 lines of a log file on a remote host
-gemini mcp call maestro read --host linux-box --path "/var/log/syslog" --tail 50
+gemini -p "Use maestro read to get the last 50 lines of /var/log/syslog on apollyon."
 ```
+
+### Transfer a file
+```bash
+gemini -p "Use maestro transfer to upload ./src/main.py to ~/workspace/main.py on judas."
+```
+
+---
 
 ## Agent Orchestra
 
-Maestro allows you to dispatch tasks to Gemini CLI as background processes.
+Maestro can dispatch Gemini CLI tasks as async background processes via the
+`gemini` tool. This is Gemini dispatching *itself* — useful for long-running
+agentic tasks you want to run in the background while the orchestrating session
+stays responsive.
 
-### Dispatching a Task
-Use the `gemini` tool to start a task.
-
+### Dispatch a task
 ```bash
-gemini mcp call maestro gemini --host workstation --prompt "Refactor the authentication logic" --approval_mode yolo
+gemini --approval-mode yolo -p "
+Use maestro to dispatch a gemini task on apollyon:
+  prompt: 'Refactor the authentication logic in maestro_oauth.py'
+  approval_mode: yolo
+  working_dir: /home/rmstxrx/Development/maestro-mcp
+Then poll until complete and summarise the changes.
+"
 ```
 
-**Parameters:**
-- `approval_mode`: `plan` (read-only), `yolo` (auto-approve), `auto_edit` (auto-approve edits), `default`.
-- `resume`: Session index or "latest" to continue a previous chat.
-- `context_files`: List of `@file` references to include.
+**Key parameters for the `gemini` tool:**
 
-### Session Management
-List previous sessions on a host to find an index for `resume`:
+| Parameter | Values | Notes |
+|-----------|--------|-------|
+| `approval_mode` | `plan`, `yolo`, `auto_edit`, `default` | `plan` = read-only; `yolo` = auto-approve all |
+| `resume` | `"latest"` or index number | Continues a previous session |
+| `context_files` | list of paths | Included as `@file` references |
+
+> **Warning:** `resume` re-sends the entire session history as input tokens.
+> You pay for all previous turns on every resumed call.
+
+### List previous sessions on a host
 ```bash
-gemini mcp call maestro gemini_sessions --host workstation
+gemini -p "Use the maestro gemini_sessions tool on host apollyon to list available sessions."
 ```
 
-### Task Lifecycle
-1. **Dispatch:** Returns a `task_id`.
-2. **Poll:** Check the status of the task.
-   ```bash
-   gemini mcp call maestro poll --task_id <id>
-   ```
-3. **Retrieve:** Read the output once complete.
-   ```bash
-   gemini mcp call maestro read_output --file_path <output_path_from_poll>
-   ```
+### Poll a dispatched task
+```bash
+gemini -p "Use maestro poll with task_id '<id>' and report the result."
+```
 
-## Best Practices & Warnings
+---
 
-- **Token Costs:** Resuming a session (`resume` parameter) re-sends the entire history. You pay for all previous turn tokens as input.
-- **Auto-Promote:** Long-running `exec` or `gemini` calls automatically become background tasks.
-- **Sensitive Data:** Never commit `hosts.yaml` or `.env` to public repositories.
+## Best Practices
+
+- **Token budget:** Every maestro tool response enters Gemini's context window.
+  Use `exec` with `grep`/`head`/`tail` instead of `read` on large files.
+- **Headless for scripting:** Use `gemini -p "..."` for automation; interactive
+  mode for exploratory work.
+- **Sensitive data:** Never commit `hosts.yaml` or `.env`. They are gitignored
+  by default.
