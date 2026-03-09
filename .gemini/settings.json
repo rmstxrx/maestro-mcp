@@ -1,9 +1,12 @@
 {
+  "_note": "Update command and args paths to match your local install before use.",
   "mcpServers": {
     "maestro": {
       "command": "/home/rmstxrx/Development/maestro-mcp/.venv/bin/python",
       "args": [
-        "/home/rmstxrx/Development/maestro-mcp/server.py"
+        "/home/rmstxrx/Development/maestro-mcp/server.py",
+        "--transport",
+        "stdio"
       ]
     }
   }

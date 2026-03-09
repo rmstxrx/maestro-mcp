@@ -56,9 +56,27 @@ python server.py --transport stdio
 pytest tests/
 ```
 
+## Environment Variables
+
+All configuration is via environment variables, typically loaded from `.env` by systemd `EnvironmentFile`.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `MAESTRO_ISSUER_URL` | **Yes (HTTP)** | `https://localhost:8222` | Public URL for OAuth discovery. Without this, remote clients can't authenticate. |
+| `MAESTRO_AUTHORIZE_PIN_HASH` | **Yes (HTTP)** | — | SHA-256 hex digest of your approval PIN. Required for the PIN-gate consent flow. |
+| `MAESTRO_TRANSFER_TOKEN` | Yes | — | Master secret for daily-rotating HMAC transfer auth. Never used as a bearer token directly — agents must derive daily tokens from it. |
+| `MAESTRO_TRUSTED_CLIENT_IDS` | No | — | Comma-separated OAuth client IDs that auto-approve without PIN prompt. |
+| `MAESTRO_LAN_ORIGINS` | No | — | LAN origins for OAuth URL rewriting (format: `host:port=scheme`, e.g. `10.0.0.1:8222=http`). |
+| `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Comma-separated dirs that transfer relay may read/write. |
+| `MAESTRO_DEFAULT_REPO` | No | `~/workspace` | Default working directory for agent CLI tools. |
+| `MAESTRO_OAUTH_STATE_PATH` | No | `~/.maestro/oauth_state.json` | Where OAuth state is persisted across restarts. |
+| `SSH_TIMEOUT` | No | `300` | Default SSH command timeout in seconds. |
+
 ## Critical Rules
 
-1. **Don't kill the Maestro process** via Maestro tools; it terminates the connection.
-2. **hosts.yaml is gitignored.** Use `hosts.example.yaml` for fleet definition.
-3. **Docs & Logs:** `docs/` is gitignored. Use `journal/` for persistent session records.
-4. **Environment:** `MAESTRO_ISSUER_URL` is required for HTTP transport.
+1. **Don't kill the Maestro process** via Maestro tools — it terminates the connection with no recovery path.
+2. **`sudo systemctl restart maestro` drops the active OAuth session.** Wait 15–30s and poll `/.well-known/oauth-authorization-server` for HTTP 200 before issuing tool calls.
+3. **`MAESTRO_ISSUER_URL` must be set** before starting in HTTP mode. Without it, OAuth discovery advertises `localhost` and remote clients can't authenticate. Always start via systemd so `EnvironmentFile` is respected.
+4. **Python default parameter values are evaluated at definition time.** Constants used as defaults must be defined before the functions that reference them.
+5. **hosts.yaml is gitignored.** Use `hosts.example.yaml` as a template.
+6. **Transfer token derivation:** `import hmac,hashlib,time; hmac.new(SECRET.encode(),str(int(time.time())//86400).encode(),hashlib.sha256).hexdigest()`. The server accepts current and previous daily window.
