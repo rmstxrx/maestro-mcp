@@ -34,6 +34,7 @@ def _audit(event: str, **kwargs: Any) -> None:
 _CONFIG: MaestroConfig | None = None
 _RESOLVE_HOST: Callable[[str], Any] | None = None
 _SCP_RUN: Callable[..., Awaitable[str]] | None = None
+_TASK_LOOKUP: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None
 
 _TRANSFER_ALLOWED_DIRS: list[Path] = []
 _SYSTEM_DIRS = frozenset({
@@ -46,11 +47,13 @@ def configure_relay(
     config: MaestroConfig,
     resolve_host: Callable[[str], Any],
     scp_run: Callable[..., Awaitable[str]],
+    task_lookup: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
 ) -> None:
-    global _CONFIG, _RESOLVE_HOST, _SCP_RUN, _TRANSFER_ALLOWED_DIRS
+    global _CONFIG, _RESOLVE_HOST, _SCP_RUN, _TRANSFER_ALLOWED_DIRS, _TASK_LOOKUP
     _CONFIG = config
     _RESOLVE_HOST = resolve_host
     _SCP_RUN = scp_run
+    _TASK_LOOKUP = task_lookup
     _TRANSFER_ALLOWED_DIRS = [
         Path(d.strip()).expanduser().resolve()
         for d in config.transfer_allowed_dirs_raw.split(",") if d.strip()
@@ -311,3 +314,52 @@ async def transfer_pull(request: Request) -> Response:
         except Exception as e:
             Path(tmp_path).unlink(missing_ok=True)
             return JSONResponse({"error": "pull_failed", "detail": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Task result endpoint — zero-token-cost result retrieval
+# ---------------------------------------------------------------------------
+
+async def task_result(request: Request) -> Response:
+    """Return task result via HTTP, enabling bash_tool wait loops.
+
+    GET /tasks/{task_id}/result
+    Authorization: Bearer <daily-HMAC-token>
+
+    Returns:
+        200 — task complete, body is the result JSON
+        202 — task still running, body has status + elapsed
+        404 — unknown task_id
+        410 — task was evicted from registry
+    """
+    if not _transfer_auth_ok(request):
+        return _auth_error()
+
+    if _TASK_LOOKUP is None:
+        return JSONResponse(
+            {"error": "not_configured", "detail": "task lookup not available"},
+            status_code=503,
+        )
+
+    task_id = request.path_params.get("task_id", "")
+    if not task_id:
+        return JSONResponse(
+            {"error": "bad_request", "detail": "task_id path parameter required"},
+            status_code=400,
+        )
+
+    result = await _TASK_LOOKUP(task_id)
+    if result is None:
+        return JSONResponse(
+            {"error": "not_found", "detail": f"task '{task_id}' not found or evicted"},
+            status_code=404,
+        )
+
+    status = result.get("status", "unknown")
+
+    if status == "running":
+        return JSONResponse(result, status_code=202)
+
+    # done, failed, timeout — return full result
+    _audit("task_result_retrieved", task_id=task_id, status=status)
+    return JSONResponse(result, status_code=200)

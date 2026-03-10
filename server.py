@@ -33,9 +33,11 @@ from maestro.hosts import (
     init_hosts,
 )
 from maestro.local import configure_local
-from maestro.relay import configure_relay, transfer_push, transfer_pull
+from maestro.relay import configure_relay, task_result, transfer_push, transfer_pull
 from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
+    TASK_REGISTRY,
+    _REGISTRY_LOCK,
     cancel_eviction_loop,
     configure_orchestra,
     start_eviction_loop,
@@ -94,7 +96,40 @@ configure_orchestra(
     teardown_connection=_teardown_connection, async_run=_async_run,
     is_transient_failure=_is_transient_failure,
 )
-configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run)
+
+async def _task_lookup(task_id: str) -> dict | None:
+    """Look up a task in the registry for the HTTP result endpoint."""
+    from datetime import datetime, timezone
+    import json as _json
+
+    async with _REGISTRY_LOCK:
+        ts = TASK_REGISTRY.get(task_id)
+
+    if ts is None:
+        return None
+
+    if ts.status == "running":
+        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+        return {
+            "task_id": task_id,
+            "agent": ts.agent,
+            "host": ts.host,
+            "status": "running",
+            "elapsed_seconds": round(elapsed, 1),
+        }
+
+    # Task is complete — parse the stored result JSON and return it
+    try:
+        result = _json.loads(ts.result_json) if ts.result_json else {}
+    except (_json.JSONDecodeError, TypeError):
+        result = {"raw": ts.result_json}
+
+    result["task_id"] = task_id
+    result["status"] = ts.status
+    return result
+
+
+configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run, task_lookup=_task_lookup)
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -141,6 +176,10 @@ async def _transfer_push(request: Request) -> Response:
 @mcp.custom_route("/transfer/pull", methods=["GET"])
 async def _transfer_pull(request: Request) -> Response:
     return await transfer_pull(request)
+
+@mcp.custom_route("/tasks/{task_id}/result", methods=["GET"])
+async def _task_result(request: Request) -> Response:
+    return await task_result(request)
 
 register_tools(mcp, CONFIG)
 
