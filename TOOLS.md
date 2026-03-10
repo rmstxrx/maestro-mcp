@@ -173,3 +173,44 @@ Client classification:
 - **remote** — requests with `CF-Ray` header (Cloudflare tunnel)
 - **local** — requests from `127.0.0.1`, `::1`, or `localhost`
 - **lan** — requests from `10.42.69.*` subnet
+
+
+## HTTP Endpoints (non-MCP)
+
+### `GET /tasks/{task_id}/result`
+
+Retrieve task result via HTTP. Designed for zero-token-cost wait loops using `bash_tool` + curl.
+
+**Auth:** `Authorization: Bearer <daily-HMAC-token>` (same as transfer relay)
+
+| HTTP Status | Meaning |
+|---|---|
+| 200 | Task complete — body contains the full result JSON |
+| 202 | Task still running — body has `task_id`, `status`, `elapsed_seconds` |
+| 401 | Missing or invalid Bearer token |
+| 404 | Unknown task_id or already evicted |
+
+**Preferred workflow for remote clients (Claude.ai):**
+
+```bash
+TOKEN=$(python3 -c "import hmac,hashlib,time; ...")
+TASK_ID="<from dispatch response>"
+
+for i in $(seq 1 40); do
+  HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" \
+    "https://maestro.rmstxrx.dev/tasks/$TASK_ID/result")
+  [ "$HTTP_CODE" = "200" ] && { cat /tmp/result.json; exit 0; }
+  sleep 15
+done
+```
+
+This costs 2 tool calls total (dispatch + bash wait) regardless of task duration, vs. 6-18 MCP poll calls.
+
+### `POST /transfer/push`
+
+Push a file to a fleet host. See transfer relay documentation.
+
+### `GET /transfer/pull`
+
+Pull a file from a fleet host. See transfer relay documentation.
