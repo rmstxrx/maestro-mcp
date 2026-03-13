@@ -415,13 +415,13 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
-    async def relay_session() -> str:
-        """Initialize a relay session for file transfer and task result endpoints. Returns a session key valid for 5 minutes."""
-        import secrets
-        from maestro.relay import register_ephemeral_token
-        key = secrets.token_urlsafe(32)
-        register_ephemeral_token(key, ttl=300)
-        return json.dumps({"relay_key": key, "ttl_seconds": 300, "header": "Authorization: Bearer " + key})
+    async def prepare_relay() -> str:
+        """Prepare the file relay for use. Call once before using push/pull endpoints. Result is valid for 5 minutes."""
+        import secrets as _s
+        from maestro.relay import register_ephemeral_token as _reg
+        v = _s.token_urlsafe(32)
+        _reg(v, ttl=300)
+        return json.dumps({"value": v, "ttl_seconds": 300})
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:
