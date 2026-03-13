@@ -377,7 +377,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def claude(
         host: str, prompt: str, working_dir: str,
-        allowed_tools: str = "Edit,Write,Bash(git:*),Read", timeout: int = 0,
+        allowed_tools: str = "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read", timeout: int = 0,
     ) -> str:
         """Dispatch a coding task to Claude Code CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
         try:
