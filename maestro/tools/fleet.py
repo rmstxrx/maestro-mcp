@@ -46,6 +46,7 @@ from maestro.transport import (
     _check_control_master,
     _scp_run,
     _ssh_run,
+    _structured_error,
     _warmup_connection,
 )
 
@@ -67,6 +68,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a command on a host."""
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -89,6 +94,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a multi-line script on a host."""
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -122,7 +131,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def read(host: str, path: str, head: int | None = None, tail: int | None = None) -> str:
         """Read a file from a host."""
-        cfg = _resolve_host(host)
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         if cfg.is_local:
             return _local_read_file(path, head=head, tail=tail)
         if cfg.shell == HostShell.POWERSHELL:
@@ -144,7 +156,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def write(host: str, path: str, content: str, append: bool = False, sudo: bool = False) -> str:
         """Write content to a file on a host."""
-        cfg = _resolve_host(host)
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         timeout = config.ssh_timeout
         if cfg.is_local:
             return _local_write_file(path, content, append=append, sudo=sudo)
@@ -169,7 +184,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def transfer(host: str, direction: str, local_path: str, remote_path: str) -> str:
         """Transfer a file to/from a host via SCP. direction: "upload" or "download"."""
-        cfg = _resolve_host(host)
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         if direction == "upload":
             if cfg.is_local:
                 return _local_copy(local_path, remote_path, upload=True)
@@ -219,7 +237,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def agent_status(host: str = "") -> str:
         """Check Codex/Gemini CLI availability on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
-        _resolve_host(h)
+        try:
+            _resolve_host(h)
+        except ValueError as e:
+            return _structured_error("validation_error", h, str(e))
 
         codex_rc, codex_out = await _orchestra_run_cli(h, "codex --version 2>&1", timeout=10)
         gemini_rc, gemini_out = await _orchestra_run_cli(h, "gemini --version 2>&1", timeout=10)
@@ -241,6 +262,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         model: str = "", reasoning_effort: str = "xhigh",
     ) -> str:
         """Dispatch task to Codex CLI. Returns task_id."""
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         ctx = get_client_context()
         timeout = config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -288,6 +313,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         resume: Session index (e.g. "1") or "latest" to continue a previous chat.
         WARNING: Resuming a session re-sends the entire history, costing tokens for all previous turns.
         """
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         ctx = get_client_context()
         timeout = config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -347,6 +376,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         allowed_tools: str = "Edit,Write,Bash(git:*),Read",
     ) -> str:
         """Dispatch task to Claude Code CLI. Returns task_id."""
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
         ctx = get_client_context()
         timeout = config.claude_timeout
         block_timeout = ctx.profile["block_timeout_agent"]

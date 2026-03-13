@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -75,6 +76,14 @@ def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     if _FORMAT_RESULT is None:
         raise RuntimeError("transport helpers are not configured")
     return _FORMAT_RESULT(stdout, stderr, returncode)
+
+
+def _structured_error(category: str, host: str, detail: str, command_preview: str = "") -> str:
+    """Build a structured JSON error response."""
+    error: dict[str, str] = {"error": category, "host": host, "detail": detail}
+    if command_preview:
+        error["command_preview"] = command_preview[:200]
+    return json.dumps(error)
 
 
 async def _async_run(
@@ -199,7 +208,8 @@ async def _ssh_run(
             return _format_result(stdout, stderr, rc)
         if not _is_transient_failure(rc, stderr):
             await _update_status(host_name, _HOST_STATUS.ERROR, last_error=stderr.strip())
-            return f"[SSH error on {host_name}]\n{stderr}"
+            category = "ssh_timeout" if "timeout" in stderr.lower() else "transport_error"
+            return _structured_error(category, host_name, stderr.strip(), " ".join(ssh_args))
         last_error = stderr.strip() or f"rc={rc}"
         logger.warning(f"{host_name}: transient failure (attempt {attempt}/{config_obj.max_retries}): {last_error}")
         if attempt < config_obj.max_retries:
@@ -208,7 +218,11 @@ async def _ssh_run(
             await asyncio.sleep(backoff)
             await _teardown_connection(config.alias)
     await _update_status(host_name, _HOST_STATUS.ERROR, last_error=last_error)
-    return f"[failed after {config_obj.max_retries} attempts on {host_name}]\nLast error: {last_error}"
+    return _structured_error(
+        "ssh_connection_failed", host_name,
+        f"failed after {config_obj.max_retries} attempts: {last_error}",
+        " ".join(ssh_args),
+    )
 
 
 async def _scp_run(
@@ -234,7 +248,8 @@ async def _scp_run(
             await _update_status(host_name, _HOST_STATUS.CONNECTED)
             return f"[OK] {action_desc}"
         if not _is_transient_failure(rc, stderr):
-            return f"[scp failed on {host_name}]\n{stderr}"
+            category = "ssh_timeout" if "timeout" in stderr.lower() else "transport_error"
+            return _structured_error(category, host_name, stderr.strip(), action_desc)
         last_error = stderr.strip()
         logger.warning(f"{host_name}: scp transient failure (attempt {attempt}/{config_obj.max_retries}): {last_error}")
         if attempt < config_obj.max_retries:
@@ -242,4 +257,8 @@ async def _scp_run(
             await asyncio.sleep(backoff)
             await _teardown_connection(config.alias)
     await _update_status(host_name, _HOST_STATUS.ERROR, last_error=last_error)
-    return f"[scp failed after {config_obj.max_retries} attempts on {host_name}]\n{last_error}"
+    return _structured_error(
+        "ssh_connection_failed", host_name,
+        f"scp failed after {config_obj.max_retries} attempts: {last_error}",
+        action_desc,
+    )
