@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,6 +56,95 @@ TASK_REGISTRY: dict[str, TaskState] = {}
 _REGISTRY_LOCK = asyncio.Lock()
 _EVICTION_TASK: asyncio.Task | None = None
 
+_REGISTRY_VERSION = 1
+
+
+class TaskRegistryStore:
+    """Atomic JSON persistence for the task registry."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save(self) -> None:
+        """Atomically serialize current registry to disk."""
+        state: dict[str, Any] = {
+            "version": _REGISTRY_VERSION,
+            "saved_at": time.time(),
+            "tasks": {},
+        }
+        for tid, ts in TASK_REGISTRY.items():
+            state["tasks"][tid] = {
+                "task_id": ts.task_id,
+                "agent": ts.agent,
+                "host": ts.host,
+                "prompt": ts.prompt,
+                "status": ts.status,
+                "started_at": ts.started_at.isoformat(),
+                "finished_at": ts.finished_at.isoformat() if ts.finished_at else None,
+                "output_file": str(ts.output_file) if ts.output_file else None,
+                "result_json": ts.result_json,
+            }
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(state, indent=2))
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.warning("task_registry: save failed: %s", exc)
+            tmp.unlink(missing_ok=True)
+
+    def load(self) -> None:
+        """Load persisted tasks, marking any 'running' as 'orphaned'."""
+        if not self.path.exists():
+            logger.info("task_registry: no state file at %s — starting fresh", self.path)
+            return
+        try:
+            state = json.loads(self.path.read_text())
+        except Exception as exc:
+            logger.warning("task_registry: failed to parse %s: %s — starting fresh", self.path, exc)
+            return
+        if state.get("version") != _REGISTRY_VERSION:
+            logger.warning("task_registry: unsupported version — starting fresh")
+            return
+
+        loaded = orphaned = 0
+        for tid, data in state.get("tasks", {}).items():
+            try:
+                status = data["status"]
+                if status == "running":
+                    status = "orphaned"
+                    orphaned += 1
+                ts = TaskState(
+                    task_id=tid,
+                    agent=data["agent"],
+                    host=data["host"],
+                    prompt=data["prompt"],
+                    status=status,
+                    started_at=datetime.fromisoformat(data["started_at"]),
+                    finished_at=(
+                        datetime.fromisoformat(data["finished_at"])
+                        if data.get("finished_at")
+                        else datetime.now(timezone.utc)
+                    ),
+                    output_file=Path(data["output_file"]) if data.get("output_file") else None,
+                    result_json=data.get("result_json"),
+                )
+                ts._done_event.set()
+                TASK_REGISTRY[tid] = ts
+                loaded += 1
+            except Exception as exc:
+                logger.warning("task_registry: skip task %r: %s", tid, exc)
+        logger.info("task_registry: loaded %d tasks (%d orphaned)", loaded, orphaned)
+
+
+_TASK_STORE: TaskRegistryStore | None = None
+
+
+def _save_registry() -> None:
+    """Persist registry to disk if a store is configured."""
+    if _TASK_STORE is not None:
+        _TASK_STORE.save()
+
 
 # ---------------------------------------------------------------------------
 # Late-bound references (set by configure_orchestra)
@@ -83,10 +174,11 @@ def configure_orchestra(
     teardown_connection: Callable[..., Awaitable[None]],
     async_run: Callable[..., Awaitable[tuple[int, str, str]]],
     is_transient_failure: Callable[[int, str], bool],
+    task_store: TaskRegistryStore | None = None,
 ) -> None:
     global _CONFIG, _RESOLVE_HOST, _WRAP_COMMAND, _FORMAT_RESULT
     global _UPDATE_HOST_STATUS, _HOST_STATUS, _ENSURE_CONNECTION
-    global _TEARDOWN_CONNECTION, _ASYNC_RUN, _IS_TRANSIENT_FAILURE
+    global _TEARDOWN_CONNECTION, _ASYNC_RUN, _IS_TRANSIENT_FAILURE, _TASK_STORE
     _CONFIG = config
     _RESOLVE_HOST = resolve_host
     _WRAP_COMMAND = wrap_command
@@ -97,6 +189,7 @@ def configure_orchestra(
     _TEARDOWN_CONNECTION = teardown_connection
     _ASYNC_RUN = async_run
     _IS_TRANSIENT_FAILURE = is_transient_failure
+    _TASK_STORE = task_store
 
 
 def _cfg() -> MaestroConfig:
@@ -131,6 +224,7 @@ async def _evict_stale_tasks() -> None:
                     pass
     if stale:
         logger.info(f"Orchestra: evicted {len(stale)} stale tasks from registry")
+        _save_registry()
 
 
 async def _periodic_eviction() -> None:
@@ -385,11 +479,13 @@ async def _auto_promote(
         finally:
             ts.finished_at = datetime.now(timezone.utc)
             ts._done_event.set()
+            _save_registry()
 
     asyncio.create_task(_monitor())
 
     async with _REGISTRY_LOCK:
         TASK_REGISTRY[task_id] = ts
+    _save_registry()
 
     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
     logger.info(f"auto_promote: {agent} on {host} [{task_id}] promoted after {elapsed:.1f}s")

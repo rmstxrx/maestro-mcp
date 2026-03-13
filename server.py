@@ -37,6 +37,7 @@ from maestro.relay import configure_relay, task_result, transfer_push, transfer_
 from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
+    TaskRegistryStore,
     _REGISTRY_LOCK,
     cancel_eviction_loop,
     configure_orchestra,
@@ -89,12 +90,16 @@ configure_transport(
     format_result=_format_result,
 )
 configure_local(config=CONFIG, format_result=_format_result)
+_task_registry_store = TaskRegistryStore(CONFIG.oauth_state_path.parent / "task_registry.json")
+_task_registry_store.load()
+
 configure_orchestra(
     config=CONFIG, resolve_host=_resolve_host, wrap_command=_wrap_command,
     format_result=_format_result, update_host_status=_update_host_status,
     host_status=HostStatus, ensure_connection=_ensure_connection,
     teardown_connection=_teardown_connection, async_run=_async_run,
     is_transient_failure=_is_transient_failure,
+    task_store=_task_registry_store,
 )
 
 async def _task_lookup(task_id: str) -> dict | None:
@@ -117,6 +122,17 @@ async def _task_lookup(task_id: str) -> dict | None:
             "status": "running",
             "elapsed_seconds": round(elapsed, 1),
         }
+
+    if ts.status == "orphaned":
+        result: dict = {
+            "task_id": task_id,
+            "agent": ts.agent,
+            "host": ts.host,
+            "status": "orphaned",
+        }
+        if ts.output_file:
+            result["output_file"] = str(ts.output_file)
+        return result
 
     # Task is complete — parse the stored result JSON and return it
     try:
