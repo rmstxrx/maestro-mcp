@@ -258,7 +258,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def codex(
-        host: str, prompt: str, working_dir: str = config.default_repo,
+        host: str, prompt: str, working_dir: str,
         model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
     ) -> str:
         """Dispatch a coding task to Codex CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
@@ -305,8 +305,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def gemini(
-        host: str, prompt: str, context_files: list[str] | None = None,
-        working_dir: str = config.default_repo, model: str = "",
+        host: str, prompt: str, working_dir: str,
+        context_files: list[str] | None = None, model: str = "",
         approval_mode: str = "plan", resume: str = "", timeout: int = 0,
     ) -> str:
         """Dispatch an analysis/research task to Gemini CLI. Exploits 1M-token context. Returns task_id — use poll() for results. Prefer over exec().
@@ -376,7 +376,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def claude(
-        host: str, prompt: str, working_dir: str = config.default_repo,
+        host: str, prompt: str, working_dir: str,
         allowed_tools: str = "Edit,Write,Bash(git:*),Read", timeout: int = 0,
     ) -> str:
         """Dispatch a coding task to Claude Code CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
