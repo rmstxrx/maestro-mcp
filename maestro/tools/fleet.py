@@ -263,9 +263,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     ) -> str:
         """Dispatch task to Codex CLI. Returns task_id."""
         try:
-            _resolve_host(host)
+            cfg = _resolve_host(host)
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
+        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
+            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
         timeout = config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -314,9 +316,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         WARNING: Resuming a session re-sends the entire history, costing tokens for all previous turns.
         """
         try:
-            _resolve_host(host)
+            cfg = _resolve_host(host)
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
+        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
+            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
         timeout = config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -377,9 +381,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     ) -> str:
         """Dispatch task to Claude Code CLI. Returns task_id."""
         try:
-            _resolve_host(host)
+            cfg = _resolve_host(host)
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
+        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
+            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
         timeout = config.claude_timeout
         block_timeout = ctx.profile["block_timeout_agent"]

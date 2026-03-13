@@ -34,6 +34,7 @@ class HostConfig:
     status: HostStatus = HostStatus.UNKNOWN
     last_check: float = 0.0
     last_error: str = ""
+    allowed_dirs: list[str] = field(default_factory=list)
 
 
 def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
@@ -71,6 +72,7 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
             description=cfg.get("description", ""),
             shell=shell,
             is_local=cfg.get("is_local", False),
+            allowed_dirs=cfg.get("allowed_dirs", []),
         )
 
     if not hosts:

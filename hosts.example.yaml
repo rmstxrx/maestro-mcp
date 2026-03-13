@@ -10,12 +10,17 @@
 #   shell: bash (default) or powershell
 #   is_local: true if this is the hub machine (direct execution, no SSH)
 #   display_name: override the display name (defaults to the YAML key)
+#   allowed_dirs: list of directory prefixes for agent dispatch (codex/claude/gemini)
+#                 If set, working_dir must start with one of these paths.
+#                 If empty/omitted, no restriction (backward compatible).
 
 hosts:
   workstation:
     alias: ssh-workstation
     description: "Main dev box, Arch Linux"
     is_local: true
+    allowed_dirs:
+      - "/home/user/Development"
 
   gpu-box:
     alias: ssh-gpu
@@ -29,6 +34,8 @@ hosts:
     alias: ssh-winpc
     description: "Windows 11, PowerShell"
     shell: powershell
+    allowed_dirs:
+      - "C:\\Users\\user\\Development"
 
   windows-wsl:
     alias: ssh-winpc-wsl
