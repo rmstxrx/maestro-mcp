@@ -259,7 +259,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def codex(
         host: str, prompt: str, working_dir: str = config.default_repo,
-        model: str = "", reasoning_effort: str = "xhigh",
+        model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
     ) -> str:
         """Dispatch task to Codex CLI. Returns task_id."""
         try:
@@ -269,7 +269,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
             return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
-        timeout = config.codex_timeout
+        effective_timeout = timeout if timeout > 0 else config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
         output_holder: list[Path | None] = [None]
 
@@ -283,7 +283,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
             task_label = output_file.stem.rsplit("_", 1)[-1]
             logger.info(f"Orchestra: codex on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
             return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
@@ -307,7 +307,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def gemini(
         host: str, prompt: str, context_files: list[str] | None = None,
         working_dir: str = config.default_repo, model: str = "",
-        approval_mode: str = "plan", resume: str = "",
+        approval_mode: str = "plan", resume: str = "", timeout: int = 0,
     ) -> str:
         """Dispatch task to Gemini CLI.
 
@@ -322,7 +322,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
             return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
-        timeout = config.gemini_timeout
+        effective_timeout = timeout if timeout > 0 else config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
         output_holder: list[Path | None] = [None]
 
@@ -345,7 +345,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
             task_label = output_file.stem.rsplit("_", 1)[-1]
             logger.info(f"Orchestra: gemini on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
             return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
         return await _auto_promote(
@@ -377,7 +377,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def claude(
         host: str, prompt: str, working_dir: str = config.default_repo,
-        allowed_tools: str = "Edit,Write,Bash(git:*),Read",
+        allowed_tools: str = "Edit,Write,Bash(git:*),Read", timeout: int = 0,
     ) -> str:
         """Dispatch task to Claude Code CLI. Returns task_id."""
         try:
@@ -387,7 +387,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
             return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
         ctx = get_client_context()
-        timeout = config.claude_timeout
+        effective_timeout = timeout if timeout > 0 else config.claude_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
         output_holder: list[Path | None] = [None]
 
@@ -404,7 +404,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             )
             task_label = output_file.stem.rsplit("_", 1)[-1]
             logger.info(f"Orchestra: claude on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
             return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
