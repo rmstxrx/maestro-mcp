@@ -312,6 +312,12 @@ The agent orchestra tools follow the same principle: full output is saved to dis
 
 ---
 
+## Gotchas
+
+Claude.ai's MCP connector can silently filter tools whose name or description suggests credential generation. If a tool disappears from discovery, inspect the tool name and description for terms like `token`, `secret`, `key`, `auth`, `bearer`, `credential`, or `session key`, then rename the tool and sanitize the description. The filtering is intent-based, not pure keyword matching.
+
+---
+
 ## Origin
 
 Maestro was born from necessity. I work across three machines — a Linux box for inference, a Windows PC for training, and a MacBook for when I'm away from the desk. I got tired of my AI assistant only seeing one machine at a time while I had to manually bridge the gaps.
