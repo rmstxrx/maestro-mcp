@@ -130,7 +130,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def read(host: str, path: str, head: int | None = None, tail: int | None = None) -> str:
-        """Read a file from a host."""
+        """Read a file from a host. For large files, prefer exec + grep/head/sed to avoid context bloat."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -183,7 +183,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def transfer(host: str, direction: str, local_path: str, remote_path: str) -> str:
-        """Transfer a file to/from a host via SCP. direction: "upload" or "download"."""
+        """Transfer a file to/from a host via SCP. direction: "upload" or "download". For large files, prefer prepare_relay + curl push/pull (zero context cost)."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -425,7 +425,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:
-        """Check task status or retrieve result. Use wait parameter (seconds) for long-poll."""
+        """Check task status or retrieve result. Use wait parameter (seconds) for long-poll. For zero-context-cost polling, use prepare_relay key with GET /tasks/{task_id}/result instead."""
         async with _REGISTRY_LOCK:
             ts = TASK_REGISTRY.get(task_id)
         if ts is None:
