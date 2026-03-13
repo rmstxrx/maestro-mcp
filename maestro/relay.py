@@ -37,6 +37,7 @@ _SCP_RUN: Callable[..., Awaitable[str]] | None = None
 _TASK_LOOKUP: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None
 
 _TRANSFER_ALLOWED_DIRS: list[Path] = []
+_EPHEMERAL_TOKENS: dict[str, float] = {}  # token → expiry_timestamp
 _SYSTEM_DIRS = frozenset({
     "/etc", "/proc", "/sys", "/dev", "/boot", "/sbin", "/bin", "/usr", "/lib", "/var",
 })
@@ -133,23 +134,51 @@ def derive_transfer_token(master_secret: str, window_offset: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Ephemeral tokens
+# ---------------------------------------------------------------------------
+
+def register_ephemeral_token(token: str, ttl: int = 300) -> None:
+    """Register a short-lived ephemeral transfer token."""
+    now = time.time()
+    _EPHEMERAL_TOKENS[token] = now + ttl
+    # Purge expired tokens
+    expired = [t for t, exp in _EPHEMERAL_TOKENS.items() if exp < now]
+    for t in expired:
+        del _EPHEMERAL_TOKENS[t]
+
+
+def _check_ephemeral_token(provided: str) -> bool:
+    """Check if an ephemeral token is valid and not expired."""
+    exp = _EPHEMERAL_TOKENS.get(provided)
+    if exp is None:
+        return False
+    if time.time() > exp:
+        del _EPHEMERAL_TOKENS[provided]
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
 def _transfer_auth_ok(request: Request) -> bool:
     """Validate Bearer token for transfer endpoints.
 
-    Accepts either the current daily-window token or the previous one,
-    so agents computing the token just before midnight are never rejected
-    mid-session.
+    Accepts ephemeral MCP-issued tokens first, then falls back to the
+    daily-rotating HMAC (current or previous window).
     """
-    cfg = _cfg()
-    if not cfg.transfer_token:
-        return False
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return False
     provided = auth[7:]
+    # Ephemeral tokens (issued by get_transfer_token MCP tool)
+    if _check_ephemeral_token(provided):
+        return True
+    # Daily HMAC fallback
+    cfg = _cfg()
+    if not cfg.transfer_token:
+        return False
     current  = derive_transfer_token(cfg.transfer_token, 0)
     previous = derive_transfer_token(cfg.transfer_token, -1)
     return (
