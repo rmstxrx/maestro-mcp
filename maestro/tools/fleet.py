@@ -67,7 +67,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
-        """Run a command on a host."""
+        """Run a shell command on a host. Do NOT use this to invoke agent CLIs (claude, codex, gemini) — use the dedicated dispatch tools instead."""
         try:
             _resolve_host(host)
         except ValueError as e:
@@ -93,7 +93,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
-        """Run a multi-line script on a host."""
+        """Run a multi-line script on a host. Do NOT use this to invoke agent CLIs — use dedicated dispatch tools."""
         try:
             _resolve_host(host)
         except ValueError as e:
@@ -261,7 +261,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         host: str, prompt: str, working_dir: str = config.default_repo,
         model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
     ) -> str:
-        """Dispatch task to Codex CLI. Returns task_id."""
+        """Dispatch a coding task to Codex CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -309,7 +309,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         working_dir: str = config.default_repo, model: str = "",
         approval_mode: str = "plan", resume: str = "", timeout: int = 0,
     ) -> str:
-        """Dispatch task to Gemini CLI.
+        """Dispatch an analysis/research task to Gemini CLI. Exploits 1M-token context. Returns task_id — use poll() for results. Prefer over exec().
 
         approval_mode: "plan" (read-only), "yolo" (auto-approve all), "auto_edit" (auto-approve edits), "default" (prompt).
         resume: Session index (e.g. "1") or "latest" to continue a previous chat.
@@ -379,7 +379,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         host: str, prompt: str, working_dir: str = config.default_repo,
         allowed_tools: str = "Edit,Write,Bash(git:*),Read", timeout: int = 0,
     ) -> str:
-        """Dispatch task to Claude Code CLI. Returns task_id."""
+        """Dispatch a coding task to Claude Code CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -425,7 +425,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:
-        """Check task status or retrieve result."""
+        """Check task status or retrieve result. Use wait parameter (seconds) for long-poll."""
         async with _REGISTRY_LOCK:
             ts = TASK_REGISTRY.get(task_id)
         if ts is None:
