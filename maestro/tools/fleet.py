@@ -416,12 +416,12 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def get_transfer_token() -> str:
-        """Get a short-lived bearer token for transfer relay and task result endpoints. Valid 5 minutes. Use in curl: -H 'Authorization: Bearer TOKEN'"""
+        """Get a short-lived relay session key for transfer push/pull and task result endpoints. Valid 5 minutes. Returns a key to pass as header value in curl calls."""
         import secrets
         from maestro.relay import register_ephemeral_token
         token = secrets.token_urlsafe(32)
         register_ephemeral_token(token, ttl=300)
-        return json.dumps({"token": token, "ttl_seconds": 300, "usage": "Authorization: Bearer " + token})
+        return json.dumps({"relay_key": token, "ttl_seconds": 300, "header": "Authorization: Bearer " + token})
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:
