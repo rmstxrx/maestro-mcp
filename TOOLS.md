@@ -127,6 +127,26 @@ Dispatch task to Claude Code CLI.
 
 Runs with `--permission-mode bypassPermissions`.
 
+### `opencode`
+Dispatch task to OpenCode CLI.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name from fleet topology |
+| `prompt` | string | yes | Task prompt for OpenCode |
+| `working_dir` | string | no | Repository path (default: MAESTRO_DEFAULT_REPO) |
+| `model` | string | no | Model override (provider/model format) |
+| `session_id` | string | no | Session ID to continue existing session |
+
+Returns task result inline if completed within block_timeout, otherwise returns `{"auto_promoted": true, "task_id": "..."}`. Use `poll` to check status.
+
+### `opencode_sessions`
+List previous OpenCode CLI sessions on a host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | no | Host to check (default: local host) |
+
 ### `poll`
 Check task status or retrieve result.
 
@@ -149,13 +169,29 @@ Read full or partial output from a previous agent run.
 Only reads files within the orchestra output directory.
 
 ### `agent_status`
-Check Codex/Gemini CLI availability on a host.
+Check Codex/Gemini/OpenCode/Claude CLI availability on a host.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `host` | string | no | Host to check (default: local host) |
 
 Returns CLI version info and recent output files.
+
+### `install_agent`
+Install a CLI agent (opencode/codex/gemini/claude) on a remote host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name from fleet topology |
+| `agent` | string | yes | Agent to install: `opencode`, `codex`, `gemini`, or `claude` |
+| `force` | bool | no | Skip confirmation and install anyway (default: false) |
+
+Checks system requirements before installation:
+- Disk space (needs ~500MB)
+- Architecture (x86_64 or arm64)
+- Required tools (curl for opencode, npm for others)
+
+Returns installation result with status and version info.
 
 ## Auto-Promote Behavior
 

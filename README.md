@@ -27,7 +27,7 @@ Maestro gives your AI agent the same mental model you have: named hosts, persist
 - **Multi-line scripts** — `script` pipes scripts via `bash -s` or PowerShell stdin
 - **File operations** — `read`, `write`, and `transfer` (SCP) across any host
 - **Fleet status** — one-command health check across all hosts with auto-reconnection
-- **Agent orchestra** *(optional)* — dispatch [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) as async background tasks with budget caps, output pagination, and polling
+- **Agent orchestra** *(optional)* — dispatch [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenCode CLI](https://opencode.ai) as async background tasks with budget caps, output pagination, and polling
 - **Remote access** *(optional)* — OAuth 2.1 with PIN-gated consent for exposing Maestro over HTTP (e.g., from Claude.ai via Cloudflare Tunnel). Not needed for stdio usage with Codex CLI, Claude Code, or Claude Desktop
 
 ---
@@ -192,7 +192,10 @@ Point the MCP connector to your tunnel URL. OAuth consent is handled automatical
 | `claude` | Run Claude Code with inline-or-background auto-promote |
 | `codex` | Run OpenAI Codex CLI with inline-or-background auto-promote |
 | `gemini` | Run Gemini CLI with `approval_mode` and `resume` support |
+| `opencode` | Run OpenCode CLI with `session_id`, model selection, and JSON format |
+| `opencode_sessions` | List previous OpenCode CLI sessions on a host |
 | `gemini_sessions` | List previous Gemini CLI sessions on a host |
+| `install_agent` | Install a CLI agent (opencode/codex/gemini/claude) on a remote host |
 | `poll` | Check status of an auto-promoted task |
 | `read_output` | Read full or partial output from a completed task |
 | `agent_status` | Check which CLI agents are available on a host |
