@@ -249,7 +249,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
-        """Check Codex/Gemini CLI availability on a host."""
+        """Check Codex/Gemini/OpenCode CLI availability on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
 
@@ -258,6 +258,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
         gemini_rc, gemini_out = await _orchestra_run_cli(
             h, "gemini --version 2>&1", timeout=10
+        )
+        opencode_rc, opencode_out = await _orchestra_run_cli(
+            h, "opencode --version 2>&1", timeout=10
         )
 
         output_dir = _orchestra_output_dir()
@@ -275,6 +278,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 "gemini": {
                     "available": gemini_rc == 0,
                     "output": gemini_out.strip()[:200],
+                },
+                "opencode": {
+                    "available": opencode_rc == 0,
+                    "output": opencode_out.strip()[:200],
                 },
                 "output_dir": str(output_dir),
                 "recent_outputs": [
