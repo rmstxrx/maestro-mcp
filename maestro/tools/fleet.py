@@ -485,7 +485,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+            cli_cmd = f"export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
             logger.info(f"Orchestra: codex on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(
                 host, cli_cmd, timeout=timeout, cwd=working_dir
@@ -507,7 +507,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         """List previous Gemini CLI sessions on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
-        rc, out = await _orchestra_run_cli(h, "gemini --list-sessions", timeout=15)
+        rc, out = await _orchestra_run_cli(
+            h,
+            "export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; gemini --list-sessions",
+            timeout=15,
+        )
         return out
 
     @mcp.tool()
@@ -516,7 +520,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
         rc, out = await _orchestra_run_cli(
-            h, "opencode session list --format json", timeout=15
+            h,
+            "export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; opencode session list --format json",
+            timeout=15,
         )
         return out
 
@@ -540,7 +546,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             session_flag = f"-s {shlex.quote(session_id)} " if session_id else ""
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"opencode run {escaped_prompt} --format json {model_flag}{session_flag}"
+            cli_cmd = f"export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; opencode run {escaped_prompt} --format json {model_flag}{session_flag}"
             logger.info(f"Orchestra: opencode on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(
                 host, cli_cmd, timeout=timeout, cwd=working_dir
@@ -590,7 +596,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
 
             cli_cmd = (
-                f"gemini -p {shlex.quote(full_prompt)} --output-format json "
+                f"export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; gemini -p {shlex.quote(full_prompt)} --output-format json "
                 f"{model_flag}{approval_flag}{resume_flag}"
             )
 
@@ -664,7 +670,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             escaped_prompt = shlex.quote(scoped_prompt)
             escaped_tools = shlex.quote(allowed_tools)
             cli_cmd = (
-                f"claude -p {escaped_prompt} --output-format json "
+                f"export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; claude -p {escaped_prompt} --output-format json "
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools}"
             )
