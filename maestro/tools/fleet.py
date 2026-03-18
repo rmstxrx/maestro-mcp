@@ -55,6 +55,31 @@ logger = logging.getLogger("maestro")
 _CONFIG: MaestroConfig | None = None
 
 
+def _inject_poll_verification(task_id: str, host: str, agent: str, result_json: str | None) -> str:
+    """Inject host verification metadata into a completed task result.
+
+    Defense against BUG-0001 (cross-host task leakage): when the MCP transport
+    layer misroutes a poll response, the ``_verify_host`` field lets the caller
+    detect the mismatch immediately rather than silently consuming wrong output.
+    """
+    result = result_json or ""
+    verification = {
+        "_verify_host": host,
+        "_verify_task_id": task_id,
+        "_verify_agent": agent,
+    }
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, dict):
+            merged = dict(parsed)
+            merged.update(verification)
+            return json.dumps(merged, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    verification["output"] = result
+    return json.dumps(verification, ensure_ascii=False)
+
+
 def register_tools(mcp: object, config: MaestroConfig) -> None:
     """Register all fleet + orchestra tools on the given FastMCP instance."""
     global _CONFIG
@@ -83,8 +108,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 if sudo:
                     parts.append("sudo")
                 parts.append(command)
-                return await _local_run(" ".join(parts), timeout=timeout, cwd=cwd)
-            return await _ssh_run(host, [_wrap_command(cfg, command, cwd, sudo)], timeout=timeout)
+                raw = await _local_run(" ".join(parts), timeout=timeout, cwd=cwd)
+            else:
+                raw = await _ssh_run(host, [_wrap_command(cfg, command, cwd, sudo)], timeout=timeout)
+            return json.dumps({"_host": host, "_agent": "exec", "output": raw})
 
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
@@ -105,7 +132,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         async def _execute() -> str:
             cfg = _resolve_host(host)
             if cfg.is_local:
-                return await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+                raw = await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+                return json.dumps({"_host": host, "_agent": "script", "output": raw})
             lines = []
             if cfg.shell == HostShell.POWERSHELL:
                 lines.append("$ErrorActionPreference = 'Stop'")
@@ -121,7 +149,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 lines.append(script)
                 stdin_body = "\n".join(lines)
                 interpreter = ["sudo", "bash", "-s"] if sudo else ["bash", "-s"]
-            return await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
+            raw = await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
+            return json.dumps({"_host": host, "_agent": "script", "output": raw})
 
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
@@ -431,7 +460,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if ts is None:
             return json.dumps({"error": f"Task '{task_id}' not found"})
         if ts.status != "running":
-            return ts.result_json
+            return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
 
         if wait > 0:
             try:
@@ -444,7 +473,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             if ts is None:
                 return json.dumps({"error": f"Task '{task_id}' not found"})
             if ts.status != "running":
-                return ts.result_json
+                return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
         else:
             ctx = get_client_context()
             cooldown = ctx.profile["poll_cooldown"]
@@ -453,6 +482,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             if ts.last_polled_at > 0 and since_last < cooldown:
                 return json.dumps({
                     "status": "cooldown", "task_id": task_id,
+                    "host": ts.host,
                     "retry_after": round(cooldown - since_last, 1),
                 })
             ts.last_polled_at = now

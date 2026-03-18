@@ -142,6 +142,9 @@ async def _task_lookup(task_id: str) -> dict | None:
 
     result["task_id"] = task_id
     result["status"] = ts.status
+    result["_verify_host"] = ts.host
+    result["_verify_task_id"] = task_id
+    result["_verify_agent"] = ts.agent
     return result
 
 
