@@ -10,6 +10,7 @@ import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from maestro.client import get_client_context
 from maestro.config import MaestroConfig
@@ -47,6 +48,7 @@ from maestro.transport import (
     _scp_run,
     _ssh_run,
     _structured_error,
+    _teardown_connection,
     _warmup_connection,
 )
 
@@ -259,6 +261,98 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             "available": connected,
             "total": len(HOSTS),
         })
+
+    @mcp.tool()
+    async def reconnect_host(host: str) -> str:
+        """Reconnect to a host by tearing down the ControlMaster socket and warming up a fresh connection. Use when a host shows as disconnected or commands fail with transport errors."""
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+        if cfg.is_local:
+            return json.dumps({"host": host, "status": "local", "message": "Local host needs no reconnection"})
+
+        await _teardown_connection(cfg.alias)
+        await asyncio.sleep(1)
+        success = await _warmup_connection(cfg.alias)
+        if success:
+            await _update_host_status(host, HostStatus.CONNECTED)
+            return json.dumps({"host": host, "status": "connected", "message": "Reconnection successful"}, indent=2)
+        else:
+            await _update_host_status(host, HostStatus.DISCONNECTED)
+            return json.dumps({"host": host, "status": "failed", "hint": "Try again, or check if the host is online"}, indent=2)
+
+    @mcp.tool()
+    async def list_ssh_hosts() -> str:
+        """List all hosts defined in ~/.ssh/config. Use for discovering available SSH hosts before adding them to the fleet. Read-only — does not modify any configuration."""
+        from maestro.hosts import _list_ssh_config_hosts
+        ssh_hosts = _list_ssh_config_hosts()
+        existing_aliases = {cfg.alias for cfg in HOSTS.values()}
+        result = []
+        for host in ssh_hosts:
+            for alias in host.get("aliases", []):
+                if alias == "*":
+                    continue
+                result.append({
+                    "alias": alias,
+                    "hostname": host.get("hostname", alias),
+                    "port": host.get("port", 22),
+                    "user": host.get("user", ""),
+                    "in_fleet": alias in existing_aliases,
+                })
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    async def add_host(
+        name: str, alias: str, description: str = "",
+        remote_cli: str = "codex", is_local: bool = False,
+    ) -> str:
+        """Add a new host to the fleet by writing to hosts.yaml and hot-reloading. IMPORTANT: This modifies the fleet configuration file. You MUST describe the proposed change and get explicit user approval before calling this tool. No password or key parameters — authentication is handled by ~/.ssh/config and SSH agent."""
+        from maestro.hosts import _find_hosts_config, _parse_ssh_config, RemoteCLI, init_hosts
+        import yaml
+
+        if name in HOSTS:
+            return json.dumps({"error": f"Host '{name}' already exists in fleet"})
+
+        try:
+            remote_cli_enum = RemoteCLI(remote_cli.lower())
+        except ValueError:
+            return json.dumps({"error": f"Invalid remote_cli '{remote_cli}'. Valid: codex, gemini, claude"})
+
+        if not is_local:
+            ssh_config = _parse_ssh_config(alias)
+            if not ssh_config.get("hostname"):
+                return json.dumps({"error": f"Alias '{alias}' not found in ~/.ssh/config or has no hostname"})
+
+        hosts_path = _find_hosts_config()
+        if hosts_path is None:
+            hosts_path = Path(__file__).resolve().parent.parent / "hosts.yaml"
+
+        try:
+            if hosts_path.exists():
+                with open(hosts_path) as f:
+                    raw = yaml.safe_load(f) or {}
+            else:
+                raw = {"hosts": {}}
+            if "hosts" not in raw:
+                raw["hosts"] = {}
+
+            entry: dict[str, Any] = {"alias": alias, "description": description}
+            if is_local:
+                entry["is_local"] = True
+            if remote_cli_enum != RemoteCLI.CODEX:
+                entry["remote_cli"] = remote_cli_enum.value
+            raw["hosts"][name] = entry
+
+            hosts_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(hosts_path, "w") as f:
+                yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+
+            init_hosts(hosts_path)
+
+            return json.dumps({"success": True, "message": f"Added host '{name}' to {hosts_path}", "host": entry}, indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to add host: {e}"})
 
     # --- Orchestra tools ---
 
