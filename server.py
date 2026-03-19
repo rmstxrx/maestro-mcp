@@ -221,18 +221,10 @@ mcp = FastMCP(
 # Register routes and tools
 @mcp.custom_route("/approve", methods=["GET", "POST"])
 async def _approve_route(request: Request) -> Response:
-    # Security: consent PIN submission must occur over secure channels only.
-    cf_ray = request.headers.get("cf-ray")
-    client_host = request.client.host if request.client else ""
-    is_localhost = client_host in ("127.0.0.1", "::1", "localhost")
-    if request.method == "POST" and not cf_ray and not is_localhost:
-        return Response(
-            content="PIN submission is only available over HTTPS (via Cloudflare tunnel) "
-                    "or from localhost. Direct LAN access is blocked to prevent "
-                    "plaintext PIN exposure.",
-            status_code=403,
-            media_type="text/plain",
-        )
+    # /approve is the normal OAuth consent flow — must be accessible from
+    # LAN clients (Claude Desktop, etc.). PIN security relies on rate limiting
+    # and HMAC comparison in the handler itself, not transport restrictions.
+    # Only /admin/rotate-pin is locked to HTTPS/localhost.
     return await _oauth_provider.handle_approve(request)
 
 @mcp.custom_route("/admin/rotate-pin", methods=["GET", "POST"])
