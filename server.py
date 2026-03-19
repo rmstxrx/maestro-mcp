@@ -221,10 +221,37 @@ mcp = FastMCP(
 # Register routes and tools
 @mcp.custom_route("/approve", methods=["GET", "POST"])
 async def _approve_route(request: Request) -> Response:
+    # Security: consent PIN submission must occur over secure channels only.
+    cf_ray = request.headers.get("cf-ray")
+    client_host = request.client.host if request.client else ""
+    is_localhost = client_host in ("127.0.0.1", "::1", "localhost")
+    if request.method == "POST" and not cf_ray and not is_localhost:
+        return Response(
+            content="PIN submission is only available over HTTPS (via Cloudflare tunnel) "
+                    "or from localhost. Direct LAN access is blocked to prevent "
+                    "plaintext PIN exposure.",
+            status_code=403,
+            media_type="text/plain",
+        )
     return await _oauth_provider.handle_approve(request)
 
 @mcp.custom_route("/admin/rotate-pin", methods=["GET", "POST"])
 async def _rotate_pin_route(request: Request) -> Response:
+    # Security: PIN rotation must only occur over secure channels.
+    # Allow if: (1) request came through Cloudflare tunnel (CF-Ray header = TLS),
+    # or (2) request is from localhost (loopback, no network exposure).
+    # Reject LAN/direct HTTP requests where the PIN would travel in plaintext.
+    cf_ray = request.headers.get("cf-ray")
+    client_host = request.client.host if request.client else ""
+    is_localhost = client_host in ("127.0.0.1", "::1", "localhost")
+    if not cf_ray and not is_localhost:
+        return Response(
+            content="PIN rotation is only available over HTTPS (via Cloudflare tunnel) "
+                    "or from localhost. Direct LAN access is blocked to prevent "
+                    "plaintext PIN exposure.",
+            status_code=403,
+            media_type="text/plain",
+        )
     return await _oauth_provider.handle_rotate_pin(request)
 
 @mcp.custom_route("/transfer/push", methods=["POST"])
