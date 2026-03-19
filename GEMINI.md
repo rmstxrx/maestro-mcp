@@ -71,6 +71,16 @@ gemini -p "Use maestro read to get the last 50 lines of /var/log/syslog on apoll
 gemini -p "Use maestro transfer to upload ./src/main.py to ~/workspace/main.py on judas."
 ```
 
+### Discover SSH hosts
+```bash
+gemini -p "Use maestro list_ssh_hosts to show available SSH hosts and which are already in the fleet."
+```
+
+### Reconnect a host
+```bash
+gemini -p "Use maestro reconnect_host to reset the SSH connection to eden."
+```
+
 ---
 
 ## Agent Orchestra
@@ -108,8 +118,22 @@ gemini -p "Use the maestro gemini_sessions tool on host apollyon to list availab
 ```
 
 ### Poll a dispatched task
+
+For immediate status:
 ```bash
 gemini -p "Use maestro poll with task_id '<id>' and report the result."
+```
+
+For long-running tasks, prefer the HTTP endpoint via bash (immune to BUG-0001):
+```bash
+gemini --approval-mode yolo -p "
+Call maestro prepare_relay, then use bash to poll the task result:
+  for i in \$(seq 1 40); do
+    HTTP_CODE=\$(curl -s -o /tmp/result.json -w '%{http_code}' -H 'Authorization: Bearer \$RELAY_KEY' 'https://maestro.rmstxrx.dev/tasks/TASK_ID/result')
+    [ \"\$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break
+    sleep 15
+  done
+"
 ```
 
 ---
@@ -118,7 +142,28 @@ gemini -p "Use maestro poll with task_id '<id>' and report the result."
 
 - **Token budget:** Every maestro tool response enters Gemini's context window.
   Use `exec` with `grep`/`head`/`tail` instead of `read` on large files.
+- **Use `prepare_relay` + curl for task results** — zero context cost.
 - **Headless for scripting:** Use `gemini -p "..."` for automation; interactive
   mode for exploratory work.
 - **Sensitive data:** Never commit `hosts.yaml` or `.env`. They are gitignored
   by default.
+
+---
+
+## Tool Quick Reference
+
+| Tool | Purpose |
+|------|---------|
+| `exec` | Run a command on a host |
+| `script` | Run a multi-line script |
+| `read` / `write` | File operations |
+| `transfer` | SCP file transfer |
+| `status` | Fleet connectivity check |
+| `reconnect_host` | Reset SSH connection to a host |
+| `list_ssh_hosts` | Discover hosts from ~/.ssh/config |
+| `add_host` | Add host to fleet (requires approval) |
+| `codex` / `gemini` / `claude` | Dispatch to agent CLI |
+| `poll` | Check task status |
+| `read_output` | Read agent output file |
+| `prepare_relay` | Get ephemeral relay token |
+| `agent_status` | Check CLI availability |

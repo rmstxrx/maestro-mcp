@@ -78,6 +78,43 @@ Returns structured JSON:
 
 Status values: `"connected"`, `"reconnected"`, `"offline"`.
 
+### `reconnect_host`
+Reconnect to a host by tearing down the ControlMaster socket and warming up a fresh connection.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name |
+
+Use when a host shows as disconnected or commands fail with transport errors. For local hosts, returns immediately (no SSH needed).
+
+### `list_ssh_hosts`
+List all hosts defined in `~/.ssh/config`.
+
+No parameters. Read-only — does not modify any configuration.
+
+Returns JSON array:
+```json
+[
+  {"alias": "eden", "hostname": "eden.home", "port": 22, "user": "romul", "in_fleet": true},
+  {"alias": "myserver", "hostname": "10.0.0.5", "port": 22, "user": "", "in_fleet": false}
+]
+```
+
+Use for discovering available SSH hosts before adding them to the fleet.
+
+### `add_host`
+Add a new host to the fleet by writing to `hosts.yaml` and hot-reloading.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Fleet name for the host (e.g. "eden") |
+| `alias` | string | yes | SSH alias from `~/.ssh/config` |
+| `description` | string | no | Human-readable description |
+| `remote_cli` | string | no | Default agent CLI: `"codex"`, `"gemini"`, or `"claude"` (default: `"codex"`) |
+| `is_local` | bool | no | Mark as local hub host (default: false) |
+
+**Requires user approval.** The alias must exist in `~/.ssh/config` (unless `is_local=true`). No password or key parameters — authentication is handled by SSH config and SSH agent.
+
 ## Orchestra Tools
 
 ### `codex`
@@ -133,11 +170,23 @@ Check task status or retrieve result.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task_id` | string | yes | Task ID from a dispatch/auto-promote response |
-| `wait` | int | no | Seconds to long-poll for completion before returning (default: 0) |
+| `wait` | int | no | Polling mode selector (default: 0) |
 
-Returns the task result if complete, or status info if still running.
-When `wait=0`, polls are subject to the per-client cooldown (remote: 10s, local: 2s, lan: 5s).
-When `wait>0`, `poll` waits up to that many seconds and never returns a cooldown response.
+**`wait=0` (default):** Returns immediate status. Subject to per-client cooldown (remote: 10s, local: 2s, lan: 5s). Returns task result if complete.
+
+**`wait>0`:** Returns the HTTP endpoint URL and curl pattern instead of blocking. This is the **BUG-0001 safe path** — actual result retrieval happens via `bash_tool` + `curl` through a separate HTTP request-response cycle, immune to MCP SSE session multiplexing issues.
+
+Example response for `wait>0`:
+```json
+{
+  "status": "use_http_endpoint",
+  "task_id": "abc123",
+  "endpoint": "/tasks/abc123/result",
+  "method": "GET",
+  "auth": "Bearer <relay_key> (call prepare_relay first)",
+  "hint": "Use bash_tool with curl loop for safe polling..."
+}
+```
 
 ### `read_output`
 Read full or partial output from a previous agent run.
