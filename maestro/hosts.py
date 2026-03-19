@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import shlex
 import time
 import yaml
@@ -10,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class HostStatus(Enum):
@@ -24,12 +28,19 @@ class HostShell(Enum):
     POWERSHELL = "powershell"
 
 
+class RemoteCLI(Enum):
+    CODEX = "codex"
+    GEMINI = "gemini"
+    CLAUDE = "claude"
+
+
 @dataclass
 class HostConfig:
     alias: str
     display_name: str
     description: str
     shell: HostShell = HostShell.BASH
+    remote_cli: RemoteCLI = RemoteCLI.CODEX
     is_local: bool = False
     status: HostStatus = HostStatus.UNKNOWN
     last_check: float = 0.0
@@ -37,8 +48,120 @@ class HostConfig:
     allowed_dirs: list[str] = field(default_factory=list)
 
 
+def _parse_ssh_config(alias: str) -> dict[str, Any]:
+    """Parse ~/.ssh/config for a given Host alias.
+
+    Returns {hostname, port, user, key_path}.  Read-only discovery —
+    we do NOT use these values for connections (ControlMaster handles that).
+    Limitations: no Match, Include, or complex directives.
+    """
+    ssh_config_path = Path.home() / ".ssh" / "config"
+    if not ssh_config_path.exists():
+        return {}
+
+    result: dict[str, Any] = {}
+    in_block = False
+
+    with open(ssh_config_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            if stripped.lower().startswith("host "):
+                aliases = stripped.split()[1:]
+                in_block = alias in aliases
+                continue
+
+            if in_block:
+                parts = stripped.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                key, value = parts[0].lower(), parts[1]
+                if key == "hostname":
+                    result["hostname"] = value
+                elif key == "port":
+                    result["port"] = int(value)
+                elif key == "user":
+                    result["user"] = value
+                elif key == "identityfile":
+                    result["key_path"] = value
+
+    return result
+
+
+def _list_ssh_config_hosts() -> list[dict[str, Any]]:
+    """Enumerate all Host blocks in ~/.ssh/config.
+
+    Returns list of {aliases, hostname, port, user, key_path}.
+    Skips ``Host *`` entries.
+    """
+    ssh_config_path = Path.home() / ".ssh" / "config"
+    if not ssh_config_path.exists():
+        return []
+
+    hosts: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    with open(ssh_config_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            if stripped.lower().startswith("host "):
+                if current is not None:
+                    hosts.append(current)
+                aliases = stripped.split()[1:]
+                if aliases == ["*"]:
+                    current = None
+                    continue
+                current = {"aliases": aliases}
+                continue
+
+            if current is not None:
+                parts = stripped.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                key, value = parts[0].lower(), parts[1]
+                if key == "hostname":
+                    current["hostname"] = value
+                elif key == "port":
+                    current["port"] = int(value)
+                elif key == "user":
+                    current["user"] = value
+                elif key == "identityfile":
+                    current["key_path"] = value
+
+    if current is not None:
+        hosts.append(current)
+
+    return hosts
+
+
+def _find_hosts_config() -> Path | None:
+    """Search for hosts.yaml via environment variables.
+
+    Priority:
+      1. MAESTRO_HOSTS_PATH (explicit path)
+      2. MAESTRO_PROJECT_DIR/.maestro/hosts.yaml (project-level)
+      3. None (caller falls back to repo default)
+    """
+    if path := os.environ.get("MAESTRO_HOSTS_PATH"):
+        p = Path(path)
+        if p.exists():
+            return p
+    if proj_dir := os.environ.get("MAESTRO_PROJECT_DIR"):
+        p = Path(proj_dir) / ".maestro" / "hosts.yaml"
+        if p.exists():
+            return p
+    return None
+
+
 def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
     """Load host registry from hosts.yaml."""
+    if config_path is None:
+        config_path = _find_hosts_config()
     if config_path is None:
         config_path = Path(__file__).resolve().parent.parent / "hosts.yaml"
     if not config_path.exists():
@@ -66,11 +189,20 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
                 f"Invalid shell '{shell_str}' for host '{name}'. "
                 f"Valid options: {', '.join(s.value for s in HostShell)}"
             )
+        cli_str = cfg.get("remote_cli", "codex").lower()
+        try:
+            remote_cli = RemoteCLI(cli_str)
+        except ValueError:
+            raise SystemExit(
+                f"Invalid remote_cli '{cli_str}' for host '{name}'. "
+                f"Valid options: {', '.join(c.value for c in RemoteCLI)}"
+            )
         hosts[name] = HostConfig(
             alias=cfg["alias"],
             display_name=cfg.get("display_name", name),
             description=cfg.get("description", ""),
             shell=shell,
+            remote_cli=remote_cli,
             is_local=cfg.get("is_local", False),
             allowed_dirs=cfg.get("allowed_dirs", []),
         )
