@@ -11,6 +11,7 @@ import asyncio
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 
 from pydantic import AnyHttpUrl
@@ -73,6 +74,18 @@ logging.basicConfig(
 
 CONFIG = MaestroConfig.from_env()
 init_hosts()
+
+# Detect transport from sys.argv before module-level FastMCP construction
+_TRANSPORT = "streamable-http"
+if "--transport" in sys.argv:
+    _idx = sys.argv.index("--transport")
+    if _idx + 1 < len(sys.argv):
+        _TRANSPORT = sys.argv[_idx + 1]
+
+if _TRANSPORT == "stdio":
+    from maestro.client import set_stdio_mode
+    from maestro.hosts import _local_host_name as _get_local_name
+    set_stdio_mode(local_host_name=_get_local_name())
 
 _oauth_state_store = OAuthStateStore(CONFIG.oauth_state_path)
 _oauth_provider = MaestroOAuthProvider(
@@ -154,7 +167,29 @@ configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run, tas
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def _build_instructions() -> str:
+def _build_instructions(transport: str = "http") -> str:
+    if transport == "stdio":
+        from maestro.hosts import _local_host_name
+        local_name = _local_host_name()
+        local_desc = HOSTS[local_name].description if local_name and local_name in HOSTS else ""
+        remote_hosts = [f"  {name}: {cfg.description}" for name, cfg in HOSTS.items() if not cfg.is_local]
+        remote_block = "\n".join(remote_hosts) if remote_hosts else "  (none configured)"
+
+        return (
+            f"You are running locally on {local_name}"
+            + (f" ({local_desc})" if local_desc else "")
+            + ".\n\n"
+            "CRITICAL: Do NOT use Maestro exec/script/read/write to target " + (local_name or "this host") + ".\n"
+            "You have native tools (Bash, filesystem) that are faster and more capable.\n"
+            "Maestro will REJECT local-targeting commands from local agents.\n\n"
+            "Use Maestro ONLY for:\n"
+            "  - Remote fleet hosts (listed below)\n"
+            "  - Agent dispatch (codex, gemini, claude) to any host including local\n"
+            "  - Fleet status, agent_status, transfer, prepare_relay\n"
+            "  - poll, read_output (task registry operations)\n\n"
+            "Remote fleet hosts:\n" + remote_block
+        )
+
     dispatch_rule = "All dispatch tools return a task_id. Use poll(task_id) for results."
     host_list = ", ".join(HOSTS.keys())
     instructions = f"Hosts: {host_list}. {dispatch_rule}"
@@ -180,7 +215,7 @@ mcp = FastMCP(
         required_scopes=["maestro"],
     ),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    instructions=_build_instructions(),
+    instructions=_build_instructions(_TRANSPORT),
 )
 
 # Register routes and tools
