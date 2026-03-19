@@ -548,7 +548,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:
-        """Check task status or retrieve result. Use wait parameter (seconds) for long-poll. For zero-context-cost polling, use prepare_relay key with GET /tasks/{task_id}/result instead."""
+        """Check task status or retrieve result. For background tasks, prefer the HTTP endpoint via bash_tool + curl (immune to MCP transport mixup BUG-0001). poll(wait=0) returns immediate status. poll(wait>0) returns the HTTP endpoint URL and curl pattern instead of blocking."""
         async with _REGISTRY_LOCK:
             ts = TASK_REGISTRY.get(task_id)
         if ts is None:
@@ -557,17 +557,18 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
 
         if wait > 0:
-            try:
-                await asyncio.wait_for(ts._done_event.wait(), timeout=wait)
-            except asyncio.TimeoutError:
-                pass
-
-            async with _REGISTRY_LOCK:
-                ts = TASK_REGISTRY.get(task_id)
-            if ts is None:
-                return json.dumps({"error": f"Task '{task_id}' not found"})
-            if ts.status != "running":
-                return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
+            elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+            return json.dumps({
+                "status": "use_http_endpoint",
+                "task_id": task_id,
+                "agent": ts.agent,
+                "host": ts.host,
+                "elapsed_seconds": round(elapsed, 1),
+                "endpoint": f"/tasks/{task_id}/result",
+                "method": "GET",
+                "auth": "Bearer <relay_key> (call prepare_relay first)",
+                "hint": "Use bash_tool with curl loop for safe polling — immune to MCP transport mixup (BUG-0001). Example: for i in $(seq 1 40); do HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{http_code}' -H 'Authorization: Bearer $RELAY_KEY' 'https://maestro.rmstxrx.dev/tasks/{task_id}/result'); [ \"$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break; sleep 15; done",
+            }, indent=2)
         else:
             ctx = get_client_context()
             cooldown = ctx.profile["poll_cooldown"]
