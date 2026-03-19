@@ -69,6 +69,8 @@ def _parse_ssh_config(alias: str) -> dict[str, Any]:
                 continue
 
             if stripped.lower().startswith("host "):
+                if in_block:
+                    break  # First-match semantics: stop at next Host block
                 aliases = stripped.split()[1:]
                 in_block = alias in aliases
                 continue
