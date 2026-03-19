@@ -22,6 +22,7 @@ import logging
 import os
 import secrets
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -51,7 +52,16 @@ TOKEN_EXPIRY = 8 * 3600  # 8 hours
 REFRESH_TOKEN_EXPIRY = 30 * 86400  # 30 days
 AUTH_CODE_TTL = 300  # 5 minutes
 
-AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")
+_authorize_pin_hash: str | None = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")
+
+
+def get_pin_hash() -> str | None:
+    return _authorize_pin_hash
+
+
+def set_pin_hash(new_hash: str) -> None:
+    global _authorize_pin_hash
+    _authorize_pin_hash = new_hash
 
 
 def _audit(event: str, **kwargs: Any) -> None:
@@ -391,7 +401,7 @@ class MaestroOAuthProvider:
             )
             return HTMLResponse(_redirect_page(deny_url))
 
-        if AUTHORIZE_PIN_HASH:
+        if get_pin_hash():
             # Rate-limit failed PIN attempts globally
             now = time.time()
             self._pin_fail_timestamps = [
@@ -407,7 +417,7 @@ class MaestroOAuthProvider:
                 )
 
             pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-            if not hmac.compare_digest(pin_hash, AUTHORIZE_PIN_HASH):
+            if not hmac.compare_digest(pin_hash, get_pin_hash()):
                 self._pin_fail_timestamps.append(now)
                 client_ip = request.client.host if request.client else "unknown"
                 _audit("authorize_pin_rejected", client_id=pending["client_id"],
@@ -435,6 +445,122 @@ class MaestroOAuthProvider:
         # Use HTML redirect instead of bare 302 — more reliable through
         # Cloudflare Tunnel which can interfere with Location headers.
         return HTMLResponse(_redirect_page(redirect_url))
+
+    # --- /admin/rotate-pin ---
+
+    async def handle_rotate_pin(self, request: Request) -> Response:
+        """GET shows the rotation form. POST validates and rotates."""
+
+        if request.method == "GET":
+            return HTMLResponse(self._render_rotate_pin_page())
+
+        # POST handling
+        form = await request.form()
+        current_pin = str(form.get("current_pin", ""))
+        new_pin = str(form.get("new_pin", ""))
+        confirm_pin = str(form.get("confirm_pin", ""))
+
+        # Validation
+        current_hash = get_pin_hash()
+        if not current_hash:
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="No PIN is currently configured. Set MAESTRO_AUTHORIZE_PIN_HASH in .env and restart."))
+
+        # Rate-limit using same mechanism as consent page
+        now = time.time()
+        self._pin_fail_timestamps = [
+            t for t in self._pin_fail_timestamps
+            if now - t < self._PIN_FAIL_WINDOW
+        ]
+        if len(self._pin_fail_timestamps) >= self._PIN_FAIL_LIMIT:
+            _audit("pin_rotate_rate_limited")
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="Too many failed attempts. Try again in 5 minutes."))
+
+        # Verify current PIN
+        current_pin_hash = hashlib.sha256(current_pin.encode()).hexdigest()
+        if not hmac.compare_digest(current_pin_hash, current_hash):
+            self._pin_fail_timestamps.append(now)
+            _audit("pin_rotate_failed", reason="wrong_current_pin")
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="Current PIN is incorrect."))
+
+        # Validate new PIN
+        if not new_pin:
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="New PIN cannot be empty."))
+        if len(new_pin) < 4:
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="New PIN must be at least 4 characters."))
+        if new_pin != confirm_pin:
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="New PIN and confirmation do not match."))
+        if new_pin == current_pin:
+            return HTMLResponse(self._render_rotate_pin_page(
+                error="New PIN must be different from current PIN."))
+
+        # Rotate
+        new_hash = hashlib.sha256(new_pin.encode()).hexdigest()
+        set_pin_hash(new_hash)
+
+        # Persist to .env
+        env_path = Path(__file__).resolve().parent / ".env"
+        env_updated = False
+        if env_path.exists():
+            try:
+                lines = env_path.read_text().splitlines()
+                new_lines = []
+                for line in lines:
+                    if line.strip().startswith("MAESTRO_AUTHORIZE_PIN_HASH="):
+                        new_lines.append(f'MAESTRO_AUTHORIZE_PIN_HASH="{new_hash}"')
+                        env_updated = True
+                    else:
+                        new_lines.append(line)
+                if not env_updated:
+                    new_lines.append(f'MAESTRO_AUTHORIZE_PIN_HASH="{new_hash}"')
+                    env_updated = True
+                env_path.write_text("\n".join(new_lines) + "\n")
+            except OSError as e:
+                logger.warning(f"PIN rotated in memory but failed to persist to .env: {e}")
+
+        _audit("pin_rotated", persisted=env_updated)
+        logger.info("OAuth PIN rotated successfully (persisted=%s)", env_updated)
+
+        return HTMLResponse(self._render_rotate_pin_page(
+            success="PIN rotated successfully." + (" Saved to .env." if env_updated else " WARNING: Could not persist to .env — will revert on restart.")))
+
+    def _render_rotate_pin_page(self, error: str = "", success: str = "") -> str:
+        status_html = ""
+        if error:
+            status_html = f'<div style="background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;padding:12px;border-radius:8px;margin-bottom:16px">{html_mod.escape(error)}</div>'
+        elif success:
+            status_html = f'<div style="background:#f0fdf4;border:1px solid #86efac;color:#166534;padding:12px;border-radius:8px;margin-bottom:16px">{html_mod.escape(success)}</div>'
+
+        return f"""<!DOCTYPE html>
+<html><head><title>Maestro — Rotate PIN</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 420px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }}
+h2 {{ font-weight: 500; margin-bottom: 4px; }}
+p.sub {{ color: #666; font-size: 14px; margin-top: 0; }}
+label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; margin-top: 16px; }}
+input[type=password] {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 16px; box-sizing: border-box; }}
+button {{ margin-top: 20px; width: 100%; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer; }}
+button:hover {{ background: #1d4ed8; }}
+</style></head><body>
+<h2>Rotate PIN</h2>
+<p class="sub">Change the OAuth consent gate PIN. No restart required.</p>
+{status_html}
+<form method="POST">
+<label for="current_pin">Current PIN</label>
+<input type="password" id="current_pin" name="current_pin" required autofocus>
+<label for="new_pin">New PIN</label>
+<input type="password" id="new_pin" name="new_pin" required minlength="4">
+<label for="confirm_pin">Confirm new PIN</label>
+<input type="password" id="confirm_pin" name="confirm_pin" required minlength="4">
+<button type="submit">Rotate PIN</button>
+</form>
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
