@@ -57,6 +57,32 @@ logger = logging.getLogger("maestro")
 _CONFIG: MaestroConfig | None = None
 
 
+def _check_local_self_reference(host: str) -> str | None:
+    """Block stdio clients from targeting the local host with fleet I/O tools.
+
+    Returns an error JSON string if blocked, None if the command should proceed.
+    """
+    ctx = get_client_context()
+    if not hasattr(ctx, "client_type") or ctx.client_type != "stdio":
+        return None
+    try:
+        cfg = _resolve_host(host)
+    except ValueError:
+        return None  # let the tool handle the unknown host error
+    if not cfg.is_local:
+        return None
+    return json.dumps({
+        "error": "local_self_reference",
+        "host": host,
+        "blocked": True,
+        "message": (
+            f"You are running on {host}. Use your native Bash/filesystem "
+            f"tools for local commands — they are faster and more capable. "
+            f"Maestro fleet tools are for remote hosts only when using stdio transport."
+        ),
+    })
+
+
 def _inject_poll_verification(task_id: str, host: str, agent: str, result_json: str | None) -> str:
     """Inject host verification metadata into a completed task result.
 
@@ -95,6 +121,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a shell command on a host. Do NOT use this to invoke agent CLIs (claude, codex, gemini) — use the dedicated dispatch tools instead."""
+        if block := _check_local_self_reference(host):
+            return block
         try:
             _resolve_host(host)
         except ValueError as e:
@@ -123,6 +151,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a multi-line script on a host. Do NOT use this to invoke agent CLIs — use dedicated dispatch tools."""
+        if block := _check_local_self_reference(host):
+            return block
         try:
             _resolve_host(host)
         except ValueError as e:
@@ -162,6 +192,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def read(host: str, path: str, head: int | None = None, tail: int | None = None) -> str:
         """Read a file from a host. For large files, prefer exec + grep/head/sed to avoid context bloat."""
+        if block := _check_local_self_reference(host):
+            return block
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -187,6 +219,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     @mcp.tool()
     async def write(host: str, path: str, content: str, append: bool = False, sudo: bool = False) -> str:
         """Write content to a file on a host."""
+        if block := _check_local_self_reference(host):
+            return block
         try:
             cfg = _resolve_host(host)
         except ValueError as e:

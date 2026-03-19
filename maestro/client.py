@@ -34,17 +34,44 @@ CLIENT_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+STDIO_PROFILE: dict[str, Any] = {
+    "block_timeout_agent": 30,
+    "block_timeout_exec": 60,
+    "poll_cooldown": 2,
+}
+
 
 @dataclass
 class ClientContext:
     classification: str
     profile: dict[str, Any]
     client_id: str | None = None
+    client_type: str = ""
+    local_host: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.client_type:
+            self.client_type = self.classification
+
+
+# ---------------------------------------------------------------------------
+# stdio mode detection
+# ---------------------------------------------------------------------------
+
+_STDIO_MODE: bool = False
+_STDIO_LOCAL_HOST: str | None = None
+
+
+def set_stdio_mode(local_host_name: str | None = None) -> None:
+    """Flag this process as running in MCP stdio transport mode."""
+    global _STDIO_MODE, _STDIO_LOCAL_HOST
+    _STDIO_MODE = True
+    _STDIO_LOCAL_HOST = local_host_name
 
 
 _client_ctx: ContextVar[ClientContext] = ContextVar("_client_ctx")
 
-# Default context for stdio / non-HTTP usage
+# Default context for non-HTTP usage (when not in stdio mode)
 _DEFAULT_CTX = ClientContext(
     classification="local",
     profile=CLIENT_PROFILES["local"],
@@ -82,4 +109,11 @@ def set_client_context(request: Request) -> None:
 
 def get_client_context() -> ClientContext:
     """Get the current client context, falling back to local defaults."""
+    if _STDIO_MODE:
+        return ClientContext(
+            classification="stdio",
+            profile=STDIO_PROFILE,
+            client_type="stdio",
+            local_host=_STDIO_LOCAL_HOST,
+        )
     return _client_ctx.get(_DEFAULT_CTX)
