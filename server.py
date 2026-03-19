@@ -223,6 +223,10 @@ mcp = FastMCP(
 async def _approve_route(request: Request) -> Response:
     return await _oauth_provider.handle_approve(request)
 
+@mcp.custom_route("/admin/rotate-pin", methods=["GET", "POST"])
+async def _rotate_pin_route(request: Request) -> Response:
+    return await _oauth_provider.handle_rotate_pin(request)
+
 @mcp.custom_route("/transfer/push", methods=["POST"])
 async def _transfer_push(request: Request) -> Response:
     return await transfer_push(request)
