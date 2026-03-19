@@ -368,7 +368,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                     raw = yaml.safe_load(f) or {}
             else:
                 raw = {"hosts": {}}
-            if "hosts" not in raw:
+            if not isinstance(raw.get("hosts"), dict):
                 raw["hosts"] = {}
 
             entry: dict[str, Any] = {"alias": alias, "description": description}
@@ -601,7 +601,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 "endpoint": f"/tasks/{task_id}/result",
                 "method": "GET",
                 "auth": "Bearer <relay_key> (call prepare_relay first)",
-                "hint": "Use bash_tool with curl loop for safe polling — immune to MCP transport mixup (BUG-0001). Example: for i in $(seq 1 40); do HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{http_code}' -H 'Authorization: Bearer $RELAY_KEY' 'https://maestro.rmstxrx.dev/tasks/{task_id}/result'); [ \"$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break; sleep 15; done",
+                "hint": f"Use bash_tool with curl loop for safe polling — immune to MCP transport mixup (BUG-0001). Example: for i in $(seq 1 40); do HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{{http_code}}' -H 'Authorization: Bearer $RELAY_KEY' '{_CONFIG.issuer_url.rstrip('/')}/tasks/{task_id}/result'); [ \"$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break; sleep 15; done",
             }, indent=2)
         else:
             ctx = get_client_context()
