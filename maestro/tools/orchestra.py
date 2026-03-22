@@ -20,16 +20,8 @@ from maestro.config import MaestroConfig
 logger = logging.getLogger("maestro")
 
 AGENT_SCOPE_PREFIX = (
-    "SCOPE CONSTRAINTS (non-negotiable):\n"
-    "1. ONLY modify files and code directly related to the task below.\n"
-    "2. Do NOT refactor, clean up, or improve code outside the task scope.\n"
-    "3. Do NOT run tests unless explicitly asked.\n"
-    "4. Do NOT update existing documentation unless explicitly asked.\n"
-    "   Exception: update STATE.md if your changes significantly affect dev status.\n"
-    "5. When done, write a brief debrief to docs/journal/debriefs/YYYY-MM-DD_-_{task-slug}.md "
-    "with: task summary, files changed (1 sentence each), any surprises or decisions made.\n"
-    "6. If the task is ambiguous, do the MINIMUM viable interpretation.\n"
-    "7. For file naming rules, see ~/Development/General/docs/fleet-naming-convention.md.\n\n"
+    "MANDATORY: Read ~/Development/General/AGENTS.md before starting.\n"
+    "It contains conduct rules and pointers to fleet documentation you must follow.\n\n"
     "TASK:\n"
 )
 
