@@ -121,3 +121,7 @@ All configuration is via environment variables, typically loaded from `.env` by 
 ## Naming & Organization
 Follow the fleet naming convention: `~/Development/General/docs/fleet-naming-convention.md`.
 If in doubt, `cat` it via Maestro or read it locally.
+
+## Agent Conduct
+All dispatched agents must read `~/Development/General/AGENTS.md` before starting work.
+It contains fleet-wide conduct rules, file hygiene requirements, and pointers to fleet documentation.
