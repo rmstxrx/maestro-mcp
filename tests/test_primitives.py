@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 # Add project root to path so we can import modules
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import maestro.tools.fleet as fleet_tools
 from maestro.hosts import (
     HostConfig,
     HostShell,
@@ -419,6 +420,65 @@ class TestPollTool:
         assert result["result_url"] == "https://example.test/tasks/abc123/result"
         assert 89.0 <= result["elapsed_seconds"] <= 91.0
         assert "output_preview" not in result
+
+
+class TestDispatchGuard:
+    def test_agent_cli_pattern_blocks_and_allows_expected_commands(self):
+        blocked_codex = json.loads(
+            fleet_tools._check_agent_dispatch_bypass(
+                "codex -q --model o4-mini -p 'fix bug'"
+            )
+        )
+        blocked_gemini = json.loads(
+            fleet_tools._check_agent_dispatch_bypass("gemini -p 'analyze this'")
+        )
+        blocked_claude = json.loads(
+            fleet_tools._check_agent_dispatch_bypass(
+                "claude --model sonnet -p 'review code'"
+            )
+        )
+
+        assert blocked_codex["detected_agent"] == "codex"
+        assert blocked_gemini["detected_agent"] == "gemini"
+        assert blocked_claude["detected_agent"] == "claude"
+        assert fleet_tools._check_agent_dispatch_bypass("codex --version") is None
+        assert fleet_tools._check_agent_dispatch_bypass("which gemini") is None
+
+    @pytest.mark.asyncio
+    async def test_exec_blocks_raw_agent_dispatch_before_host_resolution(self, monkeypatch):
+        def _should_not_run(host):
+            raise AssertionError("host resolution should not happen for blocked dispatches")
+
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool(
+            "exec",
+            {"host": "test-host", "command": "codex -q --model o4-mini -p 'fix bug'"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["error"] == "agent_dispatch_bypass"
+        assert result["detected_agent"] == "codex"
+
+    @pytest.mark.asyncio
+    async def test_script_blocks_raw_agent_dispatch_before_host_resolution(self, monkeypatch):
+        def _should_not_run(host):
+            raise AssertionError("host resolution should not happen for blocked dispatches")
+
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool(
+            "script",
+            {"host": "test-host", "script": "gemini -p 'analyze this'"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["error"] == "agent_dispatch_bypass"
+        assert result["detected_agent"] == "gemini"
 
 
 # ---------------------------------------------------------------------------

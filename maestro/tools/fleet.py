@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,10 @@ from maestro.transport import (
 logger = logging.getLogger("maestro")
 
 _CONFIG: MaestroConfig | None = None
+_AGENT_CLI_PATTERNS = re.compile(
+    r"\b(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _check_local_self_reference(host: str) -> str | None:
@@ -79,6 +84,26 @@ def _check_local_self_reference(host: str) -> str | None:
             f"Maestro fleet tools are for remote hosts only when using stdio transport."
         ),
     })
+
+
+def _check_agent_dispatch_bypass(command: str) -> str | None:
+    """Block raw agent CLI dispatches that should use orchestra tools instead."""
+    match = _AGENT_CLI_PATTERNS.search(command)
+    if match is None:
+        return None
+    agent = match.group(1).lower()
+    return json.dumps({
+        "error": "agent_dispatch_bypass",
+        "blocked": True,
+        "detected_agent": agent,
+        "recommended_tool": agent,
+        "message": (
+            f"Detected a raw {agent} CLI dispatch with prompt/model flags. "
+            f"Use the {agent} dispatch tool instead so Maestro applies the scope prefix, "
+            f"records the task in the ledger, and builds the correct CLI arguments."
+        ),
+    })
+
 
 def _format_relative_time(ts: datetime, now: datetime | None = None) -> str:
     """Format a timestamp as a compact relative age string."""
@@ -107,6 +132,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a shell command on a host. Do NOT use this to invoke agent CLIs (claude, codex, gemini) — use the dedicated dispatch tools instead."""
         if block := _check_local_self_reference(host):
+            return block
+        if block := _check_agent_dispatch_bypass(command):
             return block
         try:
             _resolve_host(host)
@@ -138,6 +165,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a multi-line script on a host. Do NOT use this to invoke agent CLIs — use dedicated dispatch tools."""
         if block := _check_local_self_reference(host):
+            return block
+        if block := _check_agent_dispatch_bypass(script):
             return block
         try:
             _resolve_host(host)
