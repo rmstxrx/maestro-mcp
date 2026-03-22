@@ -6,8 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,14 +34,13 @@ from maestro.local import (
 )
 from maestro.tools.orchestra import (
     AGENT_SCOPE_PREFIX,
-    TASK_REGISTRY,
-    _REGISTRY_LOCK,
     _auto_promote,
     _extract_gemini_response,
     _orchestra_build_result,
     _orchestra_output_dir,
     _orchestra_output_path,
     _orchestra_run_cli,
+    get_task_ledger,
 )
 from maestro.transport import (
     _check_control_master,
@@ -55,6 +54,10 @@ from maestro.transport import (
 logger = logging.getLogger("maestro")
 
 _CONFIG: MaestroConfig | None = None
+_AGENT_CLI_PATTERNS = re.compile(
+    r"\b(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _check_local_self_reference(host: str) -> str | None:
@@ -83,29 +86,36 @@ def _check_local_self_reference(host: str) -> str | None:
     })
 
 
-def _inject_poll_verification(task_id: str, host: str, agent: str, result_json: str | None) -> str:
-    """Inject host verification metadata into a completed task result.
+def _check_agent_dispatch_bypass(command: str) -> str | None:
+    """Block raw agent CLI dispatches that should use orchestra tools instead."""
+    match = _AGENT_CLI_PATTERNS.search(command)
+    if match is None:
+        return None
+    agent = match.group(1).lower()
+    return json.dumps({
+        "error": "agent_dispatch_bypass",
+        "blocked": True,
+        "detected_agent": agent,
+        "recommended_tool": agent,
+        "message": (
+            f"Detected a raw {agent} CLI dispatch with prompt/model flags. "
+            f"Use the {agent} dispatch tool instead so Maestro applies the scope prefix, "
+            f"records the task in the ledger, and builds the correct CLI arguments."
+        ),
+    })
 
-    Defense against BUG-0001 (cross-host task leakage): when the MCP transport
-    layer misroutes a poll response, the ``_verify_host`` field lets the caller
-    detect the mismatch immediately rather than silently consuming wrong output.
-    """
-    result = result_json or ""
-    verification = {
-        "_verify_host": host,
-        "_verify_task_id": task_id,
-        "_verify_agent": agent,
-    }
-    try:
-        parsed = json.loads(result)
-        if isinstance(parsed, dict):
-            merged = dict(parsed)
-            merged.update(verification)
-            return json.dumps(merged, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    verification["output"] = result
-    return json.dumps(verification, ensure_ascii=False)
+
+def _format_relative_time(ts: datetime, now: datetime | None = None) -> str:
+    """Format a timestamp as a compact relative age string."""
+    current = now or datetime.now(timezone.utc)
+    seconds = max(int((current - ts).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 def register_tools(mcp: object, config: MaestroConfig) -> None:
@@ -122,6 +132,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a shell command on a host. Do NOT use this to invoke agent CLIs (claude, codex, gemini) — use the dedicated dispatch tools instead."""
         if block := _check_local_self_reference(host):
+            return block
+        if block := _check_agent_dispatch_bypass(command):
             return block
         try:
             _resolve_host(host)
@@ -146,12 +158,15 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="exec", host=host, prompt=command[:200],
+            client_class=ctx.classification,
         )
 
     @mcp.tool()
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
         """Run a multi-line script on a host. Do NOT use this to invoke agent CLIs — use dedicated dispatch tools."""
         if block := _check_local_self_reference(host):
+            return block
+        if block := _check_agent_dispatch_bypass(script):
             return block
         try:
             _resolve_host(host)
@@ -187,6 +202,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="script", host=host, prompt=script[:200],
+            client_class=ctx.classification,
         )
 
     @mcp.tool()
@@ -446,6 +462,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="codex", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("codex", tid),
             output_holder=output_holder,
         )
@@ -508,6 +525,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="gemini", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("gemini", tid),
             output_holder=output_holder,
         )
@@ -567,57 +585,69 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="claude", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("claude", tid),
             output_holder=output_holder,
         )
 
     @mcp.tool()
     async def prepare_relay() -> str:
-        """Prepare the file relay for use. Call once before using push/pull endpoints. Result is valid for 5 minutes."""
+        """Prepare the file relay for use. Call once before using push/pull endpoints. Result is valid for 1 hour."""
         import secrets as _s
         from maestro.relay import register_ephemeral_token as _reg
         v = _s.token_urlsafe(32)
-        _reg(v, ttl=300)
-        return json.dumps({"value": v, "ttl_seconds": 300})
+        _reg(v, ttl=3600)
+        return json.dumps({"value": v, "ttl_seconds": 3600})
 
     @mcp.tool()
-    async def poll(task_id: str, wait: int = 0) -> str:
-        """Check task status or retrieve result. For background tasks, prefer the HTTP endpoint via bash_tool + curl (immune to MCP transport mixup BUG-0001). poll(wait=0) returns immediate status. poll(wait>0) returns the HTTP endpoint URL and curl pattern instead of blocking."""
-        async with _REGISTRY_LOCK:
-            ts = TASK_REGISTRY.get(task_id)
-        if ts is None:
+    async def tasks(
+        status: str | None = None,
+        agent: str | None = None,
+        host: str | None = None,
+        last: int = 10,
+    ) -> str:
+        """List recent tasks from the task ledger."""
+        ledger = get_task_ledger()
+        if ledger is None:
+            return json.dumps({"error": "Task ledger is not configured"})
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "task_id": entry.task_id,
+                "agent": entry.agent,
+                "host": entry.host,
+                "status": entry.status,
+                "dispatched_at": _format_relative_time(entry.dispatched_at, now),
+                "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
+                "return_code": entry.return_code,
+                "output_file": entry.output_file,
+                "result_url": entry.result_url,
+            }
+            for entry in ledger.query(status=status, agent=agent, host=host, last=last)
+        ]
+        return json.dumps({"tasks": rows}, ensure_ascii=False)
+
+    @mcp.tool()
+    async def poll(task_id: str) -> str:
+        """Check task status. Returns metadata only — retrieve full results via result_url or read_output(output_file)."""
+        ledger = get_task_ledger()
+        if ledger is None:
+            return json.dumps({"error": "Task ledger is not configured"})
+        entry = ledger.get(task_id)
+        if entry is None:
             return json.dumps({"error": f"Task '{task_id}' not found"})
-        if ts.status != "running":
-            return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
-
-        if wait > 0:
-            elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
-            return json.dumps({
-                "status": "use_http_endpoint",
-                "task_id": task_id,
-                "agent": ts.agent,
-                "host": ts.host,
-                "elapsed_seconds": round(elapsed, 1),
-                "endpoint": f"/tasks/{task_id}/result",
-                "method": "GET",
-                "auth": "Bearer <relay_key> (call prepare_relay first)",
-                "hint": f"Use bash_tool with curl loop for safe polling — immune to MCP transport mixup (BUG-0001). Example: for i in $(seq 1 40); do HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{{http_code}}' -H 'Authorization: Bearer $RELAY_KEY' '{_CONFIG.issuer_url.rstrip('/')}/tasks/{task_id}/result'); [ \"$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break; sleep 15; done",
-            }, indent=2)
-        else:
-            ctx = get_client_context()
-            cooldown = ctx.profile["poll_cooldown"]
-            now = time.time()
-            since_last = now - ts.last_polled_at
-            if ts.last_polled_at > 0 and since_last < cooldown:
-                return json.dumps({
-                    "status": "cooldown", "task_id": task_id,
-                    "host": ts.host,
-                    "retry_after": round(cooldown - since_last, 1),
-                })
-            ts.last_polled_at = now
-
-        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
-        return json.dumps({
-            "task_id": task_id, "agent": ts.agent, "host": ts.host,
-            "status": "running", "elapsed_seconds": round(elapsed, 1),
-        })
+        result: dict[str, Any] = {
+            "task_id": entry.task_id,
+            "agent": entry.agent,
+            "host": entry.host,
+            "status": entry.status,
+            "dispatched_at": entry.dispatched_at.isoformat(),
+            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
+            "return_code": entry.return_code,
+            "output_file": entry.output_file,
+            "result_url": entry.result_url,
+        }
+        if entry.status == "running":
+            elapsed = (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds()
+            result["elapsed_seconds"] = round(elapsed, 1)
+        return json.dumps(result, ensure_ascii=False)

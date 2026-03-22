@@ -11,7 +11,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,7 @@ _REGISTRY_LOCK = asyncio.Lock()
 _EVICTION_TASK: asyncio.Task | None = None
 
 _REGISTRY_VERSION = 1
+_LEDGER_VERSION = 1
 
 
 class TaskRegistryStore:
@@ -139,13 +140,186 @@ class TaskRegistryStore:
         logger.info("task_registry: loaded %d tasks (%d orphaned)", loaded, orphaned)
 
 
+@dataclass
+class TaskLedgerEntry:
+    task_id: str
+    agent: str
+    host: str
+    prompt: str
+    status: str
+    client_class: str
+    dispatched_at: datetime
+    completed_at: datetime | None = None
+    return_code: int | None = None
+    output_file: str | None = None
+    result_url: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "agent": self.agent,
+            "host": self.host,
+            "prompt": self.prompt,
+            "status": self.status,
+            "client_class": self.client_class,
+            "dispatched_at": self.dispatched_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "return_code": self.return_code,
+            "output_file": self.output_file,
+            "result_url": self.result_url,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskLedgerEntry":
+        return cls(
+            task_id=data["task_id"],
+            agent=data["agent"],
+            host=data["host"],
+            prompt=data["prompt"],
+            status=data["status"],
+            client_class=data["client_class"],
+            dispatched_at=datetime.fromisoformat(data["dispatched_at"]),
+            completed_at=(
+                datetime.fromisoformat(data["completed_at"])
+                if data.get("completed_at")
+                else None
+            ),
+            return_code=data.get("return_code"),
+            output_file=data.get("output_file"),
+            result_url=data.get("result_url", ""),
+        )
+
+
+class TaskLedger:
+    """Persistent task metadata ledger."""
+
+    def __init__(self, path: Path, issuer_url: str) -> None:
+        self.path = path.expanduser()
+        self.issuer_url = issuer_url.rstrip("/")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._entries: dict[str, TaskLedgerEntry] = {}
+        self._load()
+
+    def record(self, entry: TaskLedgerEntry) -> None:
+        """Insert or replace a task ledger entry."""
+        if not entry.result_url:
+            entry.result_url = self._result_url(entry.task_id)
+        self._entries[entry.task_id] = entry
+        self._save()
+
+    def update(self, task_id: str, **fields: Any) -> None:
+        """Partially update an existing ledger entry."""
+        entry = self._entries.get(task_id)
+        if entry is None:
+            logger.warning("task_ledger: task %r not found for update", task_id)
+            return
+        for key, value in fields.items():
+            if not hasattr(entry, key):
+                continue
+            setattr(entry, key, value)
+        if not entry.result_url:
+            entry.result_url = self._result_url(task_id)
+        self._save()
+
+    def query(
+        self,
+        *,
+        status: str | None = None,
+        agent: str | None = None,
+        host: str | None = None,
+        last: int = 10,
+    ) -> list[TaskLedgerEntry]:
+        """Return recent ledger entries, filtered by exact-match fields."""
+        entries = list(self._entries.values())
+        if status is not None:
+            entries = [entry for entry in entries if entry.status == status]
+        if agent is not None:
+            entries = [entry for entry in entries if entry.agent == agent]
+        if host is not None:
+            entries = [entry for entry in entries if entry.host == host]
+        entries.sort(key=lambda entry: entry.dispatched_at, reverse=True)
+        return entries[: max(last, 0)]
+
+    def get(self, task_id: str) -> TaskLedgerEntry | None:
+        """Look up a single task by task ID."""
+        return self._entries.get(task_id)
+
+    def _save(self) -> None:
+        state = {
+            "version": _LEDGER_VERSION,
+            "saved_at": time.time(),
+            "tasks": {
+                task_id: entry.to_dict()
+                for task_id, entry in self._entries.items()
+            },
+        }
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            logger.warning("task_ledger: save failed: %s", exc)
+            tmp.unlink(missing_ok=True)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            logger.info("task_ledger: no state file at %s — starting fresh", self.path)
+            return
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("task_ledger: failed to parse %s: %s — starting fresh", self.path, exc)
+            return
+        if state.get("version") != _LEDGER_VERSION:
+            logger.warning("task_ledger: unsupported version — starting fresh")
+            return
+
+        loaded = orphaned = 0
+        orphaned_at = datetime.now(timezone.utc)
+        for task_id, data in state.get("tasks", {}).items():
+            try:
+                entry = TaskLedgerEntry.from_dict(data)
+                if entry.status == "running":
+                    entry.status = "orphaned"
+                    entry.completed_at = entry.completed_at or orphaned_at
+                    orphaned += 1
+                if not entry.result_url:
+                    entry.result_url = self._result_url(task_id)
+                self._entries[task_id] = entry
+                loaded += 1
+            except Exception as exc:
+                logger.warning("task_ledger: skip task %r: %s", task_id, exc)
+        logger.info("task_ledger: loaded %d tasks (%d orphaned)", loaded, orphaned)
+
+    def _prune(self, max_age_days: int = 30) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        stale = [
+            task_id
+            for task_id, entry in self._entries.items()
+            if (entry.completed_at or entry.dispatched_at) < cutoff
+        ]
+        for task_id in stale:
+            self._entries.pop(task_id, None)
+        if stale:
+            self._save()
+
+    def _result_url(self, task_id: str) -> str:
+        return f"{self.issuer_url}/tasks/{task_id}/result"
+
+
 _TASK_STORE: TaskRegistryStore | None = None
+_TASK_LEDGER: TaskLedger | None = None
 
 
 def _save_registry() -> None:
     """Persist registry to disk if a store is configured."""
     if _TASK_STORE is not None:
         _TASK_STORE.save()
+
+
+def get_task_ledger() -> TaskLedger | None:
+    """Return the configured task ledger, if any."""
+    return _TASK_LEDGER
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +351,12 @@ def configure_orchestra(
     async_run: Callable[..., Awaitable[tuple[int, str, str]]],
     is_transient_failure: Callable[[int, str], bool],
     task_store: TaskRegistryStore | None = None,
+    task_ledger: TaskLedger | None = None,
 ) -> None:
     global _CONFIG, _RESOLVE_HOST, _WRAP_COMMAND, _FORMAT_RESULT
     global _UPDATE_HOST_STATUS, _HOST_STATUS, _ENSURE_CONNECTION
-    global _TEARDOWN_CONNECTION, _ASYNC_RUN, _IS_TRANSIENT_FAILURE, _TASK_STORE
+    global _TEARDOWN_CONNECTION, _ASYNC_RUN, _IS_TRANSIENT_FAILURE
+    global _TASK_STORE, _TASK_LEDGER
     _CONFIG = config
     _RESOLVE_HOST = resolve_host
     _WRAP_COMMAND = wrap_command
@@ -192,6 +368,7 @@ def configure_orchestra(
     _ASYNC_RUN = async_run
     _IS_TRANSIENT_FAILURE = is_transient_failure
     _TASK_STORE = task_store
+    _TASK_LEDGER = task_ledger
 
 
 def _cfg() -> MaestroConfig:
@@ -330,6 +507,77 @@ def _orchestra_build_result(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+def _extract_return_code(result_json: str | None) -> int | None:
+    """Best-effort extraction of a return code from a task result payload."""
+    if not result_json:
+        return None
+    try:
+        parsed = json.loads(result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("return_code")
+    if isinstance(value, int):
+        return value
+    output = parsed.get("output")
+    if not isinstance(output, str):
+        return None
+    marker = "[exit code: "
+    if marker not in output:
+        return None
+    suffix = output.rsplit(marker, 1)[-1]
+    try:
+        return int(suffix.split("]", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_ledger_entry(
+    *,
+    task_id: str,
+    agent: str,
+    host: str,
+    prompt: str,
+    client_class: str,
+    dispatched_at: datetime,
+    output_file: Path | None,
+) -> None:
+    if _TASK_LEDGER is None:
+        return
+    _TASK_LEDGER.record(
+        TaskLedgerEntry(
+            task_id=task_id,
+            agent=agent,
+            host=host,
+            prompt=prompt[:200],
+            status="running",
+            client_class=client_class,
+            dispatched_at=dispatched_at,
+            output_file=str(output_file) if output_file else None,
+        )
+    )
+
+
+def _complete_ledger_entry(
+    *,
+    task_id: str,
+    status: str,
+    result_json: str | None,
+    output_file: Path | None,
+    completed_at: datetime,
+) -> None:
+    if _TASK_LEDGER is None:
+        return
+    _TASK_LEDGER.update(
+        task_id,
+        status=status,
+        completed_at=completed_at,
+        return_code=_extract_return_code(result_json),
+        output_file=str(output_file) if output_file else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI runners
 # ---------------------------------------------------------------------------
@@ -419,6 +667,7 @@ async def _auto_promote(
     agent: str,
     host: str,
     prompt: str,
+    client_class: str = "unknown",
     output_file_factory: Callable[[str], Path] | None = None,
     output_holder: list[Path | None] | None = None,
 ) -> str:
@@ -435,10 +684,47 @@ async def _auto_promote(
     if output_holder is not None:
         output_holder[0] = output_file
 
+    _record_ledger_entry(
+        task_id=task_id,
+        agent=agent,
+        host=host,
+        prompt=prompt,
+        client_class=client_class,
+        dispatched_at=started_at,
+        output_file=output_file,
+    )
+
     work_task = asyncio.create_task(execute_fn())
 
     if block_timeout < 0:
-        return await work_task
+        try:
+            result = await work_task
+        except asyncio.CancelledError:
+            _complete_ledger_entry(
+                task_id=task_id,
+                status="failed",
+                result_json=None,
+                output_file=output_file,
+                completed_at=datetime.now(timezone.utc),
+            )
+            raise
+        except Exception:
+            _complete_ledger_entry(
+                task_id=task_id,
+                status="failed",
+                result_json=None,
+                output_file=output_file,
+                completed_at=datetime.now(timezone.utc),
+            )
+            raise
+        _complete_ledger_entry(
+            task_id=task_id,
+            status="done",
+            result_json=result,
+            output_file=output_file,
+            completed_at=datetime.now(timezone.utc),
+        )
+        return result
 
     if block_timeout > 0:
         try:
@@ -446,9 +732,34 @@ async def _auto_promote(
                 asyncio.shield(work_task),
                 timeout=block_timeout,
             )
+            _complete_ledger_entry(
+                task_id=task_id,
+                status="done",
+                result_json=result,
+                output_file=output_file,
+                completed_at=datetime.now(timezone.utc),
+            )
             return result
         except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            _complete_ledger_entry(
+                task_id=task_id,
+                status="failed",
+                result_json=None,
+                output_file=output_file,
+                completed_at=datetime.now(timezone.utc),
+            )
+            raise
+        except Exception:
+            _complete_ledger_entry(
+                task_id=task_id,
+                status="failed",
+                result_json=None,
+                output_file=output_file,
+                completed_at=datetime.now(timezone.utc),
+            )
+            raise
 
     # Auto-promote: register as background task
     ts = TaskState(
@@ -481,6 +792,13 @@ async def _auto_promote(
         finally:
             ts.finished_at = datetime.now(timezone.utc)
             ts._done_event.set()
+            _complete_ledger_entry(
+                task_id=task_id,
+                status=ts.status,
+                result_json=ts.result_json,
+                output_file=ts.output_file,
+                completed_at=ts.finished_at,
+            )
             _save_registry()
 
     asyncio.create_task(_monitor())

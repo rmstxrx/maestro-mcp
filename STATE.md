@@ -1,38 +1,37 @@
 # STATE.md — maestro-mcp
 
-**Last Updated:** 2026-03-21
+**Last Updated:** 2026-03-22
 
 ---
 
 ## Current Focus
 
-Core feature work is complete through ADR-0005. The last development sprint (2026-03-19) delivered:
-- **ADR-0004:** Fork cherry-pick — fleet discovery tools (`reconnect_host`, `list_ssh_hosts`, `add_host`), SSH config parsing, poll() hardening for BUG-0001.
-- **ADR-0005:** Host-aware agent routing — stdio client classification, local self-reference guard on fleet I/O tools.
-- **PIN rotation:** `/admin/rotate-pin` endpoint with secure-channel guards.
-- **Security:** `/approve` POST restricted to HTTPS/localhost; `/admin/rotate-pin` locked down on all methods.
-
-Working tree has uncommitted housekeeping: docs renamed to fleet naming convention, old `journal/` files deleted (moved to `docs/journal/sessions/`), and an edit in `maestro/tools/orchestra.py`.
+Core feature work is now complete through ADR-0006 on the feature branch. The current branch implements:
+- **ADR-0006 Phase 1:** `prepare_relay()` TTL extended from 5 minutes to 1 hour.
+- **ADR-0006 Phase 2:** Persistent task ledger storage with dispatch/completion tracking and client attribution.
+- **ADR-0006 Phase 3:** New `tasks` tool for querying recent ledger entries.
+- **ADR-0006 Phase 4:** `poll()` rewritten as ledger-backed metadata only, with result retrieval pushed to HTTP or `read_output`.
+- **ADR-0006 Phase 5:** Dispatch guard blocking raw Codex/Gemini/Claude CLI usage through `exec` and `script`.
 
 ## Active Branches
 
 | Branch | Location | Status |
 |--------|----------|--------|
 | `main` | local + remote | Active development branch |
+| `feat/adr-0006-task-ledger` | local | ADR-0006 implementation branch |
 | `feat/adr-0004-0005-pin-rotation` | remote only | Feature branch — appears merged to main, candidate for deletion |
 
 ## Blockers
 
-- **Uncommitted working tree:** Renamed docs, deleted stale journal files, modified `CLAUDE.md` and `maestro/tools/orchestra.py` sitting unstaged. Needs a cleanup commit.
 - **TODO item 6:** Three F3 naming iteration commits (699f2b3 .. e117083) should be squashed before any public push. Status unknown — may already be in remote history.
 
 ## What's Next
 
-1. **Commit working tree cleanup** — stage the doc renames, journal moves, and orchestra.py changes.
+1. **Land ADR-0006 branch** — review and merge `feat/adr-0006-task-ledger` into `main`.
 2. **Remaining TODO items** (from `docs/TODO.md`):
    - Item 4: Set `MAESTRO_DEFAULT_REPO` in `.env` to a real path.
    - Item 6: Squash F3 naming commits if not already done.
    - Items 1–3, 5: Completed per commit history.
-3. **ADR-0005 status field** — ADR doc still says "Proposed" but implementation is merged. Update status to "Accepted" or "Implemented."
+3. **ADR status docs** — ADR-0005 and ADR-0006 documentation status fields still need follow-up when doc updates are in scope.
 4. **Delete stale remote branch** `feat/adr-0004-0005-pin-rotation` if fully merged.
-5. **Tests** — 54/54 passing as of last session. No new test gaps identified.
+5. **Tests** — 59/59 passing on the ADR-0006 branch after the final Phase 5 commit.
