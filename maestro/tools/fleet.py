@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import shlex
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,8 +33,6 @@ from maestro.local import (
 )
 from maestro.tools.orchestra import (
     AGENT_SCOPE_PREFIX,
-    TASK_REGISTRY,
-    _REGISTRY_LOCK,
     _auto_promote,
     _extract_gemini_response,
     _orchestra_build_result,
@@ -82,32 +79,6 @@ def _check_local_self_reference(host: str) -> str | None:
             f"Maestro fleet tools are for remote hosts only when using stdio transport."
         ),
     })
-
-
-def _inject_poll_verification(task_id: str, host: str, agent: str, result_json: str | None) -> str:
-    """Inject host verification metadata into a completed task result.
-
-    Defense against BUG-0001 (cross-host task leakage): when the MCP transport
-    layer misroutes a poll response, the ``_verify_host`` field lets the caller
-    detect the mismatch immediately rather than silently consuming wrong output.
-    """
-    result = result_json or ""
-    verification = {
-        "_verify_host": host,
-        "_verify_task_id": task_id,
-        "_verify_agent": agent,
-    }
-    try:
-        parsed = json.loads(result)
-        if isinstance(parsed, dict):
-            merged = dict(parsed)
-            merged.update(verification)
-            return json.dumps(merged, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    verification["output"] = result
-    return json.dumps(verification, ensure_ascii=False)
-
 
 def _format_relative_time(ts: datetime, now: datetime | None = None) -> str:
     """Format a timestamp as a compact relative age string."""
@@ -628,43 +599,26 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"tasks": rows}, ensure_ascii=False)
 
     @mcp.tool()
-    async def poll(task_id: str, wait: int = 0) -> str:
-        """Check task status or retrieve result. For background tasks, prefer the HTTP endpoint via bash_tool + curl (immune to MCP transport mixup BUG-0001). poll(wait=0) returns immediate status. poll(wait>0) returns the HTTP endpoint URL and curl pattern instead of blocking."""
-        async with _REGISTRY_LOCK:
-            ts = TASK_REGISTRY.get(task_id)
-        if ts is None:
+    async def poll(task_id: str) -> str:
+        """Check task status. Returns metadata only — retrieve full results via result_url or read_output(output_file)."""
+        ledger = get_task_ledger()
+        if ledger is None:
+            return json.dumps({"error": "Task ledger is not configured"})
+        entry = ledger.get(task_id)
+        if entry is None:
             return json.dumps({"error": f"Task '{task_id}' not found"})
-        if ts.status != "running":
-            return _inject_poll_verification(task_id, ts.host, ts.agent, ts.result_json)
-
-        if wait > 0:
-            elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
-            return json.dumps({
-                "status": "use_http_endpoint",
-                "task_id": task_id,
-                "agent": ts.agent,
-                "host": ts.host,
-                "elapsed_seconds": round(elapsed, 1),
-                "endpoint": f"/tasks/{task_id}/result",
-                "method": "GET",
-                "auth": "Bearer <relay_key> (call prepare_relay first)",
-                "hint": f"Use bash_tool with curl loop for safe polling — immune to MCP transport mixup (BUG-0001). Example: for i in $(seq 1 40); do HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{{http_code}}' -H 'Authorization: Bearer $RELAY_KEY' '{_CONFIG.issuer_url.rstrip('/')}/tasks/{task_id}/result'); [ \"$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break; sleep 15; done",
-            }, indent=2)
-        else:
-            ctx = get_client_context()
-            cooldown = ctx.profile["poll_cooldown"]
-            now = time.time()
-            since_last = now - ts.last_polled_at
-            if ts.last_polled_at > 0 and since_last < cooldown:
-                return json.dumps({
-                    "status": "cooldown", "task_id": task_id,
-                    "host": ts.host,
-                    "retry_after": round(cooldown - since_last, 1),
-                })
-            ts.last_polled_at = now
-
-        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
-        return json.dumps({
-            "task_id": task_id, "agent": ts.agent, "host": ts.host,
-            "status": "running", "elapsed_seconds": round(elapsed, 1),
-        })
+        result: dict[str, Any] = {
+            "task_id": entry.task_id,
+            "agent": entry.agent,
+            "host": entry.host,
+            "status": entry.status,
+            "dispatched_at": entry.dispatched_at.isoformat(),
+            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
+            "return_code": entry.return_code,
+            "output_file": entry.output_file,
+            "result_url": entry.result_url,
+        }
+        if entry.status == "running":
+            elapsed = (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds()
+            result["elapsed_seconds"] = round(elapsed, 1)
+        return json.dumps(result, ensure_ascii=False)

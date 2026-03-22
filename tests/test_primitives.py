@@ -381,6 +381,46 @@ class TestTasksTool:
         }
 
 
+class TestPollTool:
+    @pytest.mark.asyncio
+    async def test_returns_metadata_only_for_running_task(self, monkeypatch):
+        dispatched_at = datetime.now(timezone.utc) - timedelta(seconds=90)
+
+        class _Ledger:
+            def get(self, task_id):
+                assert task_id == "abc123"
+                return TaskLedgerEntry(
+                    task_id="abc123",
+                    agent="codex",
+                    host="test-host",
+                    prompt="Fix the issue",
+                    status="running",
+                    client_class="local",
+                    dispatched_at=dispatched_at,
+                    output_file="/tmp/output.txt",
+                    result_url="https://example.test/tasks/abc123/result",
+                )
+
+        monkeypatch.setattr("maestro.tools.fleet.get_task_ledger", lambda: _Ledger())
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool("poll", {"task_id": "abc123"})
+
+        result = json.loads(call_result["result"])
+        assert result["task_id"] == "abc123"
+        assert result["agent"] == "codex"
+        assert result["host"] == "test-host"
+        assert result["status"] == "running"
+        assert result["dispatched_at"] == dispatched_at.isoformat()
+        assert result["completed_at"] is None
+        assert result["return_code"] is None
+        assert result["output_file"] == "/tmp/output.txt"
+        assert result["result_url"] == "https://example.test/tasks/abc123/result"
+        assert 89.0 <= result["elapsed_seconds"] <= 91.0
+        assert "output_preview" not in result
+
+
 # ---------------------------------------------------------------------------
 # _auto_promote
 # ---------------------------------------------------------------------------
