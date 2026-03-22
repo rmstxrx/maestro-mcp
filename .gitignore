@@ -32,3 +32,4 @@ gptqmodel_offload/
 
 # Pytest
 .pytest_cache/
+hi.json

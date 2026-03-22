@@ -81,3 +81,10 @@ All configuration is via environment variables, typically loaded from `.env` by 
 4. **Python default parameter values are evaluated at definition time.** Constants used as defaults must be defined before the functions that reference them.
 5. **hosts.yaml is gitignored.** Use `hosts.example.yaml` as a template.
 6. **Transfer token derivation:** `import hmac,hashlib,time; hmac.new(SECRET.encode(),str(int(time.time())//86400).encode(),hashlib.sha256).hexdigest()`. The server accepts current and previous daily window.
+
+---
+
+## Naming & Organization
+Follow the fleet naming convention: `~/Development/General/docs/fleet-naming-convention.md`.
+If in doubt, `cat` it via Maestro or read it locally.
+
