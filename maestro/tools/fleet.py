@@ -42,6 +42,7 @@ from maestro.tools.orchestra import (
     _orchestra_output_dir,
     _orchestra_output_path,
     _orchestra_run_cli,
+    get_task_ledger,
 )
 from maestro.transport import (
     _check_control_master,
@@ -106,6 +107,19 @@ def _inject_poll_verification(task_id: str, host: str, agent: str, result_json: 
         pass
     verification["output"] = result
     return json.dumps(verification, ensure_ascii=False)
+
+
+def _format_relative_time(ts: datetime, now: datetime | None = None) -> str:
+    """Format a timestamp as a compact relative age string."""
+    current = now or datetime.now(timezone.utc)
+    seconds = max(int((current - ts).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 def register_tools(mcp: object, config: MaestroConfig) -> None:
@@ -584,6 +598,34 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         v = _s.token_urlsafe(32)
         _reg(v, ttl=3600)
         return json.dumps({"value": v, "ttl_seconds": 3600})
+
+    @mcp.tool()
+    async def tasks(
+        status: str | None = None,
+        agent: str | None = None,
+        host: str | None = None,
+        last: int = 10,
+    ) -> str:
+        """List recent tasks from the task ledger."""
+        ledger = get_task_ledger()
+        if ledger is None:
+            return json.dumps({"error": "Task ledger is not configured"})
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "task_id": entry.task_id,
+                "agent": entry.agent,
+                "host": entry.host,
+                "status": entry.status,
+                "dispatched_at": _format_relative_time(entry.dispatched_at, now),
+                "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
+                "return_code": entry.return_code,
+                "output_file": entry.output_file,
+                "result_url": entry.result_url,
+            }
+            for entry in ledger.query(status=status, agent=agent, host=host, last=last)
+        ]
+        return json.dumps({"tasks": rows}, ensure_ascii=False)
 
     @mcp.tool()
     async def poll(task_id: str, wait: int = 0) -> str:

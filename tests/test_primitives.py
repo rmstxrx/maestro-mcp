@@ -1,4 +1,5 @@
 """Tests for pure functions across maestro modules."""
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from maestro.transport import _is_transient_failure
 from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
+    TaskLedgerEntry,
     _REGISTRY_LOCK,
     _auto_promote,
     _orchestra_truncate,
@@ -322,6 +324,60 @@ class TestGeminiSessions:
         assert result == {
             "host": "test-host",
             "error": "gemini not installed",
+        }
+
+
+class TestTasksTool:
+    @pytest.mark.asyncio
+    async def test_returns_compact_filtered_rows(self, monkeypatch):
+        now = datetime.now(timezone.utc)
+
+        class _Ledger:
+            def query(self, *, status=None, agent=None, host=None, last=10):
+                assert status == "done"
+                assert agent == "codex"
+                assert host == "test-host"
+                assert last == 5
+                return [
+                    TaskLedgerEntry(
+                        task_id="abc123",
+                        agent="codex",
+                        host="test-host",
+                        prompt="Fix the issue",
+                        status="done",
+                        client_class="local",
+                        dispatched_at=now - timedelta(minutes=12),
+                        completed_at=now - timedelta(minutes=7),
+                        return_code=0,
+                        output_file="/tmp/output.txt",
+                        result_url="https://example.test/tasks/abc123/result",
+                    )
+                ]
+
+        monkeypatch.setattr("maestro.tools.fleet.get_task_ledger", lambda: _Ledger())
+
+        mcp = FastMCP("test")
+        register_tools(mcp, _config)
+        _, call_result = await mcp.call_tool(
+            "tasks",
+            {"status": "done", "agent": "codex", "host": "test-host", "last": 5},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result == {
+            "tasks": [
+                {
+                    "task_id": "abc123",
+                    "agent": "codex",
+                    "host": "test-host",
+                    "status": "done",
+                    "dispatched_at": "12m ago",
+                    "completed_at": (now - timedelta(minutes=7)).isoformat(),
+                    "return_code": 0,
+                    "output_file": "/tmp/output.txt",
+                    "result_url": "https://example.test/tasks/abc123/result",
+                }
+            ]
         }
 
 
