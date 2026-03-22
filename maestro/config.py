@@ -24,6 +24,7 @@ class MaestroConfig:
     task_eviction_seconds: int
     task_output_retention_seconds: int
     oauth_state_path: Path
+    task_ledger_path: Path
     trusted_client_ids: frozenset[str]
 
     @classmethod
@@ -53,6 +54,12 @@ class MaestroConfig:
             oauth_state_path=Path(
                 os.environ.get("MAESTRO_OAUTH_STATE_PATH",
                                str(Path.home() / ".maestro" / "oauth_state.json"))
+            ),
+            task_ledger_path=Path(
+                os.environ.get(
+                    "MAESTRO_TASK_LEDGER_PATH",
+                    str(Path.home() / ".maestro" / "task_ledger.json"),
+                )
             ),
             trusted_client_ids=frozenset(
                 c.strip()

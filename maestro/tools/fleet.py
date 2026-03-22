@@ -146,6 +146,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="exec", host=host, prompt=command[:200],
+            client_class=ctx.classification,
         )
 
     @mcp.tool()
@@ -187,6 +188,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="script", host=host, prompt=script[:200],
+            client_class=ctx.classification,
         )
 
     @mcp.tool()
@@ -446,6 +448,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="codex", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("codex", tid),
             output_holder=output_holder,
         )
@@ -508,6 +511,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="gemini", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("gemini", tid),
             output_holder=output_holder,
         )
@@ -567,6 +571,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _auto_promote(
             _execute, block_timeout=block_timeout,
             agent="claude", host=host, prompt=prompt,
+            client_class=ctx.classification,
             output_file_factory=lambda tid: _orchestra_output_path("claude", tid),
             output_holder=output_holder,
         )

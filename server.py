@@ -38,6 +38,7 @@ from maestro.relay import configure_relay, task_result, transfer_push, transfer_
 from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
+    TaskLedger,
     TaskRegistryStore,
     _REGISTRY_LOCK,
     cancel_eviction_loop,
@@ -105,6 +106,7 @@ configure_transport(
 configure_local(config=CONFIG, format_result=_format_result)
 _task_registry_store = TaskRegistryStore(CONFIG.oauth_state_path.parent / "task_registry.json")
 _task_registry_store.load()
+_task_ledger = TaskLedger(CONFIG.task_ledger_path, CONFIG.issuer_url)
 
 configure_orchestra(
     config=CONFIG, resolve_host=_resolve_host, wrap_command=_wrap_command,
@@ -113,6 +115,7 @@ configure_orchestra(
     teardown_connection=_teardown_connection, async_run=_async_run,
     is_transient_failure=_is_transient_failure,
     task_store=_task_registry_store,
+    task_ledger=_task_ledger,
 )
 
 async def _task_lookup(task_id: str) -> dict | None:
