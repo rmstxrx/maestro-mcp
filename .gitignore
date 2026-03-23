@@ -33,3 +33,6 @@ gptqmodel_offload/
 # Pytest
 .pytest_cache/
 hi.json
+
+# Docker (runtime state, not deployment files)
+apollyon-maestro-state-archive.tar.gz

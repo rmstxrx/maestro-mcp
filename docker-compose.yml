@@ -1,0 +1,40 @@
+services:
+  maestro:
+    build: .
+    container_name: maestro
+    restart: unless-stopped
+    ports:
+      - "8222:8222"
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../config/ssh:/mnt/ssh:ro
+      - ../config/hosts.yaml:/app/hosts.yaml:ro
+      - ../state:/root/.maestro
+
+  cloudflared:
+    build:
+      context: .
+      dockerfile: cloudflared.Dockerfile
+    container_name: maestro-cloudflared
+    restart: unless-stopped
+    volumes:
+      - ../config/cloudflared:/mnt/cloudflared:ro
+    network_mode: "service:maestro"
+    depends_on:
+      - maestro
+
+# ┌─────────────────────────────────────────────────────────┐
+# │ RESTART RULE                                            │
+# │                                                         │
+# │ cloudflared shares maestro's network namespace via      │
+# │ network_mode: "service:maestro". If maestro alone is    │
+# │ restarted, cloudflared's namespace reference goes       │
+# │ stale — all outbound connections fail silently.         │
+# │                                                         │
+# │ ALWAYS:  docker compose restart                         │
+# │ NEVER:   docker restart maestro                         │
+# │                                                         │
+# │ If cloudflared is broken after a maestro restart:       │
+# │   docker restart maestro-cloudflared                    │
+# └─────────────────────────────────────────────────────────┘

@@ -87,9 +87,30 @@ python server.py --transport stdio
 pytest tests/
 ```
 
+## Deployment (Cellar)
+
+Maestro runs as a Docker container on the Cellar (TrueNAS SCALE, 10.42.69.2).
+The Cellar is the fleet hub (`is_local: true`). All other hosts are SSH targets.
+
+```
+/volume2/docker/maestro/
+├── repo/          # git clone (Dockerfile, docker-compose.yml, source)
+├── config/        # .env, hosts.yaml, ssh/, cloudflared/
+└── state/         # Persistent: oauth_state.json, task_ledger.json, task_registry.json
+```
+
+```bash
+# Update + rebuild
+cd /volume2/docker/maestro/repo
+git pull && docker compose up -d --build
+
+# Restart (ALWAYS both containers)
+docker compose restart
+```
+
 ## Environment Variables
 
-All configuration is via environment variables, typically loaded from `.env` by systemd `EnvironmentFile`.
+All configuration is via environment variables, loaded from `.env` (on the Cellar: `/volume2/docker/maestro/config/.env`).
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -107,9 +128,9 @@ All configuration is via environment variables, typically loaded from `.env` by 
 
 ## Critical Rules
 
-1. **Don't kill the Maestro process** via Maestro tools — it terminates the connection with no recovery path.
-2. **`sudo systemctl restart maestro` drops the active OAuth session.** Wait 15–30s and poll `/.well-known/oauth-authorization-server` for HTTP 200 before issuing tool calls.
-3. **`MAESTRO_ISSUER_URL` must be set** before starting in HTTP mode. Without it, OAuth discovery advertises `localhost` and remote clients can't authenticate. Always start via systemd so `EnvironmentFile` is respected.
+1. **Don't kill the Maestro container** via Maestro tools — it terminates the connection with no recovery path. Maestro runs on the Cellar as a Docker container.
+2. **Always use `docker compose restart`** on the Cellar (never `docker restart maestro` alone). cloudflared shares maestro's network namespace — restarting maestro alone orphans cloudflared. Wait 15–30s and poll `/.well-known/oauth-authorization-server` for HTTP 200 before issuing tool calls.
+3. **`MAESTRO_ISSUER_URL` must be set** in the Cellar's config `.env`. Without it, OAuth discovery advertises `localhost` and remote clients can't authenticate. Deployment: `/volume2/docker/maestro/` on the Cellar (repo/, config/, state/).
 4. **Python default parameter values are evaluated at definition time.** Constants used as defaults must be defined before the functions that reference them.
 5. **hosts.yaml is gitignored.** Use `hosts.example.yaml` as a template.
 6. **Transfer token derivation:** `import hmac,hashlib,time; hmac.new(SECRET.encode(),str(int(time.time())//86400).encode(),hashlib.sha256).hexdigest()`. The server accepts current and previous daily window.

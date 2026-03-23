@@ -1,37 +1,56 @@
 # STATE.md — maestro-mcp
 
-**Last Updated:** 2026-03-22
+**Last Updated:** 2026-03-23
 
 ---
 
 ## Current Focus
 
-Core feature work is now complete through ADR-0006 on the feature branch. The current branch implements:
-- **ADR-0006 Phase 1:** `prepare_relay()` TTL extended from 5 minutes to 1 hour.
-- **ADR-0006 Phase 2:** Persistent task ledger storage with dispatch/completion tracking and client attribution.
-- **ADR-0006 Phase 3:** New `tasks` tool for querying recent ledger entries.
-- **ADR-0006 Phase 4:** `poll()` rewritten as ledger-backed metadata only, with result retrieval pushed to HTTP or `read_output`.
-- **ADR-0006 Phase 5:** Dispatch guard blocking raw Codex/Gemini/Claude CLI usage through `exec` and `script`.
+**Cellar migration complete.** Maestro now runs as a Docker container on the Cellar (TrueNAS SCALE), the fleet's always-on infrastructure hub. Apollyon is a pure compute leaf. The migration was config-only — zero source code changes.
+
+### Deployment (Cellar)
+
+| Component | Location |
+|---|---|
+| Repo (git clone) | `/volume2/docker/maestro/repo/` |
+| Config (.env, hosts.yaml, ssh/, cloudflared/) | `/volume2/docker/maestro/config/` |
+| Persistent state (oauth, ledger, registry) | `/volume2/docker/maestro/state/` |
+| Containers | `maestro` (python:3.12-slim) + `maestro-cloudflared` (Alpine + cloudflared) |
+| Update workflow | `cd repo && git pull && docker compose up -d --build` |
+
+### Fleet Topology (post-migration)
+
+| Host | Role | Status |
+|---|---|---|
+| Cellar | Hub (`is_local: true`), orchestration only | Docker, always-on |
+| Apollyon | Compute leaf, agent dispatch target | DGX Spark, GPU workloads |
+| Eden | Compute leaf, agent dispatch target | RTX 5090, PowerShell |
+| Judas | Compute leaf, agent dispatch target | MacBook Pro M3 Max |
+| Eden-WSL | Compute leaf (proxy through Eden) | WSL2 Ubuntu on Eden |
 
 ## Active Branches
 
 | Branch | Location | Status |
 |--------|----------|--------|
 | `main` | local + remote | Active development branch |
-| `feat/adr-0006-task-ledger` | local | ADR-0006 implementation branch |
-| `feat/adr-0004-0005-pin-rotation` | remote only | Feature branch — appears merged to main, candidate for deletion |
+| `feat/adr-0006-task-ledger` | local | ADR-0006 implementation — candidate for merge |
 
 ## Blockers
 
-- **TODO item 6:** Three F3 naming iteration commits (699f2b3 .. e117083) should be squashed before any public push. Status unknown — may already be in remote history.
+- None. Migration landed cleanly.
 
 ## What's Next
 
 1. **Land ADR-0006 branch** — review and merge `feat/adr-0006-task-ledger` into `main`.
-2. **Remaining TODO items** (from `docs/TODO.md`):
+2. **Commit Dockerfile + docker-compose.yml + entrypoints** to the repo (currently only on Cellar, not in git).
+3. **Remaining TODO items** (from `docs/TODO.md`):
    - Item 4: Set `MAESTRO_DEFAULT_REPO` in `.env` to a real path.
    - Item 6: Squash F3 naming commits if not already done.
-   - Items 1–3, 5: Completed per commit history.
-3. **ADR status docs** — ADR-0005 and ADR-0006 documentation status fields still need follow-up when doc updates are in scope.
 4. **Delete stale remote branch** `feat/adr-0004-0005-pin-rotation` if fully merged.
-5. **Tests** — 59/59 passing on the ADR-0006 branch after the final Phase 5 commit.
+5. **Tests** — 59/59 passing on the ADR-0006 branch. Re-verify after merge.
+
+## Lessons Learned (Migration)
+
+- TrueNAS SCALE ZFS ACLs override POSIX `chmod`. Docker bind mounts inherit the volume's permissions. Solution: entrypoint scripts that copy files with correct perms at startup.
+- The `cloudflare/cloudflared:latest` image is distroless (no shell). Use Alpine multi-stage builds.
+- `network_mode: "service:maestro"` ties cloudflared to maestro's network namespace. **Never restart maestro alone** — always `docker compose restart` or cloudflared's namespace goes stale.
