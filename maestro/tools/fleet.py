@@ -130,7 +130,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
-        """Run a shell command on a host. Do NOT use this to invoke agent CLIs (claude, codex, gemini) — use the dedicated dispatch tools instead."""
+        """Run a shell command on a host. Returns JSON with output.
+
+        Guards: rejects raw agent CLI invocations (use codex/claude/gemini tools instead). In stdio mode, rejects commands targeting the local host (use native Bash).
+        Auto-promotes to background if execution exceeds the client's block_timeout_exec (5s remote, 60s local). Check for "auto_promoted" in response.
+        Best for: grep, head, ls, git status, nvidia-smi, systemctl. Context cost = stdout size."""
         if block := _check_local_self_reference(host):
             return block
         if block := _check_agent_dispatch_bypass(command):
@@ -163,7 +167,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
-        """Run a multi-line script on a host. Do NOT use this to invoke agent CLIs — use dedicated dispatch tools."""
+        """Run a multi-line script on a host (piped via bash -s or PowerShell). Same guards and auto-promote as exec.
+
+        Use for multi-step operations with conditionals or loops. Bash scripts get set -euo pipefail prepended automatically."""
         if block := _check_local_self_reference(host):
             return block
         if block := _check_agent_dispatch_bypass(script):
@@ -234,7 +240,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def write(host: str, path: str, content: str, append: bool = False, sudo: bool = False) -> str:
-        """Write content to a file on a host."""
+        """Write content to a file on a host. Creates parent directories automatically.
+
+        Content transits MCP (context-expensive for large payloads). For files >1KB that don't need inline reasoning, prefer prepare_relay + curl push instead."""
         if block := _check_local_self_reference(host):
             return block
         try:
@@ -408,7 +416,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
-        """Check Codex/Gemini CLI availability on a host."""
+        """Check Codex/Gemini/Claude Code CLI availability on a host. Also lists recent orchestra output files."""
         h = host or _local_host_name() or next(iter(HOSTS))
         try:
             _resolve_host(h)
@@ -417,6 +425,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
         codex_rc, codex_out = await _orchestra_run_cli(h, "codex --version 2>&1", timeout=10)
         gemini_rc, gemini_out = await _orchestra_run_cli(h, "gemini --version 2>&1", timeout=10)
+        claude_rc, claude_out = await _orchestra_run_cli(h, "claude --version 2>&1", timeout=10)
 
         output_dir = _orchestra_output_dir()
         recent = sorted(output_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
@@ -425,6 +434,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             "host": h,
             "codex": {"available": codex_rc == 0, "output": codex_out.strip()[:200]},
             "gemini": {"available": gemini_rc == 0, "output": gemini_out.strip()[:200]},
+            "claude": {"available": claude_rc == 0, "output": claude_out.strip()[:200]},
             "output_dir": str(output_dir),
             "recent_outputs": [{"name": f.name, "size": f.stat().st_size} for f in recent],
         }, indent=2)
@@ -434,7 +444,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         host: str, prompt: str, working_dir: str,
         model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
     ) -> str:
-        """Dispatch a coding task to Codex CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
+        """Dispatch a coding task to Codex CLI. Requires explicit working_dir (validated against host's allowed_dirs).
+
+        Handles: scope prefix injection, CLI flag construction, output capture to disk, task ledger recording, auto-promote to background. Default timeout: 1800s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -532,7 +544,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def read_output(file_path: str, start_line: int = 0, max_lines: int = 200) -> str:
-        """Read full or partial output from a previous agent run."""
+        """Read full or partial output from a previous agent run. Restricted to files in the orchestra output directory.
+
+        Use start_line and max_lines for windowed reads to control context cost. Returns total_lines and has_more for pagination."""
         fp = Path(file_path)
         try:
             fp.resolve().relative_to(config.orchestra_output_dir.resolve())
@@ -554,7 +568,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         host: str, prompt: str, working_dir: str,
         allowed_tools: str = "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read", timeout: int = 0,
     ) -> str:
-        """Dispatch a coding task to Claude Code CLI. Handles flags, output capture, task registry, auto-promote. Returns task_id — use poll() for results. Prefer over exec()."""
+        """Dispatch a coding task to Claude Code CLI. Requires explicit working_dir (validated against host's allowed_dirs).
+
+        Handles: scope prefix injection, --permission-mode bypassPermissions, allowed_tools whitelist, output capture, task ledger, auto-promote. Default timeout: 1200s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
@@ -592,7 +608,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def prepare_relay() -> str:
-        """Prepare the file relay for use. Call once before using push/pull endpoints. Result is valid for 1 hour."""
+        """Get an ephemeral bearer token for the HTTP transfer relay and task result endpoints. Valid for 1 hour. Use with: curl -H "Authorization: Bearer <token>" on /transfer/push, /transfer/pull, /tasks/{id}/result."""
         import secrets as _s
         from maestro.relay import register_ephemeral_token as _reg
         v = _s.token_urlsafe(32)
@@ -606,7 +622,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         host: str | None = None,
         last: int = 10,
     ) -> str:
-        """List recent tasks from the task ledger."""
+        """List recent tasks from the persistent ledger. Filters: status (running|done|failed|timeout|orphaned), agent (codex|claude|gemini|exec|script), host. Returns up to `last` entries sorted most-recent-first with relative timestamps.
+
+        Survives Maestro restarts. Tasks older than 30 days are auto-pruned."""
         ledger = get_task_ledger()
         if ledger is None:
             return json.dumps({"error": "Task ledger is not configured"})
@@ -629,7 +647,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def poll(task_id: str) -> str:
-        """Check task status. Returns metadata only — retrieve full results via result_url or read_output(output_file)."""
+        """Check task status in the persistent ledger. Returns metadata only: task_id, agent, host, status, timestamps, return_code, output_file, result_url.
+
+        Does NOT return result payloads. For full output: use read_output(output_file) for targeted line ranges, or curl the result_url (from prepare_relay) for zero-context retrieval."""
         ledger = get_task_ledger()
         if ledger is None:
             return json.dumps({"error": "Task ledger is not configured"})
