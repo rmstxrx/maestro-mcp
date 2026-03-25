@@ -8,8 +8,8 @@ Maestro is a modular Python package with a slim entry point:
 
 - **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server (stdio or streamable-http).
 - **Core Package (`maestro/`):**
-    - **`tools/fleet.py`:** Fleet operations (`exec`, `script`, `read`, `write`, `transfer`, `status`), agent dispatch (`codex`, `gemini`, `claude`), task management (`tasks`, `poll`, `read_output`), relay (`prepare_relay`), and discovery tools (`list_ssh_hosts`, `add_host`, `agent_status`, `reconnect_host`, `gemini_sessions`).
-    - **`tools/orchestra.py`:** Task registry, task ledger, auto-promote logic, agent output management, CLI runner helpers, scope prefix, and eviction loop.
+    - **`tools/fleet.py`:** Fleet tools: `exec`, `script`, `read`, `write`, `transfer`, `status`, `add_host`, `reconnect_host`, `list_ssh_hosts`, `agent_status`, and `gemini_sessions`.
+    - **`tools/orchestra.py`:** Orchestra tools: `codex`, `gemini`, `claude`, `poll`, `read_output`, `tasks`, `prepare_relay`, plus task registry, task ledger, auto-promote logic, agent output management, CLI runner helpers, scope prefix, and eviction loop.
     - **`hosts.py`:** Fleet topology management and `hosts.yaml` parsing. Supports Bash and PowerShell. Per-host `allowed_dirs` enforcement.
     - **`transport.py`:** Persistent SSH ControlMaster lifecycle (warmup, teardown, transient failure retries with exponential backoff).
     - **`local.py`:** Zero-overhead execution for the hub machine (`is_local: true`).
@@ -17,6 +17,20 @@ Maestro is a modular Python package with a slim entry point:
     - **`client.py`:** Client classification (remote/local/lan/stdio) and per-client execution profiles controlling block timeouts and poll cooldowns.
     - **`oauth_state.py`:** Atomic JSON persistence for OAuth clients and tokens (survives restarts).
     - **`config.py`:** Environment-based configuration (`MaestroConfig`).
+
+## Taxonomy
+
+Three domains, strict boundaries:
+
+- **Maestro** — The system. The MCP server and everything it governs. Always use the proper name; never say "orchestrator."
+- **Orchestra** — The performers. AI agents (Codex, Gemini, Claude Code) and their coordination: dispatch, scope prefix, task ledger, output management.
+- **Fleet** — The infrastructure. Physical and virtual machines, SSH transport, host topology, file operations.
+
+The principle: Musical terms for intelligence. Logistical terms for infrastructure. Maestro conducts both.
+
+Code mapping:
+- `tools/fleet.py` — Fleet tools: exec, script, read, write, transfer, status, add_host, reconnect_host, list_ssh_hosts, agent_status.
+- `tools/orchestra.py` — Orchestra tools: codex, gemini, claude, poll, read_output, tasks, prepare_relay. Plus task registry, task ledger, auto-promote, scope prefix, output management.
 
 ## Key Patterns
 
@@ -137,7 +151,7 @@ All configuration is via environment variables, loaded from `.env` (on the Cella
 | `MAESTRO_LAN_ORIGINS` | No | — | LAN origins for OAuth URL rewriting (format: `host:port=scheme`). |
 | `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Comma-separated dirs that transfer relay may read/write. |
 | `MAESTRO_DEFAULT_REPO` | No | `~/workspace` | Default working directory (vestigial — all dispatch tools require explicit `working_dir`). |
-| `MAESTRO_ORCHESTRA_OUTPUT_DIR` | No | `~/.agent-orchestra/outputs` | Directory where agent output files are written. |
+| `MAESTRO_ORCHESTRA_OUTPUT_DIR` | No | `~/.maestro/outputs` | Directory where agent output files are written. |
 | `MAESTRO_OAUTH_STATE_PATH` | No | `~/.maestro/oauth_state.json` | Where OAuth state is persisted across restarts. |
 | `MAESTRO_TASK_LEDGER_PATH` | No | `~/.maestro/task_ledger.json` | Where the persistent task ledger is stored. |
 | `MAESTRO_CODEX_TIMEOUT` | No | `1800` | Default Codex dispatch timeout in seconds (30 min). |

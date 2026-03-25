@@ -23,7 +23,6 @@ from maestro.hosts import (
     init_hosts,
 )
 from maestro.transport import _is_transient_failure
-from maestro.tools.fleet import register_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
     TaskLedgerEntry,
@@ -31,11 +30,18 @@ from maestro.tools.orchestra import (
     _auto_promote,
     _orchestra_truncate,
     configure_orchestra,
+    register_orchestra_tools,
 )
+from maestro.tools.fleet import register_fleet_tools
 from maestro.config import MaestroConfig
 
 _config = MaestroConfig.from_env()
 MAX_INLINE_OUTPUT = _config.max_inline_output
+
+
+def _register_all_tools(mcp: FastMCP) -> None:
+    register_fleet_tools(mcp, _config)
+    register_orchestra_tools(mcp, _config)
 
 # Initialize hosts (noop if hosts.yaml missing) and configure orchestra for truncate tests
 try:
@@ -296,7 +302,7 @@ class TestGeminiSessions:
         monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
 
         result = json.loads(call_result["result"])
@@ -318,7 +324,7 @@ class TestGeminiSessions:
         monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
 
         result = json.loads(call_result["result"])
@@ -355,10 +361,10 @@ class TestTasksTool:
                     )
                 ]
 
-        monkeypatch.setattr("maestro.tools.fleet.get_task_ledger", lambda: _Ledger())
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
             "tasks",
             {"status": "done", "agent": "codex", "host": "test-host", "last": 5},
@@ -402,10 +408,10 @@ class TestPollTool:
                     result_url="https://example.test/tasks/abc123/result",
                 )
 
-        monkeypatch.setattr("maestro.tools.fleet.get_task_ledger", lambda: _Ledger())
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool("poll", {"task_id": "abc123"})
 
         result = json.loads(call_result["result"])
@@ -452,7 +458,7 @@ class TestDispatchGuard:
         monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
             "exec",
             {"host": "test-host", "command": "codex -q --model o4-mini -p 'fix bug'"},
@@ -470,7 +476,7 @@ class TestDispatchGuard:
         monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
 
         mcp = FastMCP("test")
-        register_tools(mcp, _config)
+        _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
             "script",
             {"host": "test-host", "script": "gemini -p 'analyze this'"},

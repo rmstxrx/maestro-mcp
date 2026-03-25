@@ -3,7 +3,7 @@
 Maestro MCP — multi-host machine fleet + AI agent orchestra.
 
 Slim entry point: module imports, FastMCP wiring, and uvicorn startup.
-All tool logic lives in maestro.tools.fleet, orchestra in maestro.tools.orchestra,
+Fleet tools live in maestro.tools.fleet, orchestra tools in maestro.tools.orchestra,
 relay in maestro.relay, hosts in maestro.hosts.
 """
 
@@ -35,7 +35,7 @@ from maestro.hosts import (
 )
 from maestro.local import configure_local
 from maestro.relay import configure_relay, task_result, transfer_push, transfer_pull
-from maestro.tools.fleet import register_tools
+from maestro.tools.fleet import register_fleet_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
     TaskLedger,
@@ -43,6 +43,7 @@ from maestro.tools.orchestra import (
     _REGISTRY_LOCK,
     cancel_eviction_loop,
     configure_orchestra,
+    register_orchestra_tools,
     start_eviction_loop,
 )
 from maestro.transport import (
@@ -188,8 +189,8 @@ def _build_instructions(transport: str = "http") -> str:
             "Use Maestro ONLY for:\n"
             "  - Remote fleet hosts (listed below)\n"
             "  - Agent dispatch (codex, gemini, claude) to any host including local\n"
-            "  - Fleet status, agent_status, transfer, prepare_relay\n"
-            "  - poll, read_output (task registry operations)\n\n"
+            "  - Fleet status, transfer, add_host, reconnect_host, list_ssh_hosts, agent_status\n"
+            "  - Orchestra tools: prepare_relay, poll, read_output, tasks\n\n"
             "Remote fleet hosts:\n" + remote_block
         )
 
@@ -261,7 +262,8 @@ async def _transfer_pull(request: Request) -> Response:
 async def _task_result(request: Request) -> Response:
     return await task_result(request)
 
-register_tools(mcp, CONFIG)
+register_fleet_tools(mcp, CONFIG)
+register_orchestra_tools(mcp, CONFIG)
 
 # ---------------------------------------------------------------------------
 # Entry point

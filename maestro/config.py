@@ -41,7 +41,7 @@ class MaestroConfig:
             orchestra_output_dir=Path(
                 os.environ.get(
                     "MAESTRO_ORCHESTRA_OUTPUT_DIR",
-                    str(Path.home() / ".agent-orchestra" / "outputs"),
+                    str(Path.home() / ".maestro" / "outputs"),
                 )
             ),
             codex_timeout=int(os.environ.get("MAESTRO_CODEX_TIMEOUT", "1800")),

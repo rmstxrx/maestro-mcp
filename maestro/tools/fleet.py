@@ -1,4 +1,4 @@
-"""Fleet + orchestra MCP tool functions."""
+"""Fleet MCP tool functions."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shlex
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,14 +32,9 @@ from maestro.local import (
     _local_write_file,
 )
 from maestro.tools.orchestra import (
-    AGENT_SCOPE_PREFIX,
     _auto_promote,
-    _extract_gemini_response,
-    _orchestra_build_result,
     _orchestra_output_dir,
-    _orchestra_output_path,
     _orchestra_run_cli,
-    get_task_ledger,
 )
 from maestro.transport import (
     _check_control_master,
@@ -53,7 +47,6 @@ from maestro.transport import (
 
 logger = logging.getLogger("maestro")
 
-_CONFIG: MaestroConfig | None = None
 _AGENT_CLI_PATTERNS = re.compile(
     r"\b(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
     re.IGNORECASE | re.DOTALL,
@@ -104,24 +97,8 @@ def _check_agent_dispatch_bypass(command: str) -> str | None:
         ),
     })
 
-
-def _format_relative_time(ts: datetime, now: datetime | None = None) -> str:
-    """Format a timestamp as a compact relative age string."""
-    current = now or datetime.now(timezone.utc)
-    seconds = max(int((current - ts).total_seconds()), 0)
-    if seconds < 60:
-        return f"{seconds}s ago"
-    if seconds < 3600:
-        return f"{seconds // 60}m ago"
-    if seconds < 86400:
-        return f"{seconds // 3600}h ago"
-    return f"{seconds // 86400}d ago"
-
-
-def register_tools(mcp: object, config: MaestroConfig) -> None:
-    """Register all fleet + orchestra tools on the given FastMCP instance."""
-    global _CONFIG
-    _CONFIG = config
+def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
+    """Register fleet tools on the given FastMCP instance."""
 
     from mcp.server.fastmcp import FastMCP
     assert isinstance(mcp, FastMCP)
@@ -412,7 +389,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         except Exception as e:
             return json.dumps({"error": f"Failed to add host: {e}"})
 
-    # --- Orchestra tools ---
+    # --- Agent CLI discovery ---
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
@@ -440,46 +417,6 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         }, indent=2)
 
     @mcp.tool()
-    async def codex(
-        host: str, prompt: str, working_dir: str,
-        model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
-    ) -> str:
-        """Dispatch a coding task to Codex CLI. Requires explicit working_dir (validated against host's allowed_dirs).
-
-        Handles: scope prefix injection, CLI flag construction, output capture to disk, task ledger recording, auto-promote to background. Default timeout: 1800s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
-        try:
-            cfg = _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.codex_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
-
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
-            model_flag = f"--model {shlex.quote(model)} " if model else ""
-            effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
-            scoped_prompt = AGENT_SCOPE_PREFIX + prompt
-            escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            task_label = output_file.stem.rsplit("_", 1)[-1]
-            logger.info(f"Orchestra: codex on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
-            return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
-
-        return await _auto_promote(
-            _execute, block_timeout=block_timeout,
-            agent="codex", host=host, prompt=prompt,
-            client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("codex", tid),
-            output_holder=output_holder,
-        )
-
-    @mcp.tool()
     async def gemini_sessions(host: str = "") -> str:
         """List previous Gemini CLI sessions on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
@@ -488,186 +425,3 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         if rc == 0:
             return json.dumps({"host": h, "sessions": out})
         return json.dumps({"host": h, "error": out})
-
-    @mcp.tool()
-    async def gemini(
-        host: str, prompt: str, working_dir: str,
-        context_files: list[str] | None = None, model: str = "",
-        approval_mode: str = "plan", resume: str = "", timeout: int = 0,
-    ) -> str:
-        """Dispatch an analysis/research task to Gemini CLI. Exploits 1M-token context. Returns task_id — use poll() for results. Prefer over exec().
-
-        approval_mode: "plan" (read-only), "yolo" (auto-approve all), "auto_edit" (auto-approve edits), "default" (prompt).
-        resume: Session index (e.g. "1") or "latest" to continue a previous chat.
-        WARNING: Resuming a session re-sends the entire history, costing tokens for all previous turns.
-        """
-        try:
-            cfg = _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.gemini_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
-
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
-            full_prompt = prompt
-            if context_files:
-                file_refs = " ".join(f"@{f}" for f in context_files)
-                full_prompt = f"{file_refs} {prompt}"
-
-            model_flag = f"--model {shlex.quote(model)} " if model else ""
-            approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
-            resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
-
-            cli_cmd = (
-                f"gemini -p {shlex.quote(full_prompt)} --output-format json "
-                f"{model_flag}{approval_flag}{resume_flag}"
-            )
-
-            task_label = output_file.stem.rsplit("_", 1)[-1]
-            logger.info(f"Orchestra: gemini on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
-            return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
-
-        return await _auto_promote(
-            _execute, block_timeout=block_timeout,
-            agent="gemini", host=host, prompt=prompt,
-            client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("gemini", tid),
-            output_holder=output_holder,
-        )
-
-    @mcp.tool()
-    async def read_output(file_path: str, start_line: int = 0, max_lines: int = 200) -> str:
-        """Read full or partial output from a previous agent run. Restricted to files in the orchestra output directory.
-
-        Use start_line and max_lines for windowed reads to control context cost. Returns total_lines and has_more for pagination."""
-        fp = Path(file_path)
-        try:
-            fp.resolve().relative_to(config.orchestra_output_dir.resolve())
-        except ValueError:
-            return json.dumps({"error": f"Access denied: only files in {config.orchestra_output_dir}"})
-        if not fp.exists():
-            return json.dumps({"error": f"File not found: {file_path}"})
-        lines = fp.read_text(encoding="utf-8").splitlines()
-        total = len(lines)
-        selected = lines[start_line : start_line + max_lines]
-        return json.dumps({
-            "file": str(fp), "total_lines": total, "start_line": start_line,
-            "lines_returned": len(selected), "has_more": start_line + max_lines < total,
-            "content": "\n".join(selected),
-        }, indent=2, ensure_ascii=False)
-
-    @mcp.tool()
-    async def claude(
-        host: str, prompt: str, working_dir: str,
-        allowed_tools: str = "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read", timeout: int = 0,
-    ) -> str:
-        """Dispatch a coding task to Claude Code CLI. Requires explicit working_dir (validated against host's allowed_dirs).
-
-        Handles: scope prefix injection, --permission-mode bypassPermissions, allowed_tools whitelist, output capture, task ledger, auto-promote. Default timeout: 1200s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
-        try:
-            cfg = _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.claude_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
-
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
-            scoped_prompt = AGENT_SCOPE_PREFIX + prompt
-            escaped_prompt = shlex.quote(scoped_prompt)
-            escaped_tools = shlex.quote(allowed_tools)
-            cli_cmd = (
-                f"claude -p {escaped_prompt} --output-format json "
-                f"--permission-mode bypassPermissions "
-                f"--allowedTools {escaped_tools}"
-            )
-            task_label = output_file.stem.rsplit("_", 1)[-1]
-            logger.info(f"Orchestra: claude on {host} [{task_label}]: {prompt[:80]}...")
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
-            return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
-
-        return await _auto_promote(
-            _execute, block_timeout=block_timeout,
-            agent="claude", host=host, prompt=prompt,
-            client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("claude", tid),
-            output_holder=output_holder,
-        )
-
-    @mcp.tool()
-    async def prepare_relay() -> str:
-        """Get an ephemeral bearer token for the HTTP transfer relay and task result endpoints. Valid for 1 hour. Use with: curl -H "Authorization: Bearer <token>" on /transfer/push, /transfer/pull, /tasks/{id}/result."""
-        import secrets as _s
-        from maestro.relay import register_ephemeral_token as _reg
-        v = _s.token_urlsafe(32)
-        _reg(v, ttl=3600)
-        return json.dumps({"value": v, "ttl_seconds": 3600})
-
-    @mcp.tool()
-    async def tasks(
-        status: str | None = None,
-        agent: str | None = None,
-        host: str | None = None,
-        last: int = 10,
-    ) -> str:
-        """List recent tasks from the persistent ledger. Filters: status (running|done|failed|timeout|orphaned), agent (codex|claude|gemini|exec|script), host. Returns up to `last` entries sorted most-recent-first with relative timestamps.
-
-        Survives Maestro restarts. Tasks older than 30 days are auto-pruned."""
-        ledger = get_task_ledger()
-        if ledger is None:
-            return json.dumps({"error": "Task ledger is not configured"})
-        now = datetime.now(timezone.utc)
-        rows = [
-            {
-                "task_id": entry.task_id,
-                "agent": entry.agent,
-                "host": entry.host,
-                "status": entry.status,
-                "dispatched_at": _format_relative_time(entry.dispatched_at, now),
-                "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
-                "return_code": entry.return_code,
-                "output_file": entry.output_file,
-                "result_url": entry.result_url,
-            }
-            for entry in ledger.query(status=status, agent=agent, host=host, last=last)
-        ]
-        return json.dumps({"tasks": rows}, ensure_ascii=False)
-
-    @mcp.tool()
-    async def poll(task_id: str) -> str:
-        """Check task status in the persistent ledger. Returns metadata only: task_id, agent, host, status, timestamps, return_code, output_file, result_url.
-
-        Does NOT return result payloads. For full output: use read_output(output_file) for targeted line ranges, or curl the result_url (from prepare_relay) for zero-context retrieval."""
-        ledger = get_task_ledger()
-        if ledger is None:
-            return json.dumps({"error": "Task ledger is not configured"})
-        entry = ledger.get(task_id)
-        if entry is None:
-            return json.dumps({"error": f"Task '{task_id}' not found"})
-        result: dict[str, Any] = {
-            "task_id": entry.task_id,
-            "agent": entry.agent,
-            "host": entry.host,
-            "status": entry.status,
-            "dispatched_at": entry.dispatched_at.isoformat(),
-            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
-            "return_code": entry.return_code,
-            "output_file": entry.output_file,
-            "result_url": entry.result_url,
-        }
-        if entry.status == "running":
-            elapsed = (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds()
-            result["elapsed_seconds"] = round(elapsed, 1)
-        return json.dumps(result, ensure_ascii=False)
