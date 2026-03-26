@@ -24,11 +24,10 @@ from maestro.hosts import (
     _update_host_status,
     _wrap_command,
 )
+from maestro.mux import mux_run
 from maestro.local import (
     _local_copy,
     _local_read_file,
-    _local_run,
-    _local_script,
     _local_write_file,
 )
 from maestro.tools.orchestra import (
@@ -97,6 +96,7 @@ def _check_agent_dispatch_bypass(command: str) -> str | None:
         ),
     })
 
+
 def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     """Register fleet tools on the given FastMCP instance."""
 
@@ -126,14 +126,16 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
         async def _execute() -> str:
             cfg = _resolve_host(host)
-            if cfg.is_local:
+            if cfg.shell == HostShell.POWERSHELL:
+                raw = await _ssh_run(host, [_wrap_command(cfg, command, cwd, sudo)], timeout=timeout)
+            elif cfg.is_local:
                 parts = []
                 if sudo:
                     parts.append("sudo")
                 parts.append(command)
-                raw = await _local_run(" ".join(parts), timeout=timeout, cwd=cwd)
+                raw = await mux_run(host, " ".join(parts), timeout=timeout, cwd=cwd)
             else:
-                raw = await _ssh_run(host, [_wrap_command(cfg, command, cwd, sudo)], timeout=timeout)
+                raw = await mux_run(host, _wrap_command(cfg, command, cwd, sudo), timeout=timeout)
             return json.dumps({"_host": host, "_agent": "exec", "output": raw})
 
         return await _auto_promote(
@@ -161,9 +163,6 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
         async def _execute() -> str:
             cfg = _resolve_host(host)
-            if cfg.is_local:
-                raw = await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
-                return json.dumps({"_host": host, "_agent": "script", "output": raw})
             lines = []
             if cfg.shell == HostShell.POWERSHELL:
                 lines.append("$ErrorActionPreference = 'Stop'")
@@ -172,14 +171,14 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 lines.append(script)
                 stdin_body = "\n".join(lines)
                 interpreter = ["powershell", "-Command", "-"]
+                raw = await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
             else:
                 lines.append("set -euo pipefail")
                 if cwd:
                     lines.append(f"cd {shlex.quote(cwd)}")
                 lines.append(script)
                 stdin_body = "\n".join(lines)
-                interpreter = ["sudo", "bash", "-s"] if sudo else ["bash", "-s"]
-            raw = await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
+                raw = await mux_run(host, stdin_body, timeout=timeout, sudo=sudo)
             return json.dumps({"_host": host, "_agent": "script", "output": raw})
 
         return await _auto_promote(

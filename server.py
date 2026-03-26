@@ -33,7 +33,8 @@ from maestro.hosts import (
     _wrap_command,
     init_hosts,
 )
-from maestro.local import configure_local
+from maestro.local import _local_run, configure_local
+from maestro.mux import configure_mux
 from maestro.relay import configure_relay, task_result, transfer_push, transfer_pull
 from maestro.tools.fleet import register_fleet_tools
 from maestro.tools.orchestra import (
@@ -51,6 +52,7 @@ from maestro.transport import (
     _ensure_connection,
     _is_transient_failure,
     _scp_run,
+    _ssh_run,
     _teardown_connection,
     configure_transport,
     teardown_all_hosts,
@@ -105,6 +107,13 @@ configure_transport(
     format_result=_format_result,
 )
 configure_local(config=CONFIG, format_result=_format_result)
+configure_mux(
+    config=CONFIG,
+    resolve_host=_resolve_host,
+    ssh_run=_ssh_run,
+    local_run=_local_run,
+    format_result=_format_result,
+)
 _task_registry_store = TaskRegistryStore(CONFIG.oauth_state_path.parent / "task_registry.json")
 _task_registry_store.load()
 _task_ledger = TaskLedger(CONFIG.task_ledger_path, CONFIG.issuer_url)
