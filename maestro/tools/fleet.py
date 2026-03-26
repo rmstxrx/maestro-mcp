@@ -454,10 +454,10 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         cwd: str | None = None,
         cleanup: bool = False,
     ) -> str:
-        """Start a persistent process in a named tmux window on a host.
+        """Run a command in a named terminal session on a host.
 
-        The window stays alive after the command exits (for inspection) unless cleanup=True.
-        Returns JSON with window name, host, and result. Use capture() to observe, send_keys() to interact, kill_window() to stop."""
+        The session stays alive after the command exits (for inspection) unless cleanup=True.
+        Returns JSON with session name, host, and result. Use mux_read() to view output, mux_input() to interact, mux_stop() to close."""
         try:
             _resolve_mux_host(host)
             name = label or f"spawn-{secrets.token_hex(4)}"
@@ -477,9 +477,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def mux_read(host: str, window: str, lines: int = 50) -> str:
-        """Read the current screen content of a named tmux window on a host.
+        """Read recent output from a named terminal session on a host.
 
-        Use to observe running processes or inspect completed ones (if window has remain-on-exit)."""
+        Use to check on running commands or inspect completed ones (if window has remain-on-exit)."""
         try:
             _resolve_mux_host(host)
             _validate_window_name(window)
@@ -491,7 +491,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def mux_input(host: str, window: str, keys: str) -> str:
-        """Send keystrokes to a named tmux window. Use for interactive processes.
+        """Provide input to a named terminal session. Use for interactive commands.
 
         Special keys: Enter, C-c (Ctrl+C), C-d (Ctrl+D), Escape, Tab."""
         try:
@@ -505,7 +505,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def mux_stop(host: str, window: str) -> str:
-        """Kill a named tmux window on a host. Terminates the process running in it."""
+        """Close a named terminal session on a host. Stops the command running in it."""
         try:
             _resolve_mux_host(host)
             _validate_window_name(window)
@@ -517,7 +517,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def mux_list(host: str) -> str:
-        """List all tmux windows in the maestro session on a host. Shows what's currently running.
+        """List active terminal sessions on a host. Shows what commands are currently running.
 
         This is the live state — for historical task records, use the tasks() tool instead."""
         try:
