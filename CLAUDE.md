@@ -171,6 +171,7 @@ All configuration is via environment variables, loaded from `.env` (on the Cella
 7. **Agent dispatch must go through orchestra tools.** Never invoke `codex`, `gemini`, or `claude` CLIs via `exec`/`script`. The dispatch guard will block it.
 8. **Transfer relay tokens are valid for 1 hour.** Call `prepare_relay` once per transfer session. Use the returned bearer token for `/transfer/push`, `/transfer/pull`, and `/tasks/{id}/result`.
 9. **Claude.ai defers tool loading.** When the MCP connector has many tools, Claude.ai lazy-loads some via Tool Search to save context tokens. Tools are registered server-side and visible in the UI, but the LLM must call `tool_search` to load them before use. This is not a filter or classifier — all tools are available, just deferred. If a Maestro tool seems missing, `tool_search` it.
+10. **Transfer relay routes through the Cellar.** The Cellar is the hub with SSH to all hosts. Push and pull requests specify `host` and `remote_path` — the relay handles the Cellar→target SCP hop internally. Never use Apollyon (or any other leaf) as a waypoint. The correct flow: Claude.ai sandbox ↔ relay HTTP ↔ Cellar ↔ SCP to/from target host.
 
 ---
 
