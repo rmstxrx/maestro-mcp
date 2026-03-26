@@ -170,6 +170,7 @@ All configuration is via environment variables, loaded from `.env` (on the Cella
 6. **`poll` is status-only.** It returns task metadata (status, times, output_file, result_url). Full results must be retrieved via HTTP (`result_url` + relay token) or `read_output`. Never expect result payloads from `poll`.
 7. **Agent dispatch must go through orchestra tools.** Never invoke `codex`, `gemini`, or `claude` CLIs via `exec`/`script`. The dispatch guard will block it.
 8. **Transfer relay tokens are valid for 1 hour.** Call `prepare_relay` once per transfer session. Use the returned bearer token for `/transfer/push`, `/transfer/pull`, and `/tasks/{id}/result`.
+9. **Claude.ai defers tool loading.** When the MCP connector has many tools, Claude.ai lazy-loads some via Tool Search to save context tokens. Tools are registered server-side and visible in the UI, but the LLM must call `tool_search` to load them before use. This is not a filter or classifier — all tools are available, just deferred. If a Maestro tool seems missing, `tool_search` it.
 
 ---
 
