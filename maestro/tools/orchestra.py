@@ -595,7 +595,7 @@ def _complete_ledger_entry(
 # CLI runners
 # ---------------------------------------------------------------------------
 
-async def _orchestra_run_cli_raw(
+async def _orchestra_run_cli_raw_ps(
     host: str,
     cli_command: str,
     timeout: int,
@@ -661,12 +661,40 @@ async def _orchestra_run_cli(
     cli_command: str,
     timeout: int,
     cwd: str | None = None,
+    window_name: str | None = None,
 ) -> tuple[int, str]:
-    """Run a CLI command, returning (rc, formatted_output)."""
+    """Run a CLI command via mux, returning (rc, formatted_output)."""
+    from maestro.hosts import HostShell
+    from maestro.mux import mux_run, mux_spawn
+
     assert _FORMAT_RESULT
-    rc, stdout, stderr = await _orchestra_run_cli_raw(host, cli_command, timeout, cwd)
-    combined = _FORMAT_RESULT(stdout, stderr, rc)
-    return rc, combined
+    cfg = _RESOLVE_HOST(host) if _RESOLVE_HOST else None
+    if cfg and cfg.shell == HostShell.POWERSHELL:
+        rc, stdout, stderr = await _orchestra_run_cli_raw_ps(host, cli_command, timeout, cwd)
+        return rc, _FORMAT_RESULT(stdout, stderr, rc)
+
+    if window_name:
+        raw = await mux_spawn(host, cli_command, name=window_name, timeout=timeout, cwd=cwd)
+    else:
+        raw = await mux_run(host, cli_command, timeout=timeout, cwd=cwd)
+
+    rc = 0
+    marker = "[exit code: "
+    if marker in raw:
+        try:
+            rc = int(raw.rsplit(marker, 1)[-1].split("]", 1)[0])
+        except (ValueError, TypeError):
+            rc = -1
+    else:
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            if raw.startswith("[local timeout after") or raw.startswith("[local error]"):
+                rc = -1
+        else:
+            if isinstance(parsed, dict) and "error" in parsed:
+                rc = -1
+    return rc, raw
 
 
 # ---------------------------------------------------------------------------
@@ -868,9 +896,16 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
             cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            task_label = output_file.stem.rsplit("_", 1)[-1]
+            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
+            window_name = f"codex-{task_label}"
             logger.info("Orchestra: codex on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(
+                host,
+                cli_cmd,
+                timeout=effective_timeout,
+                cwd=working_dir,
+                window_name=window_name,
+            )
             return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
@@ -924,9 +959,16 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 f"{model_flag}{approval_flag}{resume_flag}"
             )
 
-            task_label = output_file.stem.rsplit("_", 1)[-1]
+            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
+            window_name = f"gemini-{task_label}"
             logger.info("Orchestra: gemini on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(
+                host,
+                cli_cmd,
+                timeout=effective_timeout,
+                cwd=working_dir,
+                window_name=window_name,
+            )
             return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
         return await _auto_promote(
@@ -994,9 +1036,16 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools}"
             )
-            task_label = output_file.stem.rsplit("_", 1)[-1]
+            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
+            window_name = f"claude-{task_label}"
             logger.info("Orchestra: claude on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=effective_timeout, cwd=working_dir)
+            rc, raw_output = await _orchestra_run_cli(
+                host,
+                cli_cmd,
+                timeout=effective_timeout,
+                cwd=working_dir,
+                window_name=window_name,
+            )
             return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(

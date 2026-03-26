@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from maestro.mux import TEMP_PREFIX, _build_ephemeral_wrapper
+import pytest
+
+from maestro.mux import (
+    TEMP_PREFIX,
+    _build_ephemeral_wrapper,
+    _build_spawn_wrapper,
+    mux_list_windows,
+)
 
 
 class TestBuildEphemeralWrapper:
@@ -53,3 +60,35 @@ class TestBuildEphemeralWrapper:
 
         assert '"bash \\"$_MUX_CMD\\" > \\"$_MUX_OUT\\"' in plain
         assert '"sudo bash \\"$_MUX_CMD\\" > \\"$_MUX_OUT\\"' in sudo
+
+
+class TestBuildSpawnWrapper:
+    def test_generates_named_window_and_remain_on_exit_by_default(self) -> None:
+        wrapper = _build_spawn_wrapper("echo hello", "feedface", "codex-feedface")
+
+        assert "tmux -L maestro new-window -n codex-feedface -t main " in wrapper
+        assert "tmux -L maestro set-option -t codex-feedface remain-on-exit on" in wrapper
+
+    def test_cleanup_omits_remain_on_exit(self) -> None:
+        wrapper = _build_spawn_wrapper("echo hello", "feedface", "codex-feedface", cleanup=True)
+
+        assert "tmux -L maestro new-window -n codex-feedface -t main " in wrapper
+        assert "remain-on-exit" not in wrapper
+
+
+class TestMuxListWindows:
+    @pytest.mark.asyncio
+    async def test_parses_tmux_window_rows(self, monkeypatch) -> None:
+        async def _fake_run(host: str, command: str, *, timeout: int | None = None) -> str:
+            assert host == "test-host"
+            assert "tmux -L maestro list-windows -t main" in command
+            return "codex-f7da0daa|python|1\nspawn-deadbeef|bash|0\n"
+
+        monkeypatch.setattr("maestro.mux._run_bash_command_raw", _fake_run)
+
+        windows = await mux_list_windows("test-host")
+
+        assert windows == [
+            {"name": "codex-f7da0daa", "command": "python", "activity": "1"},
+            {"name": "spawn-deadbeef", "command": "bash", "activity": "0"},
+        ]

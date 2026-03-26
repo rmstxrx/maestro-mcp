@@ -8,7 +8,7 @@ Maestro is a modular Python package with a slim entry point:
 
 - **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server (stdio or streamable-http).
 - **Core Package (`maestro/`):**
-    - **`tools/fleet.py`:** Fleet tools: `exec`, `script`, `read`, `write`, `transfer`, `status`, `add_host`, `reconnect_host`, `list_ssh_hosts`, `agent_status`, and `gemini_sessions`.
+    - **`tools/fleet.py`:** Fleet tools: `exec`, `script`, `read`, `write`, `transfer`, `status`, `add_host`, `reconnect_host`, `list_ssh_hosts`, `agent_status`, `gemini_sessions`. Mux tools: `spawn`, `capture`, `send_keys`, `kill_window`, `list_windows`.
     - **`tools/orchestra.py`:** Orchestra tools: `codex`, `gemini`, `claude`, `poll`, `read_output`, `tasks`, `prepare_relay`, plus task registry, task ledger, auto-promote logic, agent output management, CLI runner helpers, scope prefix, and eviction loop.
     - **`hosts.py`:** Fleet topology management and `hosts.yaml` parsing. Supports Bash and PowerShell. Per-host `allowed_dirs` enforcement.
     - **`transport.py`:** Persistent SSH ControlMaster lifecycle (warmup, teardown, transient failure retries with exponential backoff).
@@ -29,7 +29,8 @@ Three domains, strict boundaries:
 The principle: Musical terms for intelligence. Logistical terms for infrastructure. Maestro conducts both.
 
 Code mapping:
-- `tools/fleet.py` — Fleet tools: exec, script, read, write, transfer, status, add_host, reconnect_host, list_ssh_hosts, agent_status.
+- `tools/fleet.py` — Fleet tools: exec, script, read, write, transfer, status, add_host, reconnect_host, list_ssh_hosts, agent_status, gemini_sessions.
+- Mux tools (fleet.py): spawn, capture, send_keys, kill_window, list_windows — tmux window management on fleet hosts.
 - `tools/orchestra.py` — Orchestra tools: codex, gemini, claude, poll, read_output, tasks, prepare_relay. Plus task registry, task ledger, auto-promote, scope prefix, output management.
 
 ## Key Patterns
@@ -76,7 +77,7 @@ When running in stdio transport mode, `exec`, `script`, `read`, and `write` reje
 
 ### 6. State Persistence
 - **OAuth state** (clients, access/refresh tokens) → `~/.maestro/oauth_state.json`
-- **Task registry** (runtime task state) → `~/.maestro/task_registry.json`
+- **Task registry** (runtime task state) → in-memory only during the transition away from disk persistence
 - **Task ledger** (persistent task history) → `~/.maestro/task_ledger.json`
 
 All use atomic write-to-tmp-and-replace to prevent corruption.
@@ -124,7 +125,7 @@ The Cellar is the fleet hub (`is_local: true`). All other hosts are SSH targets.
 /volume2/docker/maestro/
 ├── repo/          # git clone (Dockerfile, docker-compose.yml, source)
 ├── config/        # .env, hosts.yaml, ssh/, cloudflared/
-└── state/         # Persistent: oauth_state.json, task_ledger.json, task_registry.json
+└── state/         # Persistent: oauth_state.json, task_ledger.json
 ```
 
 ```bash

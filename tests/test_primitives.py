@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from mcp.server.fastmcp import FastMCP
@@ -28,6 +29,7 @@ from maestro.tools.orchestra import (
     TaskLedgerEntry,
     _REGISTRY_LOCK,
     _auto_promote,
+    _orchestra_run_cli,
     _orchestra_truncate,
     configure_orchestra,
     register_orchestra_tools,
@@ -426,6 +428,65 @@ class TestPollTool:
         assert result["result_url"] == "https://example.test/tasks/abc123/result"
         assert 89.0 <= result["elapsed_seconds"] <= 91.0
         assert "output_preview" not in result
+
+
+class TestOrchestraRunCli:
+    @pytest.mark.asyncio
+    async def test_uses_mux_spawn_for_named_bash_windows(self, monkeypatch):
+        monkeypatch.setattr(
+            "maestro.tools.orchestra._RESOLVE_HOST",
+            lambda host: SimpleNamespace(shell=HostShell.BASH),
+        )
+
+        async def _fake_spawn(host, cli_command, name, timeout, cwd=None, sudo=False, cleanup=False):
+            assert host == "test-host"
+            assert cli_command == "codex --version 2>&1"
+            assert name == "codex-feedface"
+            assert timeout == 10
+            assert cwd == "/tmp/work"
+            assert not sudo
+            assert not cleanup
+            return "codex ok\n[exit code: 7]"
+
+        monkeypatch.setattr("maestro.mux.mux_spawn", _fake_spawn)
+
+        rc, output = await _orchestra_run_cli(
+            "test-host",
+            "codex --version 2>&1",
+            timeout=10,
+            cwd="/tmp/work",
+            window_name="codex-feedface",
+        )
+
+        assert rc == 7
+        assert output == "codex ok\n[exit code: 7]"
+
+    @pytest.mark.asyncio
+    async def test_powershell_uses_raw_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            "maestro.tools.orchestra._RESOLVE_HOST",
+            lambda host: SimpleNamespace(shell=HostShell.POWERSHELL),
+        )
+
+        async def _fake_raw_ps(host, cli_command, timeout, cwd=None):
+            assert host == "eden"
+            assert cli_command == "claude --version 2>&1"
+            assert timeout == 10
+            assert cwd == "C:/work"
+            return 0, "claude 1.2.3", ""
+
+        monkeypatch.setattr("maestro.tools.orchestra._orchestra_run_cli_raw_ps", _fake_raw_ps)
+
+        rc, output = await _orchestra_run_cli(
+            "eden",
+            "claude --version 2>&1",
+            timeout=10,
+            cwd="C:/work",
+            window_name="claude-feedface",
+        )
+
+        assert rc == 0
+        assert output == "claude 1.2.3"
 
 
 class TestDispatchGuard:

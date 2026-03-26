@@ -40,7 +40,6 @@ from maestro.tools.fleet import register_fleet_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
     TaskLedger,
-    TaskRegistryStore,
     _REGISTRY_LOCK,
     cancel_eviction_loop,
     configure_orchestra,
@@ -114,8 +113,6 @@ configure_mux(
     local_run=_local_run,
     format_result=_format_result,
 )
-_task_registry_store = TaskRegistryStore(CONFIG.oauth_state_path.parent / "task_registry.json")
-_task_registry_store.load()
 _task_ledger = TaskLedger(CONFIG.task_ledger_path, CONFIG.issuer_url)
 
 configure_orchestra(
@@ -124,7 +121,7 @@ configure_orchestra(
     host_status=HostStatus, ensure_connection=_ensure_connection,
     teardown_connection=_teardown_connection, async_run=_async_run,
     is_transient_failure=_is_transient_failure,
-    task_store=_task_registry_store,
+    task_store=None,
     task_ledger=_task_ledger,
 )
 

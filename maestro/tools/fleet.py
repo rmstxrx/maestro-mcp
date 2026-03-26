@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,18 @@ from maestro.hosts import (
     _update_host_status,
     _wrap_command,
 )
-from maestro.mux import mux_run
 from maestro.local import (
     _local_copy,
     _local_read_file,
     _local_write_file,
+)
+from maestro.mux import (
+    mux_capture,
+    mux_kill_window,
+    mux_list_windows,
+    mux_run,
+    mux_send_keys,
+    mux_spawn,
 )
 from maestro.tools.orchestra import (
     _auto_promote,
@@ -50,6 +58,7 @@ _AGENT_CLI_PATTERNS = re.compile(
     r"\b(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
     re.IGNORECASE | re.DOTALL,
 )
+_WINDOW_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
 
 
 def _check_local_self_reference(host: str) -> str | None:
@@ -95,6 +104,18 @@ def _check_agent_dispatch_bypass(command: str) -> str | None:
             f"records the task in the ledger, and builds the correct CLI arguments."
         ),
     })
+
+
+def _resolve_mux_host(host: str) -> HostConfig:
+    cfg = _resolve_host(host)
+    if cfg.shell == HostShell.POWERSHELL:
+        raise ValueError("tmux tools do not support PowerShell hosts")
+    return cfg
+
+
+def _validate_window_name(name: str) -> None:
+    if not _WINDOW_NAME_PATTERN.fullmatch(name):
+        raise ValueError("window name must match [a-zA-Z0-9_-] and be at most 50 characters")
 
 
 def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
@@ -424,3 +445,85 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         if rc == 0:
             return json.dumps({"host": h, "sessions": out})
         return json.dumps({"host": h, "error": out})
+
+    @mcp.tool()
+    async def spawn(
+        host: str,
+        command: str,
+        label: str = "",
+        cwd: str | None = None,
+        cleanup: bool = False,
+    ) -> str:
+        """Start a persistent process in a named tmux window on a host.
+
+        The window stays alive after the command exits (for inspection) unless cleanup=True.
+        Returns JSON with window name, host, and result. Use capture() to observe, send_keys() to interact, kill_window() to stop."""
+        try:
+            _resolve_mux_host(host)
+            name = label or f"spawn-{secrets.token_hex(4)}"
+            _validate_window_name(name)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        result = await mux_spawn(
+            host,
+            command,
+            name,
+            timeout=config.ssh_timeout,
+            cwd=cwd,
+            cleanup=cleanup,
+        )
+        return json.dumps({"host": host, "window": name, "output": result})
+
+    @mcp.tool()
+    async def capture(host: str, window: str, lines: int = 50) -> str:
+        """Read the current screen content of a named tmux window on a host.
+
+        Use to observe running processes or inspect completed ones (if window has remain-on-exit)."""
+        try:
+            _resolve_mux_host(host)
+            _validate_window_name(window)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        result = await mux_capture(host, window, lines)
+        return json.dumps({"host": host, "window": window, "content": result})
+
+    @mcp.tool()
+    async def send_keys(host: str, window: str, keys: str) -> str:
+        """Send keystrokes to a named tmux window. Use for interactive processes.
+
+        Special keys: Enter, C-c (Ctrl+C), C-d (Ctrl+D), Escape, Tab."""
+        try:
+            _resolve_mux_host(host)
+            _validate_window_name(window)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        await mux_send_keys(host, window, keys)
+        return json.dumps({"host": host, "window": window, "sent": keys})
+
+    @mcp.tool()
+    async def kill_window(host: str, window: str) -> str:
+        """Kill a named tmux window on a host. Terminates the process running in it."""
+        try:
+            _resolve_mux_host(host)
+            _validate_window_name(window)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        await mux_kill_window(host, window)
+        return json.dumps({"host": host, "window": window, "status": "killed"})
+
+    @mcp.tool()
+    async def list_windows(host: str) -> str:
+        """List all tmux windows in the maestro session on a host. Shows what's currently running.
+
+        This is the live state — for historical task records, use the tasks() tool instead."""
+        try:
+            _resolve_mux_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        windows = await mux_list_windows(host)
+        return json.dumps({"host": host, "windows": windows})
