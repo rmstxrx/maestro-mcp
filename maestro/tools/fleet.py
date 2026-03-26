@@ -55,7 +55,7 @@ from maestro.transport import (
 logger = logging.getLogger("maestro")
 
 _AGENT_CLI_PATTERNS = re.compile(
-    r"\b(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
+    r"^\s*(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
     re.IGNORECASE | re.DOTALL,
 )
 _WINDOW_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
@@ -447,7 +447,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"host": h, "error": out})
 
     @mcp.tool()
-    async def spawn(
+    async def mux_start(
         host: str,
         command: str,
         label: str = "",
@@ -476,7 +476,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"host": host, "window": name, "output": result})
 
     @mcp.tool()
-    async def capture(host: str, window: str, lines: int = 50) -> str:
+    async def mux_read(host: str, window: str, lines: int = 50) -> str:
         """Read the current screen content of a named tmux window on a host.
 
         Use to observe running processes or inspect completed ones (if window has remain-on-exit)."""
@@ -490,7 +490,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"host": host, "window": window, "content": result})
 
     @mcp.tool()
-    async def send_keys(host: str, window: str, keys: str) -> str:
+    async def mux_input(host: str, window: str, keys: str) -> str:
         """Send keystrokes to a named tmux window. Use for interactive processes.
 
         Special keys: Enter, C-c (Ctrl+C), C-d (Ctrl+D), Escape, Tab."""
@@ -504,7 +504,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"host": host, "window": window, "sent": keys})
 
     @mcp.tool()
-    async def kill_window(host: str, window: str) -> str:
+    async def mux_stop(host: str, window: str) -> str:
         """Kill a named tmux window on a host. Terminates the process running in it."""
         try:
             _resolve_mux_host(host)
@@ -516,7 +516,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"host": host, "window": window, "status": "killed"})
 
     @mcp.tool()
-    async def list_windows(host: str) -> str:
+    async def mux_list(host: str) -> str:
         """List all tmux windows in the maestro session on a host. Shows what's currently running.
 
         This is the live state — for historical task records, use the tasks() tool instead."""

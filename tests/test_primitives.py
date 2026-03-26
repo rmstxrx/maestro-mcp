@@ -510,6 +510,9 @@ class TestDispatchGuard:
         assert blocked_claude["detected_agent"] == "claude"
         assert fleet_tools._check_agent_dispatch_bypass("codex --version") is None
         assert fleet_tools._check_agent_dispatch_bypass("which gemini") is None
+        # Tmux mux commands referencing agent windows must NOT be blocked
+        assert fleet_tools._check_agent_dispatch_bypass("tmux capture-pane -t codex-10abf942 -p") is None
+        assert fleet_tools._check_agent_dispatch_bypass("tmux send-keys -t gemini-abc 'hello' Enter") is None
 
     @pytest.mark.asyncio
     async def test_exec_blocks_raw_agent_dispatch_before_host_resolution(self, monkeypatch):
