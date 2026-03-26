@@ -6,7 +6,7 @@
 
 ## Current Focus
 
-**ADR-0007 landed (Phases 1–3).** Taxonomy cleanup, tmux multiplexer layer, and mux tools are deployed. Phase 4 (agent interop) is the next major work item.
+**ADR-0007 landed (Phases 1–3).** Taxonomy cleanup, tmux multiplexer layer, and mux tools are deployed. Phase 4 (agent interop) is deferred pending a concrete use case.
 
 ### Recent Commits
 
@@ -57,7 +57,7 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 
 ## What's Next
 
-1. **ADR-0007 Phase 4 — Agent interop.** Enable agents to discover and observe each other's tmux windows. Document interop patterns in AGENTS.md.
+1. **ADR-0007 Phase 4 — Agent interop (deferred).** Infrastructure is in place (named windows, mux tools), but cross-agent observation needs deliberate design around coordination and scope. Not a checklist item — revisit when a concrete use case demands it.
 2. **Stale items from previous cycles:**
    - Set `MAESTRO_DEFAULT_REPO` in `.env` to a real path (or remove the config field).
    - Delete stale remote branch `feat/adr-0004-0005-pin-rotation` if fully merged.
