@@ -31,12 +31,22 @@ from maestro.local import (
     _local_write_file,
 )
 from maestro.mux import (
+    # Legacy (remote-tmux) — used by exec/script during transition
     mux_capture,
     mux_kill_window,
     mux_list_windows,
     mux_run,
     mux_send_keys,
     mux_spawn,
+    # New (Cellar-local tmux) — used by run
+    capture_pane,
+    cleanup_task_files,
+    create_task_window,
+    get_output_path,
+    kill_window,
+    list_windows,
+    send_keys,
+    wait_for_completion,
 )
 from maestro.tools.orchestra import (
     _auto_promote,
@@ -125,6 +135,88 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     assert isinstance(mcp, FastMCP)
 
     # --- Fleet tools ---
+
+    # --- ADR-0007: Cellar-local execution via run ---
+
+    @mcp.tool()
+    async def run(
+        host: str,
+        command: str,
+        cwd: str | None = None,
+        sudo: bool = False,
+        expected_runtime: int | None = None,
+    ) -> str:
+        """Execute a command or multi-line script on a host (ADR-0007).
+
+        Single commands and multi-line scripts are handled uniformly —
+        Maestro detects multi-line input and pipes via bash -s automatically.
+        Every execution is ledger-tracked with output captured to Cellar disk.
+
+        Guards: rejects raw agent CLI invocations (use dispatch instead).
+        In stdio mode, rejects commands targeting the local host.
+
+        Timeout: 300s hard ceiling (system policy, not configurable per-call).
+        expected_runtime: your estimate in seconds (default 15). Recorded
+        verbatim in the ledger. Task flagged as overtime at exactly this value.
+
+        Returns inline result or {auto_promoted: true, task_id} for long tasks.
+        Use observe(task_id) for live output, tasks() for status."""
+        if block := _check_local_self_reference(host):
+            return block
+        if block := _check_agent_dispatch_bypass(command):
+            return block
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        ctx = get_client_context()
+        block_timeout = ctx.profile["block_timeout_exec"]
+        is_script = "\n" in command.strip()
+        task_id = secrets.token_hex(8)
+        ert = expected_runtime if expected_runtime is not None else config.default_expected_runtime_run
+
+        async def _execute() -> str:
+            output_file = await create_task_window(
+                task_id,
+                cfg.alias,
+                command,
+                tee=True,
+                is_script=is_script,
+                cwd=cwd,
+                sudo=sudo,
+                shell=cfg.shell.value,
+            )
+            rc = await wait_for_completion(task_id, timeout=config.run_ceiling)
+
+            output = ""
+            if output_file and output_file.exists():
+                raw = output_file.read_text(encoding="utf-8", errors="replace")
+                # Truncate for inline response (full output on disk)
+                if len(raw) > config.max_inline_output:
+                    output = raw[:config.max_inline_output] + "\n... [truncated, use read_output]"
+                else:
+                    output = raw
+            cleanup_task_files(task_id)
+            return json.dumps({
+                "_host": host,
+                "_agent": "run",
+                "output": output,
+                "return_code": rc,
+                "output_file": str(output_file) if output_file else None,
+            })
+
+        return await _auto_promote(
+            _execute,
+            block_timeout=block_timeout,
+            agent="run",
+            host=host,
+            prompt=command[:200],
+            client_class=ctx.classification,
+            task_id=task_id,
+            expected_runtime=ert,
+        )
+
 
     @mcp.tool()
     async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:

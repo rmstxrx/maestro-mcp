@@ -26,6 +26,13 @@ class MaestroConfig:
     oauth_state_path: Path
     task_ledger_path: Path
     trusted_client_ids: frozenset[str]
+    # ADR-0007: system-policy timeouts and runtime estimates
+    run_ceiling: int
+    dispatch_ceiling: int
+    default_expected_runtime_run: int
+    default_expected_runtime_dispatch: int
+    output_retention_days: int
+    max_tasks_per_host: int
 
     @classmethod
     def from_env(cls) -> "MaestroConfig":
@@ -66,4 +73,11 @@ class MaestroConfig:
                 for c in os.environ.get("MAESTRO_TRUSTED_CLIENT_IDS", "").split(",")
                 if c.strip()
             ),
+            # ADR-0007: system-policy timeouts (not exposed to callers)
+            run_ceiling=300,
+            dispatch_ceiling=int(os.environ.get("MAESTRO_DISPATCH_CEILING", "21600")),
+            default_expected_runtime_run=15,
+            default_expected_runtime_dispatch=1800,
+            output_retention_days=90,
+            max_tasks_per_host=int(os.environ.get("MAESTRO_MAX_TASKS_PER_HOST", "10")),
         )

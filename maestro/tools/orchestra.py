@@ -711,6 +711,8 @@ async def _auto_promote(
     client_class: str = "unknown",
     output_file_factory: Callable[[str], Path] | None = None,
     output_holder: list[Path | None] | None = None,
+    task_id: str | None = None,
+    expected_runtime: int | None = None,
 ) -> str:
     """Run execute_fn with adaptive blocking.
 
@@ -719,7 +721,7 @@ async def _auto_promote(
       == 0 -- dispatch immediately (never block)
       < 0  -- block forever (legacy behaviour, no promotion)
     """
-    task_id = secrets.token_hex(8)
+    task_id = task_id or secrets.token_hex(8)
     started_at = datetime.now(timezone.utc)
     output_file = output_file_factory(task_id) if output_file_factory else None
     if output_holder is not None:
