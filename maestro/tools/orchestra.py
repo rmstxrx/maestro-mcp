@@ -871,6 +871,185 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
     assert isinstance(mcp, FastMCP)
 
+    # --- ADR-0007: Unified dispatch ---
+
+    def _build_agent_cli(
+        agent: str,
+        prompt: str,
+        working_dir: str,
+        *,
+        model: str = "",
+        reasoning_effort: str = "xhigh",
+        approval_mode: str = "plan",
+        context_files: list[str] | None = None,
+        resume: str = "",
+        allowed_tools: str = "",
+        mode: str = "oneshot",
+    ) -> str:
+        """Build the CLI command string for a given agent."""
+        if mode == "interactive":
+            # Interactive: start agent bare, no prompt flag
+            if agent == "codex":
+                return f"codex -C {shlex.quote(working_dir)}"
+            elif agent == "gemini":
+                model_flag = f"--model {shlex.quote(model)} " if model else ""
+                approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
+                return f"gemini {model_flag}{approval_flag}"
+            elif agent == "claude":
+                return "claude"
+            else:
+                raise ValueError(f"Unknown agent: {agent}")
+
+        # One-shot: full CLI with prompt
+        scoped_prompt = AGENT_SCOPE_PREFIX + prompt
+        escaped_prompt = shlex.quote(scoped_prompt)
+
+        if agent == "codex":
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
+            return (
+                f"codex exec --dangerously-bypass-approvals-and-sandbox --json "
+                f"{model_flag}{effort_flag}"
+                f"-C {shlex.quote(working_dir)} {escaped_prompt}"
+            )
+        elif agent == "gemini":
+            full_prompt = prompt
+            if context_files:
+                file_refs = " ".join(f"@{f}" for f in context_files)
+                full_prompt = f"{file_refs} {prompt}"
+            escaped = shlex.quote(AGENT_SCOPE_PREFIX + full_prompt)
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
+            resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
+            return (
+                f"gemini -p {escaped} --output-format json "
+                f"{model_flag}{approval_flag}{resume_flag}"
+            )
+        elif agent == "claude":
+            default_tools = (
+                "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),"
+                "Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),"
+                "Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),"
+                "Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read"
+            )
+            tools = allowed_tools or default_tools
+            return (
+                f"claude -p {escaped_prompt} --output-format json "
+                f"--permission-mode bypassPermissions "
+                f"--allowedTools {shlex.quote(tools)}"
+            )
+        else:
+            raise ValueError(f"Unknown agent: {agent}")
+
+    @mcp.tool()
+    async def dispatch(
+        host: str,
+        agent: str,
+        prompt: str,
+        working_dir: str,
+        mode: str = "oneshot",
+        expected_runtime: int | None = None,
+        model: str = "",
+        reasoning_effort: str = "xhigh",
+        approval_mode: str = "plan",
+        context_files: list[str] | None = None,
+        resume: str = "",
+        allowed_tools: str = "",
+    ) -> str:
+        """Dispatch a task to an AI agent (codex, gemini, or claude).
+
+        mode: "oneshot" (default) fires with prompt, runs to completion.
+              "interactive" starts the agent bare — drive it via observe/steer.
+
+        All dispatches run in the background (block_timeout=0). Returns
+        {auto_promoted: true, task_id}. Use observe(task_id) for live output,
+        steer(task_id) to redirect, tasks() for status, read_output for results.
+
+        Timeout: 6h hard ceiling (system policy). 30min default overtime flag.
+        expected_runtime: your estimate (seconds). Recorded verbatim in ledger.
+
+        Validates working_dir against host's allowed_dirs.
+        Injects AGENT_SCOPE_PREFIX (pointer to AGENTS.md) automatically."""
+        valid_agents = ("codex", "gemini", "claude")
+        if agent not in valid_agents:
+            return json.dumps({"error": "validation_error", "detail": f"agent must be one of {valid_agents}, got '{agent}'"})
+        if mode not in ("oneshot", "interactive"):
+            return json.dumps({"error": "validation_error", "detail": f"mode must be 'oneshot' or 'interactive', got '{mode}'"})
+        try:
+            cfg = _resolve_host_config(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
+            return json.dumps({
+                "error": "validation_error", "host": host,
+                "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}",
+            })
+
+        from maestro.mux import create_task_window, wait_for_completion, get_output_path
+        from maestro.hosts import _resolve_host
+
+        ctx = get_client_context()
+        task_id = secrets.token_hex(8)
+        ert = expected_runtime if expected_runtime is not None else config.default_expected_runtime_dispatch
+        host_cfg = _resolve_host(host)
+
+        cli_cmd = _build_agent_cli(
+            agent, prompt, working_dir,
+            model=model, reasoning_effort=reasoning_effort,
+            approval_mode=approval_mode, context_files=context_files,
+            resume=resume, allowed_tools=allowed_tools, mode=mode,
+        )
+
+        async def _execute() -> str:
+            output_file = await create_task_window(
+                task_id,
+                host_cfg.alias,
+                cli_cmd,
+                tee=True,
+                interactive=(mode == "interactive"),
+                cwd=working_dir,
+                shell=host_cfg.shell.value,
+            )
+            rc = await wait_for_completion(task_id, timeout=config.dispatch_ceiling)
+
+            # Read captured output
+            raw_output = ""
+            out_path = get_output_path(task_id)
+            if out_path.exists():
+                raw_output = out_path.read_text(encoding="utf-8", errors="replace")
+
+            # Post-process gemini JSON envelope
+            if agent == "gemini":
+                raw_output = _extract_gemini_response(raw_output)
+
+            # Build structured result
+            preview, was_truncated = _orchestra_truncate(raw_output)
+            return json.dumps({
+                "agent": agent,
+                "host": host,
+                "mode": mode,
+                "success": rc == 0,
+                "return_code": rc,
+                "output_file": str(out_path),
+                "output_preview": preview,
+                "truncated": was_truncated,
+                "output_bytes": len(raw_output),
+            }, indent=2, ensure_ascii=False)
+
+        return await _auto_promote(
+            _execute,
+            block_timeout=0,  # dispatches always go background
+            agent=agent,
+            host=host,
+            prompt=prompt[:200],
+            client_class=ctx.classification,
+            task_id=task_id,
+            expected_runtime=ert,
+            output_file_factory=lambda tid: _orchestra_output_path(agent, tid),
+        )
+
+    # --- Legacy agent tools (removed in Phase 5) ---
+
     @mcp.tool()
     async def codex(
         host: str, prompt: str, working_dir: str,
