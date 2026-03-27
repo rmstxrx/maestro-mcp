@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,27 @@ from maestro.transport import (
 )
 
 logger = logging.getLogger("maestro")
+
+
+def _record_io(task_type: str, host: str, prompt: str, status: str = "done") -> None:
+    """Record a ledger entry for a synchronous I/O operation (read/write/transfer)."""
+    from maestro.tools.orchestra import _record_ledger_entry, get_task_ledger
+    from maestro.client import get_client_context
+    if get_task_ledger() is None:
+        return
+    ctx = get_client_context()
+    now = datetime.now(timezone.utc)
+    _record_ledger_entry(
+        task_id=secrets.token_hex(4),
+        agent=task_type,
+        host=host,
+        prompt=prompt[:200],
+        status=status,
+        client_class=ctx.classification,
+        dispatched_at=now,
+        output_file=None,
+        task_type=task_type,
+    )
 
 _AGENT_CLI_PATTERNS = re.compile(
     r"^\s*(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
@@ -326,7 +348,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 cmd = f"tail -n {tail} {shlex.quote(path)}"
             else:
                 cmd = f"cat {shlex.quote(path)}"
-        return await _ssh_run(host, [cmd], timeout=config.ssh_timeout)
+        result = await _ssh_run(host, [cmd], timeout=config.ssh_timeout)
+        _record_io("read", host, path)
+        return result
 
     @mcp.tool()
     async def write(host: str, path: str, content: str, append: bool = False, sudo: bool = False) -> str:
@@ -347,7 +371,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 cmd = f"$input | Out-File -Append -LiteralPath {_ps_quote(path)}"
             else:
                 cmd = f"$input | Out-File -LiteralPath {_ps_quote(path)}"
-            return await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
+            result = await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
+            _record_io("write", host, path)
+            return result
         else:
             parent = os.path.dirname(path)
             quoted = shlex.quote(path)
@@ -358,7 +384,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             else:
                 mkdir_part = f"mkdir -p {shlex.quote(parent)} && " if parent else ""
                 cmd = f"{mkdir_part}tee {tee_flag} {quoted} > /dev/null"
-            return await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
+            result = await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
+            _record_io("write", host, path)
+            return result
 
     @mcp.tool()
     async def transfer(host: str, direction: str, local_path: str, remote_path: str) -> str:
@@ -370,11 +398,15 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         if direction == "upload":
             if cfg.is_local:
                 return _local_copy(local_path, remote_path, upload=True)
-            return await _scp_run(host, local_path, remote_path, upload=True)
+            result = await _scp_run(host, local_path, remote_path, upload=True)
+            _record_io("transfer", host, f"upload {local_path} -> {remote_path}")
+            return result
         elif direction == "download":
             if cfg.is_local:
                 return _local_copy(remote_path, local_path, upload=False)
-            return await _scp_run(host, remote_path, local_path, upload=False)
+            result = await _scp_run(host, remote_path, local_path, upload=False)
+            _record_io("transfer", host, f"download {remote_path} -> {local_path}")
+            return result
         else:
             return json.dumps({"error": f"Invalid direction '{direction}'. Use 'upload' or 'download'."})
 
@@ -670,20 +702,85 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         except RuntimeError as e:
             return json.dumps({"error": str(e), "task_id": task_id})
 
+    @mcp.tool()
+    async def service(
+        host: str,
+        command: str,
+        label: str = "",
+        cwd: str | None = None,
+        capture: bool = False,
+    ) -> str:
+        """Start a long-running process on a host (ADR-0007).
+
+        For services like vLLM, Jupyter, training runs, or any process
+        that runs indefinitely. No hard ceiling — runs until stopped.
+
+        The service is observable via observe(task_id) for live pane output
+        and steerable via steer(task_id). Stop with stop(task_id).
+
+        capture: if True, tee output to disk (caution: service logs grow).
+        Default is False — rely on observe for live reads.
+
+        Overtime advisory at 24h (configurable). This is informational, not
+        a kill signal.
+
+        Returns immediately with {task_id} — always background."""
+        try:
+            cfg = _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        task_id = secrets.token_hex(8)
+        ctx = get_client_context()
+
+        await create_task_window(
+            task_id,
+            cfg.alias,
+            command,
+            tee=capture,
+            interactive=False,
+            cwd=cwd,
+            shell=cfg.shell.value,
+        )
+
+        # Record in ledger
+        from maestro.tools.orchestra import _record_ledger_entry
+        from datetime import datetime, timezone as tz
+        _record_ledger_entry(
+            task_id=task_id,
+            agent="service",
+            host=host,
+            prompt=(label or command[:200]),
+            status="running",
+            client_class=ctx.classification,
+            dispatched_at=datetime.now(tz.utc),
+            output_file=get_output_path(task_id) if capture else None,
+            expected_runtime=config.service_overtime_advisory,
+            task_type="service",
+        )
+
+        return json.dumps({
+            "task_id": task_id,
+            "host": host,
+            "label": label or command[:80],
+            "capture": capture,
+            "hint": "Use observe(task_id) for live output, stop(task_id) to kill.",
+        })
+
     # --- Legacy mux tools (removed in Phase 8) ---
 
     @mcp.tool()
     async def mux_start(
         host: str,
-        command: str,
         label: str = "",
-        cwd: str | None = None,
-        cleanup: bool = False,
     ) -> str:
-        """Run a command in a named terminal session on a host.
+        """Open an interactive terminal session on a host.
 
-        The session stays alive after the command exits (for inspection) unless cleanup=True.
-        Returns JSON with session name, host, and result. Use mux_read() to view output, mux_input() to interact, mux_stop() to close."""
+        Creates a tmux window with an SSH shell to the host.
+        Returns immediately with the window name for future queries.
+
+        Use mux_input() to send commands, mux_read() to check output,
+        mux_stop() to close. Do NOT pass commands here — use mux_input."""
         try:
             _resolve_mux_host(host)
             name = label or f"spawn-{secrets.token_hex(4)}"
@@ -691,15 +788,17 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
 
-        result = await mux_spawn(
-            host,
-            command,
-            name,
-            timeout=config.ssh_timeout,
-            cwd=cwd,
-            cleanup=cleanup,
-        )
-        return json.dumps({"host": host, "window": name, "output": result})
+        try:
+            await mux_spawn(
+                host,
+                "",  # No command — interactive shell
+                name,
+                timeout=10,
+                cleanup=False,
+            )
+            return json.dumps({"host": host, "window": name, "status": "ready"})
+        except Exception as e:
+            return json.dumps({"host": host, "window": name, "error": str(e)})
 
     @mcp.tool()
     async def mux_read(host: str, window: str, lines: int = 50) -> str:

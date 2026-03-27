@@ -33,6 +33,7 @@ class MaestroConfig:
     default_expected_runtime_dispatch: int
     output_retention_days: int
     max_tasks_per_host: int
+    service_overtime_advisory: int
 
     @classmethod
     def from_env(cls) -> "MaestroConfig":
@@ -80,4 +81,5 @@ class MaestroConfig:
             default_expected_runtime_dispatch=1800,
             output_retention_days=90,
             max_tasks_per_host=int(os.environ.get("MAESTRO_MAX_TASKS_PER_HOST", "10")),
+            service_overtime_advisory=86400,
         )
