@@ -47,6 +47,7 @@ from maestro.mux import (
     list_windows,
     send_keys,
     wait_for_completion,
+    TMUX_SESSION,
 )
 from maestro.tools.orchestra import (
     _auto_promote,
@@ -537,6 +538,97 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         if rc == 0:
             return json.dumps({"host": h, "sessions": out})
         return json.dumps({"host": h, "error": out})
+
+    # --- ADR-0007: Task lifecycle tools ---
+
+    @mcp.tool()
+    async def observe(task_id: str, lines: int = 50) -> str:
+        """Capture live output from a running task's tmux pane (ADR-0007).
+
+        Local pane read — zero SSH cost, instant response.
+        Works on any task: run, dispatch, service, interactive.
+        Use to monitor agent progress, check command output, or
+        verify a service is running.
+
+        Returns the last N lines of visible pane content."""
+        try:
+            content = await capture_pane(task_id, lines)
+            return json.dumps({
+                "task_id": task_id,
+                "lines": lines,
+                "content": content,
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": str(e), "task_id": task_id})
+
+    @mcp.tool()
+    async def steer(task_id: str, keys: str) -> str:
+        """Send input to a running task's tmux pane (ADR-0007).
+
+        Keystrokes are sent locally and relayed through SSH to the remote process.
+        Everything sent is logged to the task's output file (audit trail).
+
+        Use to: course-correct an agent, answer a prompt, send Ctrl-C (use 'C-c'),
+        type Enter (use 'Enter'), or drive an interactive agent session.
+
+        Special keys: Enter, C-c (Ctrl+C), C-d (Ctrl+D), Escape, Tab."""
+        try:
+            await send_keys(task_id, keys)
+
+            # Log the steering input to the output file for audit trail
+            from maestro.mux import get_output_path
+            output_file = get_output_path(task_id)
+            if output_file.exists():
+                with open(output_file, "a") as f:
+                    f.write(f"\n[STEER] {keys}\n")
+
+            return json.dumps({
+                "task_id": task_id,
+                "sent": keys,
+                "logged": True,
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": str(e), "task_id": task_id})
+
+    @mcp.tool()
+    async def stop(task_id: str) -> str:
+        """Kill a running task (ADR-0007).
+
+        Kills the Cellar-local tmux window. The SSH session inside it dies,
+        which terminates the remote process.
+
+        Safety: refuses to kill the tmux server itself. Only task windows
+        can be stopped.
+
+        Updates the task ledger with status='killed'."""
+        # Validate task_id format (prevent killing arbitrary windows)
+        if not task_id or len(task_id) < 8:
+            return json.dumps({"error": "Invalid task_id", "task_id": task_id})
+
+        window_name = f"task-{task_id[:12]}"
+        # Safety: refuse to kill the session itself
+        if window_name in ("tasks", TMUX_SESSION):
+            return json.dumps({"error": "Cannot kill the tmux session", "task_id": task_id})
+
+        try:
+            await kill_window(task_id)
+
+            # Update ledger
+            from maestro.tools.orchestra import get_task_ledger
+            ledger = get_task_ledger()
+            if ledger:
+                from datetime import datetime, timezone
+                ledger.update(task_id, status="killed", completed_at=datetime.now(timezone.utc))
+
+            return json.dumps({
+                "task_id": task_id,
+                "status": "killed",
+                "window": window_name,
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": str(e), "task_id": task_id})
+
+    # --- Legacy mux tools (removed in Phase 8) ---
 
     @mcp.tool()
     async def mux_start(

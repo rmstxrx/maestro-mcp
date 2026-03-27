@@ -147,6 +147,8 @@ class TaskLedgerEntry:
     return_code: int | None = None
     output_file: str | None = None
     result_url: str = ""
+    expected_runtime: int | None = None
+    task_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -161,6 +163,8 @@ class TaskLedgerEntry:
             "return_code": self.return_code,
             "output_file": self.output_file,
             "result_url": self.result_url,
+            "expected_runtime": self.expected_runtime,
+            "task_type": self.task_type,
         }
 
     @classmethod
@@ -181,6 +185,8 @@ class TaskLedgerEntry:
             return_code=data.get("return_code"),
             output_file=data.get("output_file"),
             result_url=data.get("result_url", ""),
+            expected_runtime=data.get("expected_runtime"),
+            task_type=data.get("task_type", ""),
         )
 
 
@@ -555,6 +561,8 @@ def _record_ledger_entry(
     client_class: str,
     dispatched_at: datetime,
     output_file: Path | None,
+    expected_runtime: int | None = None,
+    task_type: str = "",
 ) -> None:
     if _TASK_LEDGER is None:
         return
@@ -568,6 +576,8 @@ def _record_ledger_entry(
             client_class=client_class,
             dispatched_at=dispatched_at,
             output_file=str(output_file) if output_file else None,
+            expected_runtime=expected_runtime,
+            task_type=task_type,
         )
     )
 
@@ -735,6 +745,7 @@ async def _auto_promote(
         client_class=client_class,
         dispatched_at=started_at,
         output_file=output_file,
+        expected_runtime=expected_runtime,
     )
 
     work_task = asyncio.create_task(execute_fn())
