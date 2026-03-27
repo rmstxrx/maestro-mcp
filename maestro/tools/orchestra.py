@@ -674,38 +674,25 @@ async def _orchestra_run_cli(
     cwd: str | None = None,
     window_name: str | None = None,
 ) -> tuple[int, str]:
-    """Run a CLI command via mux, returning (rc, formatted_output)."""
-    from maestro.hosts import HostShell
-    from maestro.mux import mux_run, mux_spawn
+    """Run a CLI command on a host, returning (rc, formatted_output).
 
-    assert _FORMAT_RESULT
-    cfg = _RESOLVE_HOST(host) if _RESOLVE_HOST else None
-    if cfg and cfg.shell == HostShell.POWERSHELL:
+    Uses the SSH transport layer directly (ADR-0007).
+    The window_name parameter is accepted for signature compatibility
+    but ignored — dispatch has its own tmux code path."""
+    from maestro.hosts import HostShell
+
+    assert _FORMAT_RESULT and _ASYNC_RUN and _RESOLVE_HOST
+
+    cfg = _RESOLVE_HOST(host)
+    if cfg.shell == HostShell.POWERSHELL:
         rc, stdout, stderr = await _orchestra_run_cli_raw_ps(host, cli_command, timeout, cwd)
         return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
-    if window_name:
-        raw = await mux_spawn(host, cli_command, name=window_name, timeout=timeout, cwd=cwd)
-    else:
-        raw = await mux_run(host, cli_command, timeout=timeout, cwd=cwd)
-
-    rc = 0
-    marker = "[exit code: "
-    if marker in raw:
-        try:
-            rc = int(raw.rsplit(marker, 1)[-1].split("]", 1)[0])
-        except (ValueError, TypeError):
-            rc = -1
-    else:
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            if raw.startswith("[local timeout after") or raw.startswith("[local error]"):
-                rc = -1
-        else:
-            if isinstance(parsed, dict) and "error" in parsed:
-                rc = -1
-    return rc, raw
+    full_cmd = _WRAP_COMMAND(cfg, cli_command, cwd, False)
+    rc, stdout, stderr = await _ASYNC_RUN(
+        ["ssh", cfg.alias, full_cmd], timeout=timeout,
+    )
+    return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
 
 # ---------------------------------------------------------------------------
