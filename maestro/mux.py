@@ -1,337 +1,298 @@
+"""Cellar-local tmux multiplexer — ADR-0007.
+
+All task execution runs inside tmux windows on the Cellar. Remote commands
+are wrapped in SSH sessions inside those windows. Maestro observes, steers,
+and detects completion locally — no network crossing required.
+
+Only Maestro creates tmux sessions. Agents never create remote tmux.
+"""
+
 from __future__ import annotations
 
-import base64
-import secrets
+import asyncio
+import logging
 import shlex
-from collections.abc import Awaitable, Callable
-from typing import Any
+from pathlib import Path
 
-from maestro.config import MaestroConfig
-from maestro.hosts import HostShell
+logger = logging.getLogger("maestro")
 
 TMUX_SERVER = "maestro"
-TMUX_SESSION = "main"
-TEMP_PREFIX = "/tmp/maestro_run_"
-RAW_OUTPUT_PREFIX = "__MAESTRO_MUX_RAW__"
-
-_ResolveHost = Callable[[str], Any]
-_Run = Callable[..., Awaitable[str]]
-
-_CONFIG: MaestroConfig | None = None
-_RESOLVE_HOST: _ResolveHost | None = None
-_SSH_RUN: _Run | None = None
-_LOCAL_RUN: _Run | None = None
-_FORMAT_RESULT: Callable[[str, str, int], str] | None = None
+TMUX_SESSION = "tasks"
+OUTPUT_DIR = Path("/root/.maestro/task_output")
 
 
-def configure_mux(
-    *,
-    config: MaestroConfig,
-    resolve_host: _ResolveHost,
-    ssh_run: _Run,
-    local_run: _Run,
-    format_result: Callable[[str, str, int], str],
-) -> None:
-    global _CONFIG, _RESOLVE_HOST, _SSH_RUN, _LOCAL_RUN, _FORMAT_RESULT
-    _CONFIG = config
-    _RESOLVE_HOST = resolve_host
-    _SSH_RUN = ssh_run
-    _LOCAL_RUN = local_run
-    _FORMAT_RESULT = format_result
+def configure_mux(*, output_dir: Path | None = None, **legacy_kwargs) -> None:
+    """Set the output directory for task captures. Called once at startup.
+
+    Forwards legacy kwargs (config, resolve_host, ssh_run, etc.) to
+    _mux_legacy.configure_mux so existing callers keep working.
+    """
+    global OUTPUT_DIR
+    if output_dir is not None:
+        OUTPUT_DIR = output_dir
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Forward to legacy module so fleet.py/orchestra.py keep working
+    if legacy_kwargs:
+        configure_mux_legacy(**legacy_kwargs)
 
 
-def _require_config() -> MaestroConfig:
-    if _CONFIG is None:
-        raise RuntimeError("mux helpers are not configured")
-    return _CONFIG
-
-
-def _resolve_host_config(host: str) -> Any:
-    if _RESOLVE_HOST is None:
-        raise RuntimeError("mux helpers are not configured")
-    return _RESOLVE_HOST(host)
-
-
-def _format_result(stdout: str, stderr: str, returncode: int) -> str:
-    if _FORMAT_RESULT is None:
-        raise RuntimeError("mux helpers are not configured")
-    return _FORMAT_RESULT(stdout, stderr, returncode)
-
-
-async def _ssh_run(
-    host: str,
-    ssh_args: list[str],
-    *,
-    timeout: int,
-    stdin_data: str | None = None,
-) -> str:
-    if _SSH_RUN is None:
-        raise RuntimeError("mux helpers are not configured")
-    return await _SSH_RUN(host, ssh_args, timeout=timeout, stdin_data=stdin_data)
-
-
-async def _local_run(
-    command: str,
-    *,
-    timeout: int,
-    stdin_data: str | None = None,
-) -> str:
-    if _LOCAL_RUN is None:
-        raise RuntimeError("mux helpers are not configured")
-    return await _LOCAL_RUN(command, timeout=timeout, stdin_data=stdin_data)
-
-
-def _session_bootstrap_command() -> str:
-    return (
-        f"tmux -L {TMUX_SERVER} has-session -t {TMUX_SESSION} 2>/dev/null || "
-        f"tmux -L {TMUX_SERVER} new-session -d -s {TMUX_SESSION}"
+async def _tmux(*args: str, timeout: int = 10) -> str:
+    """Run a tmux command against the maestro server. Returns stdout."""
+    cmd = ["tmux", "-L", TMUX_SERVER, *args]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"tmux command timed out: {' '.join(cmd)}")
+    stdout = stdout_b.decode(errors="replace").rstrip("\n")
+    if proc.returncode != 0:
+        stderr = stderr_b.decode(errors="replace").rstrip("\n")
+        if "no server running" not in stderr and "session not found" not in stderr:
+            logger.debug("tmux [rc=%d]: %s — %s", proc.returncode, " ".join(args), stderr)
+    return stdout
 
 
-def _build_ephemeral_wrapper(
+async def ensure_server() -> None:
+    """Ensure the maestro tmux server and task session exist."""
+    result = await asyncio.create_subprocess_exec(
+        "tmux", "-L", TMUX_SERVER, "has-session", "-t", TMUX_SESSION,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await result.wait()
+    if result.returncode != 0:
+        await _tmux("new-session", "-d", "-s", TMUX_SESSION)
+        logger.info("mux: created tmux server '%s', session '%s'", TMUX_SERVER, TMUX_SESSION)
+
+
+def _build_wrapper(
+    task_id: str,
+    ssh_alias: str,
     command: str,
-    run_id: str,
+    *,
+    tee: bool = True,
     cwd: str | None = None,
     sudo: bool = False,
+    shell: str = "bash",
 ) -> str:
-    """Build the bash wrapper script for tmux ephemeral execution."""
-    runner = "sudo bash" if sudo else "bash"
-    tmux_parts = [f"tmux -L {TMUX_SERVER} new-window"]
-    if cwd:
-        tmux_parts.append(f"-c {shlex.quote(cwd)}")
-    tmux_parts.append(f"-t {TMUX_SESSION}")
-    tmux_parts.append(
-        f'"{runner} \\"$_MUX_CMD\\" > \\"$_MUX_OUT\\" 2>&1; '
-        'echo \\$? > \\"$_MUX_RC\\"; rm -f \\"$_MUX_CMD\\""'
-    )
-    window_command = " ".join(tmux_parts)
+    """Build wrapper script for a single command inside a Cellar-local tmux window."""
+    output_file = OUTPUT_DIR / f"{task_id}.txt"
+    rc_file = OUTPUT_DIR / f"{task_id}.rc"
 
-    lines = [
-        "set -e",
-        _session_bootstrap_command(),
-        "",
-        f'_MUX_ID="{run_id}"',
-        f'_MUX_CMD="{TEMP_PREFIX}${{_MUX_ID}}.cmd"',
-        f'_MUX_OUT="{TEMP_PREFIX}${{_MUX_ID}}.out"',
-        f'_MUX_RC="{TEMP_PREFIX}${{_MUX_ID}}.rc"',
-        "",
-        'cat > "$_MUX_CMD" << \'__MAESTRO_CMD_END__\'',
-        command,
-        "__MAESTRO_CMD_END__",
-        "",
-        window_command,
-        "",
-        'while [ ! -f "$_MUX_RC" ]; do sleep 0.01; done',
-        "",
-        'cat "$_MUX_OUT"',
-        '_MUX_EXIT=$(cat "$_MUX_RC")',
-        "",
-        'rm -f "$_MUX_OUT" "$_MUX_RC"',
-        "",
-        "exit $_MUX_EXIT",
-    ]
-    return "\n".join(lines)
-
-
-def _build_spawn_wrapper(
-    command: str,
-    run_id: str,
-    name: str,
-    cwd: str | None = None,
-    sudo: bool = False,
-    cleanup: bool = False,
-) -> str:
-    """Build the bash wrapper script for named tmux execution."""
-    runner = "sudo bash" if sudo else "bash"
-    quoted_name = shlex.quote(name)
-    tmux_parts = [f"tmux -L {TMUX_SERVER} new-window", f"-n {quoted_name}"]
-    if cwd:
-        tmux_parts.append(f"-c {shlex.quote(cwd)}")
-    tmux_parts.append(f"-t {TMUX_SESSION}")
-    tmux_parts.append(
-        f'"{runner} \\"$_MUX_CMD\\" > \\"$_MUX_OUT\\" 2>&1; '
-        'echo \\$? > \\"$_MUX_RC\\"; rm -f \\"$_MUX_CMD\\""'
-    )
-    window_command = " ".join(tmux_parts)
-
-    lines = [
-        "set -e",
-        _session_bootstrap_command(),
-        "",
-        f'_MUX_ID="{run_id}"',
-        f'_MUX_CMD="{TEMP_PREFIX}${{_MUX_ID}}.cmd"',
-        f'_MUX_OUT="{TEMP_PREFIX}${{_MUX_ID}}.out"',
-        f'_MUX_RC="{TEMP_PREFIX}${{_MUX_ID}}.rc"',
-        "",
-        'cat > "$_MUX_CMD" << \'__MAESTRO_CMD_END__\'',
-        command,
-        "__MAESTRO_CMD_END__",
-        "",
-        window_command,
-    ]
-    if not cleanup:
-        lines.extend([
-            "",
-            f"tmux -L {TMUX_SERVER} set-option -t {quoted_name} remain-on-exit on",
-        ])
-    lines.extend([
-        "",
-        'while [ ! -f "$_MUX_RC" ]; do sleep 0.01; done',
-        "",
-        'cat "$_MUX_OUT"',
-        '_MUX_EXIT=$(cat "$_MUX_RC")',
-        "",
-        'rm -f "$_MUX_OUT" "$_MUX_RC"',
-        "",
-        "exit $_MUX_EXIT",
-    ])
-    return "\n".join(lines)
-
-
-def _decode_marked_output(result: str) -> str:
-    if not result.startswith(RAW_OUTPUT_PREFIX):
-        return result
-    encoded = result[len(RAW_OUTPUT_PREFIX):]
-    if not encoded:
-        return ""
-    return base64.b64decode(encoded.encode("ascii")).decode(errors="replace")
-
-
-async def _run_bash_command(
-    host: str,
-    command: str,
-    *,
-    timeout: int | None = None,
-) -> str:
-    cfg = _resolve_host_config(host)
-    if cfg.shell == HostShell.POWERSHELL:
-        raise ValueError("mux helpers do not support PowerShell hosts")
-
-    used_timeout = timeout if timeout is not None else _require_config().ssh_timeout
-    if cfg.is_local:
-        return await _local_run(f"bash -lc {shlex.quote(command)}", timeout=used_timeout)
-    return await _ssh_run(host, ["bash", "-lc", command], timeout=used_timeout)
-
-
-async def _run_bash_command_raw(
-    host: str,
-    command: str,
-    *,
-    timeout: int | None = None,
-) -> str:
-    wrapped = (
-        f"mux_raw_b64=$({command} | base64 | tr -d '\\n') && "
-        f"printf %s {shlex.quote(RAW_OUTPUT_PREFIX)} && "
-        'printf %s "$mux_raw_b64"'
-    )
-    return _decode_marked_output(await _run_bash_command(host, wrapped, timeout=timeout))
-
-
-async def ensure_session(host: str) -> bool:
-    """Verify the maestro tmux server is alive on the given host. Creates it if absent."""
-    cfg = _resolve_host_config(host)
-    if cfg.shell == HostShell.POWERSHELL:
-        return False
-
-    marker = "__MAESTRO_MUX_READY__"
-    expected = _format_result(marker, "", 0)
-    command = f"{_session_bootstrap_command()} && printf %s {shlex.quote(marker)}"
-    timeout = _require_config().ssh_timeout
-
-    if cfg.is_local:
-        result = await _local_run(command, timeout=timeout)
+    # Build the remote command
+    if shell == "powershell":
+        remote_parts = []
+        if cwd:
+            remote_parts.append(f"Set-Location -LiteralPath '{cwd}';")
+        remote_parts.append(f"sudo {command}" if sudo else command)
+        remote_cmd = " ".join(remote_parts)
     else:
-        result = await _ssh_run(host, ["bash", "-lc", command], timeout=timeout)
+        remote_parts = []
+        if cwd:
+            remote_parts.append(f"cd {shlex.quote(cwd)} &&")
+        if sudo:
+            remote_parts.append("sudo")
+        remote_parts.append(command)
+        remote_cmd = " ".join(remote_parts)
 
-    return result == expected
+    ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
+
+    lines = ["#!/bin/bash"]
+    if tee:
+        lines.append(f"{ssh_cmd} 2>&1 | tee {shlex.quote(str(output_file))}")
+        lines.append(f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(rc_file))}")
+    else:
+        lines.append(ssh_cmd)
+        lines.append(f"echo $? > {shlex.quote(str(rc_file))}")
+    lines.append(f"tmux -L {TMUX_SERVER} wait-for -S 'done-{task_id}'")
+    return "\n".join(lines)
 
 
-async def mux_run(
-    host: str,
-    command: str,
-    timeout: int = 300,
+def _build_script_wrapper(
+    task_id: str,
+    ssh_alias: str,
+    script_body: str,
+    *,
+    tee: bool = True,
     cwd: str | None = None,
     sudo: bool = False,
+    shell: str = "bash",
 ) -> str:
-    """Execute a command in a tmux ephemeral window on the given host."""
-    cfg = _resolve_host_config(host)
-    if cfg.shell == HostShell.POWERSHELL:
-        raise ValueError("mux_run does not support PowerShell hosts")
+    """Build wrapper for multi-line scripts piped via stdin."""
+    output_file = OUTPUT_DIR / f"{task_id}.txt"
+    rc_file = OUTPUT_DIR / f"{task_id}.rc"
 
-    wrapper_script = _build_ephemeral_wrapper(command, secrets.token_hex(4), cwd=cwd, sudo=sudo)
-    if cfg.is_local:
-        return await _local_run("bash -s", timeout=timeout, stdin_data=wrapper_script)
-    return await _ssh_run(host, ["bash", "-s"], timeout=timeout, stdin_data=wrapper_script)
+    if shell == "powershell":
+        script_lines = ["$ErrorActionPreference = 'Stop'"]
+        if cwd:
+            script_lines.append(f"Set-Location -LiteralPath '{cwd}'")
+        script_lines.append(script_body)
+        escaped_script = "\n".join(script_lines)
+        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} 'powershell -Command -'"
+    else:
+        script_lines = ["set -euo pipefail"]
+        if cwd:
+            script_lines.append(f"cd {shlex.quote(cwd)}")
+        script_lines.append(script_body)
+        escaped_script = "\n".join(script_lines)
+        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} 'bash -s'"
+
+    heredoc = f"cat << '__MAESTRO_SCRIPT__'\n{escaped_script}\n__MAESTRO_SCRIPT__"
+    full_cmd = f"{heredoc} | {ssh_cmd}"
+
+    lines = ["#!/bin/bash"]
+    if tee:
+        lines.append(f"{full_cmd} 2>&1 | tee {shlex.quote(str(output_file))}")
+        lines.append(f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(rc_file))}")
+    else:
+        lines.append(full_cmd)
+        lines.append(f"echo $? > {shlex.quote(str(rc_file))}")
+    lines.append(f"tmux -L {TMUX_SERVER} wait-for -S 'done-{task_id}'")
+    return "\n".join(lines)
 
 
-async def mux_spawn(
-    host: str,
+# -----------------------------------------------------------------------
+# Core primitives
+# -----------------------------------------------------------------------
+
+async def create_task_window(
+    task_id: str,
+    ssh_alias: str,
     command: str,
-    name: str,
-    timeout: int = 300,
+    *,
+    tee: bool = True,
+    interactive: bool = False,
+    is_script: bool = False,
     cwd: str | None = None,
     sudo: bool = False,
-    cleanup: bool = False,
-) -> str:
-    """Create a named tmux window and run a command, blocking until it exits."""
-    cfg = _resolve_host_config(host)
-    if cfg.shell == HostShell.POWERSHELL:
-        raise ValueError("mux_spawn does not support PowerShell hosts")
+    shell: str = "bash",
+) -> Path | None:
+    """Create a Cellar-local tmux window that SSHes to the target host.
 
-    wrapper_script = _build_spawn_wrapper(
-        command,
-        secrets.token_hex(4),
-        name,
-        cwd=cwd,
-        sudo=sudo,
-        cleanup=cleanup,
+    Returns the output file path (if tee=True), or None for interactive.
+    """
+    await ensure_server()
+
+    if is_script:
+        wrapper = _build_script_wrapper(
+            task_id, ssh_alias, command,
+            tee=tee, cwd=cwd, sudo=sudo, shell=shell,
+        )
+    else:
+        wrapper = _build_wrapper(
+            task_id, ssh_alias, command,
+            tee=(tee and not interactive), cwd=cwd, sudo=sudo, shell=shell,
+        )
+
+    # Write wrapper to temp file and run it in a new tmux window
+    wrapper_path = OUTPUT_DIR / f"{task_id}.sh"
+    wrapper_path.write_text(wrapper, encoding="utf-8")
+    wrapper_path.chmod(0o755)
+
+    window_name = f"task-{task_id[:12]}"
+    await _tmux(
+        "new-window",
+        "-t", TMUX_SESSION,
+        "-n", window_name,
+        f"bash {shlex.quote(str(wrapper_path))}",
     )
-    if cfg.is_local:
-        return await _local_run("bash -s", timeout=timeout, stdin_data=wrapper_script)
-    return await _ssh_run(host, ["bash", "-s"], timeout=timeout, stdin_data=wrapper_script)
+
+    output_file = OUTPUT_DIR / f"{task_id}.txt" if (tee and not interactive) else None
+    logger.info("mux: window '%s' → %s (task %s)", window_name, ssh_alias, task_id)
+    return output_file
 
 
-async def mux_capture(host: str, name: str, lines: int = 50) -> str:
-    """Capture the current screen content of a named tmux window."""
-    quoted_name = shlex.quote(name)
-    command = f"tmux -L {TMUX_SERVER} capture-pane -t {quoted_name} -p -S -{lines}"
-    return await _run_bash_command_raw(host, command)
-
-
-async def mux_send_keys(host: str, name: str, keys: str) -> str:
-    """Send keystrokes to a named tmux window."""
-    quoted_name = shlex.quote(name)
-    command = f"tmux -L {TMUX_SERVER} send-keys -t {quoted_name} -- {shlex.quote(keys)}"
-    return await _run_bash_command(host, command)
-
-
-async def mux_kill_window(host: str, name: str) -> str:
-    """Kill a named tmux window."""
-    quoted_name = shlex.quote(name)
-    command = f"tmux -L {TMUX_SERVER} kill-window -t {quoted_name}"
-    return await _run_bash_command(host, command)
-
-
-async def mux_list_windows(host: str) -> list[dict[str, str]]:
-    """List all windows in the maestro tmux session on a host."""
-    command = (
-        f"if tmux -L {TMUX_SERVER} has-session -t {TMUX_SESSION} 2>/dev/null; then "
-        f"tmux -L {TMUX_SERVER} list-windows -t {TMUX_SESSION} -F "
-        f"{shlex.quote('#{window_name}|#{pane_current_command}|#{window_activity}')}; "
-        "fi"
+async def wait_for_completion(task_id: str, timeout: int = 300) -> int:
+    """Block until a task signals completion. Zero-CPU wait. Returns exit code (-1 on timeout)."""
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "-L", TMUX_SERVER, "wait-for", f"done-{task_id}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    raw = await _run_bash_command_raw(host, command)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.warning("mux: task %s hit ceiling after %ds", task_id, timeout)
+        return -1
+
+    rc_file = OUTPUT_DIR / f"{task_id}.rc"
+    try:
+        return int(rc_file.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        logger.warning("mux: no rc file for task %s", task_id)
+        return -1
+
+
+async def capture_pane(task_id: str, lines: int = 50) -> str:
+    """Capture live output from a task's tmux pane. Local read, zero SSH cost."""
+    window_name = f"task-{task_id[:12]}"
+    return await _tmux(
+        "capture-pane", "-t", f"{TMUX_SESSION}:{window_name}",
+        "-p", "-S", f"-{lines}",
+    )
+
+
+async def send_keys(task_id: str, keys: str) -> None:
+    """Send keystrokes to a task's pane. Relayed through SSH to the remote process."""
+    window_name = f"task-{task_id[:12]}"
+    await _tmux(
+        "send-keys", "-t", f"{TMUX_SESSION}:{window_name}",
+        "--", keys,
+    )
+
+
+async def kill_window(task_id: str) -> None:
+    """Kill a task's tmux window. SSH session dies → remote process terminates."""
+    window_name = f"task-{task_id[:12]}"
+    # Signal done so any wait_for_completion unblocks
+    try:
+        await _tmux("wait-for", "-S", f"done-{task_id}")
+    except RuntimeError:
+        pass  # window may already be gone
+    try:
+        await _tmux("kill-window", "-t", f"{TMUX_SESSION}:{window_name}")
+    except RuntimeError:
+        pass
+    logger.info("mux: killed window '%s' (task %s)", window_name, task_id)
+
+
+async def list_windows() -> list[dict[str, str]]:
+    """List all task windows in the maestro tmux server."""
+    raw = await _tmux(
+        "list-windows", "-t", TMUX_SESSION,
+        "-F", "#{window_name}|#{pane_current_command}|#{window_activity}",
+    )
     if not raw:
         return []
-
     windows: list[dict[str, str]] = []
     for line in raw.splitlines():
         if not line or "|" not in line:
             continue
-        name, pane_command, activity = (line.split("|", 2) + ["", ""])[:3]
-        windows.append({
-            "name": name,
-            "command": pane_command,
-            "activity": activity,
-        })
+        parts = (line.split("|", 2) + ["", ""])[:3]
+        windows.append({"name": parts[0], "command": parts[1], "activity": parts[2]})
     return windows
+
+
+def get_output_path(task_id: str) -> Path:
+    """Get the expected output file path for a task."""
+    return OUTPUT_DIR / f"{task_id}.txt"
+
+
+def get_rc_path(task_id: str) -> Path:
+    """Get the expected exit code file path for a task."""
+    return OUTPUT_DIR / f"{task_id}.rc"
+
+
+def cleanup_task_files(task_id: str) -> None:
+    """Remove wrapper and rc files for a completed task. Output file is retained."""
+    for suffix in (".sh", ".rc"):
+        (OUTPUT_DIR / f"{task_id}{suffix}").unlink(missing_ok=True)
+

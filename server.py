@@ -106,13 +106,7 @@ configure_transport(
     format_result=_format_result,
 )
 configure_local(config=CONFIG, format_result=_format_result)
-configure_mux(
-    config=CONFIG,
-    resolve_host=_resolve_host,
-    ssh_run=_ssh_run,
-    local_run=_local_run,
-    format_result=_format_result,
-)
+configure_mux()  # ADR-0007: Cellar-local tmux, no legacy kwargs
 _task_ledger = TaskLedger(CONFIG.task_ledger_path, CONFIG.issuer_url)
 
 configure_orchestra(
