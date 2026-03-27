@@ -558,6 +558,7 @@ def _record_ledger_entry(
     agent: str,
     host: str,
     prompt: str,
+    status: str = "running",
     client_class: str,
     dispatched_at: datetime,
     output_file: Path | None,
@@ -572,7 +573,7 @@ def _record_ledger_entry(
             agent=agent,
             host=host,
             prompt=prompt[:200],
-            status="running",
+            status=status,
             client_class=client_class,
             dispatched_at=dispatched_at,
             output_file=str(output_file) if output_file else None,
@@ -1140,4 +1141,3 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                     row["overtime"] = elapsed > entry.expected_runtime
             rows.append(row)
         return json.dumps({"tasks": rows}, ensure_ascii=False)
-

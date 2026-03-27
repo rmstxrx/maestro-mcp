@@ -66,8 +66,9 @@ def _record_io(task_type: str, host: str, prompt: str, status: str = "done") -> 
         return
     ctx = get_client_context()
     now = datetime.now(timezone.utc)
+    task_id = secrets.token_hex(4)
     _record_ledger_entry(
-        task_id=secrets.token_hex(4),
+        task_id=task_id,
         agent=task_type,
         host=host,
         prompt=prompt[:200],
@@ -77,6 +78,9 @@ def _record_io(task_type: str, host: str, prompt: str, status: str = "done") -> 
         output_file=None,
         task_type=task_type,
     )
+    ledger = get_task_ledger()
+    if ledger:
+        ledger.update(task_id, status="done", completed_at=now)
 
 _AGENT_CLI_PATTERNS = re.compile(
     r"^\s*(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
