@@ -296,19 +296,3 @@ def cleanup_task_files(task_id: str) -> None:
     for suffix in (".sh", ".rc"):
         (OUTPUT_DIR / f"{task_id}{suffix}").unlink(missing_ok=True)
 
-
-# -----------------------------------------------------------------------
-# Legacy re-exports — fleet.py and orchestra.py import these names.
-# They still use the OLD remote-tmux approach. Removed in Phase 5.
-# -----------------------------------------------------------------------
-
-from maestro._mux_legacy import (  # noqa: E402, F401
-    configure_mux as configure_mux_legacy,
-    mux_run,
-    mux_spawn,
-    mux_capture,
-    mux_send_keys,
-    mux_kill_window,
-    mux_list_windows,
-    ensure_session,
-)
