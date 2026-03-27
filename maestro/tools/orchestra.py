@@ -1266,29 +1266,47 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         status: str | None = None,
         agent: str | None = None,
         host: str | None = None,
+        task_type: str | None = None,
         last: int = 10,
     ) -> str:
-        """List recent tasks from the persistent ledger. Filters: status (running|done|failed|timeout|orphaned), agent (codex|claude|gemini|exec|script), host. Returns up to `last` entries sorted most-recent-first with relative timestamps.
+        """List recent tasks from the persistent ledger (ADR-0007).
+
+        Filters: status (running|done|failed|timeout|orphaned|killed),
+        agent (codex|claude|gemini|exec|script), host, task_type (run|dispatch|service).
+        Returns up to `last` entries sorted most-recent-first.
+
+        Running tasks include elapsed_seconds and an overtime flag when
+        elapsed exceeds the caller's declared expected_runtime.
 
         Survives Maestro restarts. Tasks older than 30 days are auto-pruned."""
         ledger = get_task_ledger()
         if ledger is None:
             return json.dumps({"error": "Task ledger is not configured"})
         now = datetime.now(timezone.utc)
-        rows = [
-            {
+        entries = ledger.query(status=status, agent=agent, host=host, last=last)
+        if task_type is not None:
+            entries = [e for e in entries if e.task_type == task_type]
+        rows = []
+        for entry in entries:
+            row: dict[str, Any] = {
                 "task_id": entry.task_id,
                 "agent": entry.agent,
                 "host": entry.host,
                 "status": entry.status,
+                "task_type": entry.task_type or None,
                 "dispatched_at": _format_relative_time(entry.dispatched_at, now),
                 "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
                 "return_code": entry.return_code,
                 "output_file": entry.output_file,
                 "result_url": entry.result_url,
             }
-            for entry in ledger.query(status=status, agent=agent, host=host, last=last)
-        ]
+            if entry.status == "running":
+                elapsed = (now - entry.dispatched_at).total_seconds()
+                row["elapsed_seconds"] = round(elapsed, 1)
+                if entry.expected_runtime is not None:
+                    row["expected_runtime"] = entry.expected_runtime
+                    row["overtime"] = elapsed > entry.expected_runtime
+            rows.append(row)
         return json.dumps({"tasks": rows}, ensure_ascii=False)
 
     @mcp.tool()

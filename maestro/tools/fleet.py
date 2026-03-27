@@ -379,8 +379,15 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             return json.dumps({"error": f"Invalid direction '{direction}'. Use 'upload' or 'download'."})
 
     @mcp.tool()
-    async def status() -> str:
-        """Check connectivity of all hosts. Returns structured JSON."""
+    async def status(host: str = "", agents: bool = False) -> str:
+        """Fleet health check with auto-reconnect and optional agent discovery (ADR-0007).
+
+        Probes connectivity for all hosts (or a single host if specified).
+        Disconnected hosts get a full teardown + reconnect attempt automatically.
+        Set agents=True to also check Codex/Gemini/Claude Code CLI availability
+        on each connected host.
+
+        Consolidates the old status, reconnect_host, and agent_status tools."""
 
         async def _check_one(name: str, cfg: HostConfig) -> dict:
             if cfg.is_local:
@@ -390,6 +397,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             if alive:
                 await _update_host_status(name, HostStatus.CONNECTED)
                 return {"status": "connected", "local": False}
+            # Full reconnect: teardown stale socket, then warmup fresh
+            await _teardown_connection(cfg.alias)
+            await asyncio.sleep(0.5)
             if await _warmup_connection(cfg.alias):
                 await _update_host_status(name, HostStatus.CONNECTED)
                 return {"status": "reconnected", "local": False}
@@ -399,15 +409,47 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 result["error"] = cfg.last_error
             return result
 
+        async def _check_agents(name: str) -> dict:
+            agents_result = {}
+            for cli in ("codex", "gemini", "claude"):
+                rc, out = await _orchestra_run_cli(name, f"{cli} --version 2>&1", timeout=10)
+                agents_result[cli] = {"available": rc == 0, "version": out.strip()[:100] if rc == 0 else None}
+            return agents_result
+
+        # Filter to single host if specified
+        targets = {}
+        if host:
+            try:
+                cfg = _resolve_host(host)
+                targets[host] = cfg
+            except ValueError as e:
+                return _structured_error("validation_error", host, str(e))
+        else:
+            targets = dict(HOSTS)
+
         results = await asyncio.gather(
-            *[_check_one(name, cfg) for name, cfg in HOSTS.items()]
+            *[_check_one(name, cfg) for name, cfg in targets.items()]
         )
-        hosts_status = dict(zip(HOSTS.keys(), results))
-        connected = sum(1 for r in results if r["status"] in ("connected", "reconnected"))
+        hosts_status = dict(zip(targets.keys(), results))
+
+        # Optionally probe agent CLIs on connected hosts
+        if agents:
+            connected_names = [
+                name for name, r in hosts_status.items()
+                if r["status"] in ("connected", "reconnected")
+            ]
+            if connected_names:
+                agent_results = await asyncio.gather(
+                    *[_check_agents(name) for name in connected_names]
+                )
+                for name, ar in zip(connected_names, agent_results):
+                    hosts_status[name]["agents"] = ar
+
+        connected = sum(1 for r in hosts_status.values() if r["status"] in ("connected", "reconnected"))
         return json.dumps({
             "hosts": hosts_status,
             "available": connected,
-            "total": len(HOSTS),
+            "total": len(targets),
         })
 
     @mcp.tool()
