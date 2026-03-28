@@ -147,6 +147,8 @@ class TaskLedgerEntry:
     return_code: int | None = None
     output_file: str | None = None
     result_url: str = ""
+    expected_runtime: int | None = None
+    task_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -161,6 +163,8 @@ class TaskLedgerEntry:
             "return_code": self.return_code,
             "output_file": self.output_file,
             "result_url": self.result_url,
+            "expected_runtime": self.expected_runtime,
+            "task_type": self.task_type,
         }
 
     @classmethod
@@ -181,6 +185,8 @@ class TaskLedgerEntry:
             return_code=data.get("return_code"),
             output_file=data.get("output_file"),
             result_url=data.get("result_url", ""),
+            expected_runtime=data.get("expected_runtime"),
+            task_type=data.get("task_type", ""),
         )
 
 
@@ -552,9 +558,12 @@ def _record_ledger_entry(
     agent: str,
     host: str,
     prompt: str,
+    status: str = "running",
     client_class: str,
     dispatched_at: datetime,
     output_file: Path | None,
+    expected_runtime: int | None = None,
+    task_type: str = "",
 ) -> None:
     if _TASK_LEDGER is None:
         return
@@ -564,10 +573,12 @@ def _record_ledger_entry(
             agent=agent,
             host=host,
             prompt=prompt[:200],
-            status="running",
+            status=status,
             client_class=client_class,
             dispatched_at=dispatched_at,
             output_file=str(output_file) if output_file else None,
+            expected_runtime=expected_runtime,
+            task_type=task_type,
         )
     )
 
@@ -663,38 +674,25 @@ async def _orchestra_run_cli(
     cwd: str | None = None,
     window_name: str | None = None,
 ) -> tuple[int, str]:
-    """Run a CLI command via mux, returning (rc, formatted_output)."""
-    from maestro.hosts import HostShell
-    from maestro.mux import mux_run, mux_spawn
+    """Run a CLI command on a host, returning (rc, formatted_output).
 
-    assert _FORMAT_RESULT
-    cfg = _RESOLVE_HOST(host) if _RESOLVE_HOST else None
-    if cfg and cfg.shell == HostShell.POWERSHELL:
+    Uses the SSH transport layer directly (ADR-0007).
+    The window_name parameter is accepted for signature compatibility
+    but ignored — dispatch has its own tmux code path."""
+    from maestro.hosts import HostShell
+
+    assert _FORMAT_RESULT and _ASYNC_RUN and _RESOLVE_HOST
+
+    cfg = _RESOLVE_HOST(host)
+    if cfg.shell == HostShell.POWERSHELL:
         rc, stdout, stderr = await _orchestra_run_cli_raw_ps(host, cli_command, timeout, cwd)
         return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
-    if window_name:
-        raw = await mux_spawn(host, cli_command, name=window_name, timeout=timeout, cwd=cwd)
-    else:
-        raw = await mux_run(host, cli_command, timeout=timeout, cwd=cwd)
-
-    rc = 0
-    marker = "[exit code: "
-    if marker in raw:
-        try:
-            rc = int(raw.rsplit(marker, 1)[-1].split("]", 1)[0])
-        except (ValueError, TypeError):
-            rc = -1
-    else:
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            if raw.startswith("[local timeout after") or raw.startswith("[local error]"):
-                rc = -1
-        else:
-            if isinstance(parsed, dict) and "error" in parsed:
-                rc = -1
-    return rc, raw
+    full_cmd = _WRAP_COMMAND(cfg, cli_command, cwd, False)
+    rc, stdout, stderr = await _ASYNC_RUN(
+        ["ssh", cfg.alias, full_cmd], timeout=timeout,
+    )
+    return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +709,8 @@ async def _auto_promote(
     client_class: str = "unknown",
     output_file_factory: Callable[[str], Path] | None = None,
     output_holder: list[Path | None] | None = None,
+    task_id: str | None = None,
+    expected_runtime: int | None = None,
 ) -> str:
     """Run execute_fn with adaptive blocking.
 
@@ -719,7 +719,7 @@ async def _auto_promote(
       == 0 -- dispatch immediately (never block)
       < 0  -- block forever (legacy behaviour, no promotion)
     """
-    task_id = secrets.token_hex(8)
+    task_id = task_id or secrets.token_hex(8)
     started_at = datetime.now(timezone.utc)
     output_file = output_file_factory(task_id) if output_file_factory else None
     if output_holder is not None:
@@ -733,6 +733,7 @@ async def _auto_promote(
         client_class=client_class,
         dispatched_at=started_at,
         output_file=output_file,
+        expected_runtime=expected_runtime,
     )
 
     work_task = asyncio.create_task(execute_fn())
@@ -869,117 +870,181 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
     assert isinstance(mcp, FastMCP)
 
-    @mcp.tool()
-    async def codex(
-        host: str, prompt: str, working_dir: str,
-        model: str = "", reasoning_effort: str = "xhigh", timeout: int = 0,
+    # --- ADR-0007: Unified dispatch ---
+
+    def _build_agent_cli(
+        agent: str,
+        prompt: str,
+        working_dir: str,
+        *,
+        model: str = "",
+        reasoning_effort: str = "xhigh",
+        approval_mode: str = "plan",
+        context_files: list[str] | None = None,
+        resume: str = "",
+        allowed_tools: str = "",
+        mode: str = "oneshot",
     ) -> str:
-        """Dispatch a coding task to Codex CLI. Requires explicit working_dir (validated against host's allowed_dirs).
+        """Build the CLI command string for a given agent."""
+        if mode == "interactive":
+            # Interactive: start agent bare, no prompt flag
+            if agent == "codex":
+                return f"codex -C {shlex.quote(working_dir)}"
+            elif agent == "gemini":
+                model_flag = f"--model {shlex.quote(model)} " if model else ""
+                approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
+                return f"gemini {model_flag}{approval_flag}"
+            elif agent == "claude":
+                return "claude"
+            else:
+                raise ValueError(f"Unknown agent: {agent}")
 
-        Handles: scope prefix injection, CLI flag construction, output capture to disk, task ledger recording, auto-promote to background. Default timeout: 1800s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
-        try:
-            cfg = _resolve_host_config(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.codex_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
+        # One-shot: full CLI with prompt
+        scoped_prompt = AGENT_SCOPE_PREFIX + prompt
+        escaped_prompt = shlex.quote(scoped_prompt)
 
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
+        if agent == "codex":
             model_flag = f"--model {shlex.quote(model)} " if model else ""
             effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
-            scoped_prompt = AGENT_SCOPE_PREFIX + prompt
-            escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
-            window_name = f"codex-{task_label}"
-            logger.info("Orchestra: codex on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(
-                host,
-                cli_cmd,
-                timeout=effective_timeout,
-                cwd=working_dir,
-                window_name=window_name,
+            return (
+                f"codex exec --dangerously-bypass-approvals-and-sandbox --json "
+                f"{model_flag}{effort_flag}"
+                f"-C {shlex.quote(working_dir)} {escaped_prompt}"
             )
-            return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
-
-        return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="codex",
-            host=host,
-            prompt=prompt,
-            client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("codex", tid),
-            output_holder=output_holder,
-        )
-
-    @mcp.tool()
-    async def gemini(
-        host: str, prompt: str, working_dir: str,
-        context_files: list[str] | None = None, model: str = "",
-        approval_mode: str = "plan", resume: str = "", timeout: int = 0,
-    ) -> str:
-        """Dispatch an analysis/research task to Gemini CLI. Exploits 1M-token context. Returns task_id — use poll() for results. Prefer over exec().
-
-        approval_mode: "plan" (read-only), "yolo" (auto-approve all), "auto_edit" (auto-approve edits), "default" (prompt).
-        resume: Session index (e.g. "1") or "latest" to continue a previous chat.
-        WARNING: Resuming a session re-sends the entire history, costing tokens for all previous turns.
-        """
-        try:
-            cfg = _resolve_host_config(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.gemini_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
-
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
+        elif agent == "gemini":
             full_prompt = prompt
             if context_files:
                 file_refs = " ".join(f"@{f}" for f in context_files)
                 full_prompt = f"{file_refs} {prompt}"
-
+            escaped = shlex.quote(AGENT_SCOPE_PREFIX + full_prompt)
             model_flag = f"--model {shlex.quote(model)} " if model else ""
             approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
             resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
-
-            cli_cmd = (
-                f"gemini -p {shlex.quote(full_prompt)} --output-format json "
+            return (
+                f"gemini -p {escaped} --output-format json "
                 f"{model_flag}{approval_flag}{resume_flag}"
             )
-
-            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
-            window_name = f"gemini-{task_label}"
-            logger.info("Orchestra: gemini on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(
-                host,
-                cli_cmd,
-                timeout=effective_timeout,
-                cwd=working_dir,
-                window_name=window_name,
+        elif agent == "claude":
+            default_tools = (
+                "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),"
+                "Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),"
+                "Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),"
+                "Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read"
             )
-            return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
+            tools = allowed_tools or default_tools
+            return (
+                f"claude -p {escaped_prompt} --output-format json "
+                f"--permission-mode bypassPermissions "
+                f"--allowedTools {shlex.quote(tools)}"
+            )
+        else:
+            raise ValueError(f"Unknown agent: {agent}")
+
+    @mcp.tool()
+    async def dispatch(
+        host: str,
+        agent: str,
+        prompt: str,
+        working_dir: str,
+        mode: str = "oneshot",
+        expected_runtime: int | None = None,
+        model: str = "",
+        reasoning_effort: str = "xhigh",
+        approval_mode: str = "plan",
+        context_files: list[str] | None = None,
+        resume: str = "",
+        allowed_tools: str = "",
+    ) -> str:
+        """Dispatch a task to an AI agent (codex, gemini, or claude).
+
+        mode: "oneshot" (default) fires with prompt, runs to completion.
+              "interactive" starts the agent bare — drive it via observe/steer.
+
+        All dispatches run in the background (block_timeout=0). Returns
+        {auto_promoted: true, task_id}. Use observe(task_id) for live output,
+        steer(task_id) to redirect, tasks() for status, read_output for results.
+
+        Timeout: 6h hard ceiling (system policy). 30min default overtime flag.
+        expected_runtime: your estimate (seconds). Recorded verbatim in ledger.
+
+        Validates working_dir against host's allowed_dirs.
+        Injects AGENT_SCOPE_PREFIX (pointer to AGENTS.md) automatically."""
+        valid_agents = ("codex", "gemini", "claude")
+        if agent not in valid_agents:
+            return json.dumps({"error": "validation_error", "detail": f"agent must be one of {valid_agents}, got '{agent}'"})
+        if mode not in ("oneshot", "interactive"):
+            return json.dumps({"error": "validation_error", "detail": f"mode must be 'oneshot' or 'interactive', got '{mode}'"})
+        try:
+            cfg = _resolve_host_config(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
+            return json.dumps({
+                "error": "validation_error", "host": host,
+                "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}",
+            })
+
+        from maestro.mux import create_task_window, wait_for_completion, get_output_path
+        from maestro.hosts import _resolve_host
+
+        ctx = get_client_context()
+        task_id = secrets.token_hex(8)
+        ert = expected_runtime if expected_runtime is not None else config.default_expected_runtime_dispatch
+        host_cfg = _resolve_host(host)
+
+        cli_cmd = _build_agent_cli(
+            agent, prompt, working_dir,
+            model=model, reasoning_effort=reasoning_effort,
+            approval_mode=approval_mode, context_files=context_files,
+            resume=resume, allowed_tools=allowed_tools, mode=mode,
+        )
+
+        async def _execute() -> str:
+            output_file = await create_task_window(
+                task_id,
+                host_cfg.alias,
+                cli_cmd,
+                tee=True,
+                interactive=(mode == "interactive"),
+                cwd=working_dir,
+                shell=host_cfg.shell.value,
+            )
+            rc = await wait_for_completion(task_id, timeout=config.dispatch_ceiling)
+
+            # Read captured output
+            raw_output = ""
+            out_path = get_output_path(task_id)
+            if out_path.exists():
+                raw_output = out_path.read_text(encoding="utf-8", errors="replace")
+
+            # Post-process gemini JSON envelope
+            if agent == "gemini":
+                raw_output = _extract_gemini_response(raw_output)
+
+            # Build structured result
+            preview, was_truncated = _orchestra_truncate(raw_output)
+            return json.dumps({
+                "agent": agent,
+                "host": host,
+                "mode": mode,
+                "success": rc == 0,
+                "return_code": rc,
+                "output_file": str(out_path),
+                "output_preview": preview,
+                "truncated": was_truncated,
+                "output_bytes": len(raw_output),
+            }, indent=2, ensure_ascii=False)
 
         return await _auto_promote(
             _execute,
-            block_timeout=block_timeout,
-            agent="gemini",
+            block_timeout=0,  # dispatches always go background
+            agent=agent,
             host=host,
-            prompt=prompt,
+            prompt=prompt[:200],
             client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("gemini", tid),
-            output_holder=output_holder,
+            task_id=task_id,
+            expected_runtime=ert,
+            output_file_factory=lambda tid: _orchestra_output_path(agent, tid),
         )
 
     @mcp.tool()
@@ -1007,59 +1072,6 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
-    async def claude(
-        host: str, prompt: str, working_dir: str,
-        allowed_tools: str = "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(cat:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(find:*),Bash(mkdir:*),Bash(cp:*),Bash(sed:*),Bash(wc:*),Bash(echo:*),Bash(diff:*),Bash(timeout:*),Read", timeout: int = 0,
-    ) -> str:
-        """Dispatch a coding task to Claude Code CLI. Requires explicit working_dir (validated against host's allowed_dirs).
-
-        Handles: scope prefix injection, --permission-mode bypassPermissions, allowed_tools whitelist, output capture, task ledger, auto-promote. Default timeout: 1200s. Returns inline result or {auto_promoted: true, task_id} — use poll() for status, read_output() for full results."""
-        try:
-            cfg = _resolve_host_config(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-        if cfg.allowed_dirs and not any(working_dir.startswith(d) for d in cfg.allowed_dirs):
-            return json.dumps({"error": "validation_error", "host": host, "detail": f"working_dir '{working_dir}' not in allowed_dirs: {cfg.allowed_dirs}"})
-        ctx = get_client_context()
-        effective_timeout = timeout if timeout > 0 else config.claude_timeout
-        block_timeout = ctx.profile["block_timeout_agent"]
-        output_holder: list[Path | None] = [None]
-
-        async def _execute() -> str:
-            output_file = output_holder[0]
-            assert output_file is not None
-            scoped_prompt = AGENT_SCOPE_PREFIX + prompt
-            escaped_prompt = shlex.quote(scoped_prompt)
-            escaped_tools = shlex.quote(allowed_tools)
-            cli_cmd = (
-                f"claude -p {escaped_prompt} --output-format json "
-                f"--permission-mode bypassPermissions "
-                f"--allowedTools {escaped_tools}"
-            )
-            task_label = output_file.stem.rsplit("_", 1)[-1][:8]
-            window_name = f"claude-{task_label}"
-            logger.info("Orchestra: claude on %s [%s]: %s...", host, task_label, prompt[:80])
-            rc, raw_output = await _orchestra_run_cli(
-                host,
-                cli_cmd,
-                timeout=effective_timeout,
-                cwd=working_dir,
-                window_name=window_name,
-            )
-            return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
-
-        return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="claude",
-            host=host,
-            prompt=prompt,
-            client_class=ctx.classification,
-            output_file_factory=lambda tid: _orchestra_output_path("claude", tid),
-            output_holder=output_holder,
-        )
-
-    @mcp.tool()
     async def prepare_relay() -> str:
         """Get an ephemeral bearer token for the HTTP transfer relay and task result endpoints. Valid for 1 hour. Use with: curl -H "Authorization: Bearer <token>" on /transfer/push, /transfer/pull, /tasks/{id}/result."""
         import secrets as _s
@@ -1074,54 +1086,45 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         status: str | None = None,
         agent: str | None = None,
         host: str | None = None,
+        task_type: str | None = None,
         last: int = 10,
     ) -> str:
-        """List recent tasks from the persistent ledger. Filters: status (running|done|failed|timeout|orphaned), agent (codex|claude|gemini|exec|script), host. Returns up to `last` entries sorted most-recent-first with relative timestamps.
+        """List recent tasks from the persistent ledger (ADR-0007).
+
+        Filters: status (running|done|failed|timeout|orphaned|killed),
+        agent (codex|claude|gemini|exec|script), host, task_type (run|dispatch|service).
+        Returns up to `last` entries sorted most-recent-first.
+
+        Running tasks include elapsed_seconds and an overtime flag when
+        elapsed exceeds the caller's declared expected_runtime.
 
         Survives Maestro restarts. Tasks older than 30 days are auto-pruned."""
         ledger = get_task_ledger()
         if ledger is None:
             return json.dumps({"error": "Task ledger is not configured"})
         now = datetime.now(timezone.utc)
-        rows = [
-            {
+        entries = ledger.query(status=status, agent=agent, host=host, last=last)
+        if task_type is not None:
+            entries = [e for e in entries if e.task_type == task_type]
+        rows = []
+        for entry in entries:
+            row: dict[str, Any] = {
                 "task_id": entry.task_id,
                 "agent": entry.agent,
                 "host": entry.host,
                 "status": entry.status,
+                "task_type": entry.task_type or None,
                 "dispatched_at": _format_relative_time(entry.dispatched_at, now),
                 "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
                 "return_code": entry.return_code,
                 "output_file": entry.output_file,
                 "result_url": entry.result_url,
             }
-            for entry in ledger.query(status=status, agent=agent, host=host, last=last)
-        ]
+            if entry.status == "running":
+                elapsed = (now - entry.dispatched_at).total_seconds()
+                row["elapsed_seconds"] = round(elapsed, 1)
+                if entry.expected_runtime is not None:
+                    row["expected_runtime"] = entry.expected_runtime
+                    row["overtime"] = elapsed > entry.expected_runtime
+            rows.append(row)
         return json.dumps({"tasks": rows}, ensure_ascii=False)
-
-    @mcp.tool()
-    async def poll(task_id: str) -> str:
-        """Check task status in the persistent ledger. Returns metadata only: task_id, agent, host, status, timestamps, return_code, output_file, result_url.
-
-        Does NOT return result payloads. For full output: use read_output(output_file) for targeted line ranges, or curl the result_url (from prepare_relay) for zero-context retrieval."""
-        ledger = get_task_ledger()
-        if ledger is None:
-            return json.dumps({"error": "Task ledger is not configured"})
-        entry = ledger.get(task_id)
-        if entry is None:
-            return json.dumps({"error": f"Task '{task_id}' not found"})
-        result: dict[str, Any] = {
-            "task_id": entry.task_id,
-            "agent": entry.agent,
-            "host": entry.host,
-            "status": entry.status,
-            "dispatched_at": entry.dispatched_at.isoformat(),
-            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
-            "return_code": entry.return_code,
-            "output_file": entry.output_file,
-            "result_url": entry.result_url,
-        }
-        if entry.status == "running":
-            elapsed = (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds()
-            result["elapsed_seconds"] = round(elapsed, 1)
-        return json.dumps(result, ensure_ascii=False)

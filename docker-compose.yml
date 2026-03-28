@@ -11,6 +11,12 @@ services:
       - ../config/ssh:/mnt/ssh:ro
       - ../config/hosts.yaml:/app/hosts.yaml:ro
       - ../state:/root/.maestro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8222/.well-known/oauth-authorization-server')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
 
   cloudflared:
     build:
@@ -22,19 +28,22 @@ services:
       - ../config/cloudflared:/mnt/cloudflared:ro
     network_mode: "service:maestro"
     depends_on:
-      - maestro
+      maestro:
+        condition: service_healthy
+        restart: true
 
 # ┌─────────────────────────────────────────────────────────┐
-# │ RESTART RULE                                            │
+# │ NETWORK NAMESPACE COUPLING                              │
 # │                                                         │
 # │ cloudflared shares maestro's network namespace via      │
-# │ network_mode: "service:maestro". If maestro alone is    │
-# │ restarted, cloudflared's namespace reference goes       │
-# │ stale — all outbound connections fail silently.         │
+# │ network_mode: "service:maestro".                        │
 # │                                                         │
-# │ ALWAYS:  docker compose restart                         │
-# │ NEVER:   docker restart maestro                         │
+# │ If maestro restarts, cloudflared's namespace goes stale │
+# │ and all outbound connections fail. Two safeguards:      │
 # │                                                         │
-# │ If cloudflared is broken after a maestro restart:       │
-# │   docker restart maestro-cloudflared                    │
+# │ 1. depends_on.restart: true — Compose-initiated         │
+# │    restarts automatically cascade to cloudflared.       │
+# │ 2. Watchdog in cloudflared-entrypoint.sh — detects      │
+# │    stale namespace after daemon auto-restarts and       │
+# │    exits, triggering Docker's restart policy.           │
 # └─────────────────────────────────────────────────────────┘
