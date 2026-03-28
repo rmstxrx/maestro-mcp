@@ -8,7 +8,7 @@
 
 ## Current State
 
-ADR-0007 is functionally complete through Phase 3. Four commits on `main`, all pushed to GitHub, all deployed to Cellar:
+ADR-0007 is functionally complete through Phase 3. Four commits on `main`, all pushed to GitHub, all deployed to Hub:
 
 ```
 63782e8 feat: ADR-0007 Phase 3 — persistent windows, mux tools, orchestra wiring
@@ -17,7 +17,7 @@ ADR-0007 is functionally complete through Phase 3. Four commits on `main`, all p
 620af59 docs: ADR-0007 — taxonomy, tmux multiplexer layer, state conventions
 ```
 
-68/68 tests passing. tmux installed on all primary hosts (Apollyon 3.4, Eden-WSL 3.4, Judas 3.6a, Cellar via Docker).
+68/68 tests passing. tmux installed on all primary hosts (GPU-server 3.4, Win-server-WSL 3.4, Mac-laptop 3.6a, Hub via Docker).
 
 ## What Works
 
@@ -41,7 +41,7 @@ The 5 new MCP tools (spawn, capture, send_keys, kill_window, list_windows) are r
 - `kill_window` → `mux_stop` or `stop_window`
 - `list_windows` → `mux_list` or `window_list`
 
-Test each rename by checking if Claude.ai discovers the tool after a Cellar rebuild. The server registers tools at startup — no need to reconnect the MCP session, just rebuild and test tool discovery.
+Test each rename by checking if Claude.ai discovers the tool after a Hub rebuild. The server registers tools at startup — no need to reconnect the MCP session, just rebuild and test tool discovery.
 
 ### Bug 2 (medium): Dispatch guard false positive on tmux commands
 
@@ -63,12 +63,12 @@ Option 1 is simplest and least likely to break. Test against the existing dispat
 - Consider: should `capture` during a running dispatch be a first-class workflow?
 
 ### Migration: Old output directory
-`~/.agent-orchestra/outputs/` still exists on Cellar and Apollyon with historical output files. The config default changed but old files weren't moved. Either:
+`~/.agent-orchestra/outputs/` still exists on Hub and GPU-server with historical output files. The config default changed but old files weren't moved. Either:
 - Move them: `mv ~/.agent-orchestra/outputs/* ~/.maestro/outputs/` on both hosts
 - Or leave them and let them age out (30-day ledger prune won't find them, but they're just disk space)
 
 ### STATE.md update
-STATE.md still says "Cellar migration complete" as the current focus. Should be updated to reflect ADR-0007 landing and the Phase 4 / bug fix items as next steps.
+STATE.md still says "Hub migration complete" as the current focus. Should be updated to reflect ADR-0007 landing and the Phase 4 / bug fix items as next steps.
 
 ### AGENTS.md update
 Fleet-wide agent conduct file should mention tmux window conventions — agents should know that their dispatch creates a named window they can observe via capture.
@@ -92,7 +92,7 @@ docs/journal/debriefs/          — 3 Codex debriefs (one per phase)
 
 ## Key Context for Next Session
 
-- tmux is installed on Judas via homebrew (`/opt/homebrew/bin/tmux`). If Judas PATH issues recur in non-interactive SSH, the fix is `~/.zshenv` (not `.zshrc`).
-- The Cellar's `task_registry.json` still exists on disk (46KB) but is no longer written to. Safe to delete after confirming the in-memory registry handles the HTTP result endpoint correctly.
-- Eden-WSL is the primary host for the Eden machine. Direct PowerShell SSH to Eden is the escape hatch. This is documented in ADR-0007.
+- tmux is installed on Mac-laptop via homebrew (`/opt/homebrew/bin/tmux`). If Mac-laptop PATH issues recur in non-interactive SSH, the fix is `~/.zshenv` (not `.zshrc`).
+- The Hub's `task_registry.json` still exists on disk (46KB) but is no longer written to. Safe to delete after confirming the in-memory registry handles the HTTP result endpoint correctly.
+- Win-server-WSL is the primary host for the Win-server machine. Direct PowerShell SSH to Win-server is the escape hatch. This is documented in ADR-0007.
 - The `_orchestra_run_cli_raw_ps` function in orchestra.py is the PowerShell fallback — it retains the original raw SSH execution with retries. Don't delete it.

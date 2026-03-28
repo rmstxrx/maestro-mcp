@@ -1,14 +1,14 @@
 # Maestro MCP — Developer Guide
 
-Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It turns a collection of SSH-accessible machines into a unified workspace with Cellar-local tmux for observation, steering, and completion detection (ADR-0007).
+Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It turns a collection of SSH-accessible machines into a unified workspace with Hub-local tmux for observation, steering, and completion detection (ADR-0007).
 
 ## Architecture
 
-All task execution uses **Cellar-local tmux**: every `run`, `dispatch`, or `service` creates a tmux window on the Cellar that runs `ssh host 'command'` inside it. Maestro observes, steers, and detects completion locally — no network crossing needed.
+All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service` creates a tmux window on the Hub that runs `ssh host 'command'` inside it. Maestro observes, steers, and detects completion locally — no network crossing needed.
 
 - **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server (stdio or streamable-http).
 - **Core Package (`maestro/`):**
-    - **`mux.py`:** Cellar-local tmux primitives — `create_task_window`, `wait_for_completion`, `capture_pane`, `send_keys`, `kill_window`, `list_windows`. Output at `/root/.maestro/task_output/`.
+    - **`mux.py`:** Hub-local tmux primitives — `create_task_window`, `wait_for_completion`, `capture_pane`, `send_keys`, `kill_window`, `list_windows`. Output at `/root/.maestro/task_output/`.
     - **`tools/fleet.py`:** Fleet tools: `run`, `read`, `write`, `transfer`, `status`, `observe`, `steer`, `stop`, `service`.
     - **`tools/orchestra.py`:** Orchestra tools: `dispatch`, `tasks`, `read_output`, `prepare_relay`. Plus task ledger, auto-promote, scope prefix, agent output management.
     - **`hosts.py`:** Fleet topology management and `hosts.yaml` parsing. Per-host `allowed_dirs` enforcement.
@@ -45,7 +45,7 @@ All task execution uses **Cellar-local tmux**: every `run`, `dispatch`, or `serv
 | `observe` | Capture live output of a running task (local pane read, zero SSH cost). |
 | `steer` | Send input to a running task (logged to output file). |
 | `stop` | Kill a task (kills tmux window → SSH → remote process). |
-| `read_output` | Read completed task output from Cellar disk. |
+| `read_output` | Read completed task output from Hub disk. |
 
 ### Infrastructure (2)
 
@@ -56,12 +56,12 @@ All task execution uses **Cellar-local tmux**: every `run`, `dispatch`, or `serv
 
 ## Key Patterns
 
-### 1. Cellar-Local Tmux (ADR-0007)
+### 1. Hub-Local Tmux (ADR-0007)
 
-Every task is a tmux window on the Cellar. The command inside each window is an SSH session to the target host. Completion is detected via `tmux wait-for` — a zero-CPU synchronization primitive.
+Every task is a tmux window on the Hub. The command inside each window is an SSH session to the target host. Completion is detected via `tmux wait-for` — a zero-CPU synchronization primitive.
 
 ```
-Cellar tmux window → SSH session → remote process
+Hub tmux window → SSH session → remote process
 observe/steer/stop → local tmux operations → relayed through SSH
 ```
 
@@ -77,7 +77,7 @@ Execution tools use `_auto_promote()` for long-running tasks:
 Client profiles (from `client.py`):
 - **remote** (Claude.ai via Cloudflare): `block_timeout_agent=0` (always dispatch), `block_timeout_exec=5`
 - **local** (localhost): `block_timeout_agent=30`, `block_timeout_exec=60`
-- **lan** (10.42.69.*): `block_timeout_agent=10`, `block_timeout_exec=20`
+- **lan** (198.51.100.*): `block_timeout_agent=10`, `block_timeout_exec=20`
 - **stdio** (Claude Code): `block_timeout_agent=30`, `block_timeout_exec=60`
 
 ### 3. System-Policy Timeouts
@@ -107,7 +107,7 @@ Two modes for `dispatch`:
 
 ### 7. Double-Entry Output
 
-Agent outputs live on both the target machine (project history, indefinite) and the Cellar (replica, 90-day retention). Either copy can recover the other.
+Agent outputs live on both the target machine (project history, indefinite) and the Hub (replica, 90-day retention). Either copy can recover the other.
 
 ### 8. Context Budget Awareness
 
@@ -121,14 +121,14 @@ Tool responses consume LLM context tokens.
 
 All agent dispatches prepend `AGENT_SCOPE_PREFIX`, directing agents to read `~/Development/General/AGENTS.md` for fleet conduct rules.
 
-## Deployment (Cellar)
+## Deployment (Hub)
 
-Maestro runs as a Docker container on the Cellar (TrueNAS SCALE, 10.42.69.2). The Cellar is the fleet hub (`is_local: true`). All other hosts are SSH targets.
+Maestro runs as a Docker container on the Hub (TrueNAS SCALE, 198.51.100.2). The Hub is the fleet hub (`is_local: true`). All other hosts are SSH targets.
 
-**Development** happens on Apollyon (`/home/rmstxrx/Development/maestro-mcp`). The Cellar repo (`/volume2/docker/maestro/repo`) is a **read-only deployment target** — it only pulls from GitHub and rebuilds. No agent may be dispatched with `working_dir` pointing to the Maestro repo on the Cellar.
+**Development** happens on GPU-server (`/home/user/Development/maestro-mcp`). The Hub repo (`/volume2/docker/maestro/repo`) is a **read-only deployment target** — it only pulls from GitHub and rebuilds. No agent may be dispatched with `working_dir` pointing to the Maestro repo on the Hub.
 
 ```
-Apollyon (dev)                    GitHub                    Cellar (deploy)
+GPU-server (dev)                  GitHub                    Hub (deploy)
   edit + commit
   git push origin main    →    origin/main    ←    git pull
                                                   docker compose build --no-cache
@@ -145,7 +145,7 @@ Apollyon (dev)                    GitHub                    Cellar (deploy)
 Task output persists at `state/task_output/` via the Docker volume mount `../state:/root/.maestro`.
 
 ```bash
-# Deploy from Cellar (after pushing from Apollyon)
+# Deploy from Hub (after pushing from GPU-server)
 cd /volume2/docker/maestro/repo
 git pull && docker compose build --no-cache && docker compose up -d --force-recreate
 ```
@@ -156,7 +156,7 @@ Wait 15-30s after rebuild and poll `/.well-known/oauth-authorization-server` for
 
 1. **Don't kill the Maestro container** via Maestro tools — it terminates the connection with no recovery path.
 2. **Always use `docker compose restart`** — cloudflared shares maestro's network namespace.
-3. **`MAESTRO_ISSUER_URL` must be set** in the Cellar's config `.env`.
+3. **`MAESTRO_ISSUER_URL` must be set** in the Hub's config `.env`.
 4. **Agent dispatch must go through `dispatch`.** Never invoke agent CLIs via `run`. The dispatch guard will block it.
 5. **Transfer relay tokens are valid for 1 hour.** Call `prepare_relay` once per session.
 6. **Only Maestro creates tmux sessions.** No tool creates remote tmux sessions.

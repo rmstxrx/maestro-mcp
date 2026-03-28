@@ -22,27 +22,27 @@ Key insight: the fleet exists independently of any agent activity. It's the conc
 
 ### Multiplexer Layer (designed interactively, implemented by Codex)
 
-The SSH signal leaking problem led to the tmux multiplexer design. Critical discovery during design: **benchmarking showed zero overhead** (40ms raw SSH vs 39ms tmux-wrapped over SSH on the Cellar→Apollyon path). This eliminated the "simplicity vs efficiency" trade-off entirely — tmux became the universal execution substrate, not an optional feature.
+The SSH signal leaking problem led to the tmux multiplexer design. Critical discovery during design: **benchmarking showed zero overhead** (40ms raw SSH vs 39ms tmux-wrapped over SSH on the Hub→GPU-server path). This eliminated the "simplicity vs efficiency" trade-off entirely — tmux became the universal execution substrate, not an optional feature.
 
 Design decisions:
 - **Dedicated tmux server** (`-L maestro`) per host — full isolation from user's personal tmux
 - **Ephemeral windows** for exec/script — signal isolation with self-cleanup
 - **Persistent named windows** for agent dispatch — observable, attachable, configurable cleanup
 - **Default stay** after command exits (remain-on-exit), optional auto-cleanup flag
-- **Eden PowerShell** bypasses tmux entirely; Eden-WSL is the primary host for that machine
+- **Win-server PowerShell** bypasses tmux entirely; Win-server-WSL is the primary host for that machine
 - **Window naming**: Maestro assigns names (`codex-{task_id[:8]}`), caller can provide optional label for manual spawns
 
 ### State Conventions (decided interactively)
 
 - `~/.maestro/` on every host (like `~/.ssh/`)
-- Hub (Cellar): oauth, ledger, audit log, outputs
+- Hub (Hub): oauth, ledger, audit log, outputs
 - Compute hosts: outputs only
 - `~/.agent-orchestra/` abolished
 - `task_registry.json` disk persistence deprecated — live state is the tmux session
 
 ### Misdirected Task Problem (identified and solved)
 
-During discussion of task ledger evolution, identified that the **centralized task registry** was the root cause of the misdirected task bug (BUG-0001 variant). The Cellar's in-memory registry was the source of truth for "what's running where?" — stale state, eviction races, and restart orphaning caused tasks to be misattributed between hosts. With tmux, each host's tmux server is the authority on its own live state. `list_windows(host)` queries the host directly.
+During discussion of task ledger evolution, identified that the **centralized task registry** was the root cause of the misdirected task bug (BUG-0001 variant). The Hub's in-memory registry was the source of truth for "what's running where?" — stale state, eviction races, and restart orphaning caused tasks to be misattributed between hosts. With tmux, each host's tmux server is the authority on its own live state. `list_windows(host)` queries the host directly.
 
 ## Implementation (4 commits, 3 Codex dispatches)
 
@@ -53,7 +53,7 @@ During discussion of task ledger evolution, identified that the **centralized ta
 | `0265c62` | Phase 2: mux.py core | 6 (+262/-12) | 63/63 | Codex ~7min |
 | `63782e8` | Phase 3: Persistent windows + orchestra | 8 (+461/-21) | 68/68 | Codex ~11min |
 
-All deployed to Cellar. All smoke tested.
+All deployed to Hub. All smoke tested.
 
 ### Phase 1: Taxonomy cleanup
 - `register_tools()` → split into `register_fleet_tools()` + `register_orchestra_tools()`
@@ -93,7 +93,7 @@ The `_AGENT_CLI_PATTERNS` regex matches tmux commands containing agent window na
 1. Taxonomy: Maestro/Orchestra/Fleet — locked, documented in CLAUDE.md
 2. tmux as universal substrate (not opt-in) — validated by benchmark
 3. Dedicated `-L maestro` server per host — isolation over convenience
-4. Eden-WSL is primary; Eden PowerShell is escape hatch
+4. Win-server-WSL is primary; Win-server PowerShell is escape hatch
 5. `~/.maestro/` on every host — like `~/.ssh/`
 6. Task registry deprecated — tmux is live state, ledger is audit trail
 7. Window naming: `{agent}-{task_id[:8]}` for orchestra, label or `spawn-{hex}` for manual

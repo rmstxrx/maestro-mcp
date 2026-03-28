@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-03-12
-**Deciders:** rmstxrx, Claude
+**Deciders:** (maintainer), Claude
 
 ## Context
 
@@ -16,7 +16,7 @@ After three weeks of daily production use (Feb 22 – Mar 12), six friction poin
 
 **F3 — Transfer relay auth via shared secret in userPreferences.** The HMAC master secret is embedded in the user's `userPreferences` block, meaning it's injected into every conversation's system prompt — even conversations that never use the relay. This is excessive exposure. The daily-rotating HMAC derivation is sound; the distribution mechanism is not.
 
-**F4 — No working-directory enforcement on agent dispatch.** Agents dispatched to Eden (or any host) can create files anywhere — WSL home dirs, wrong drives, unrelated repos. The `cwd` parameter is passed through but never validated against a per-host policy. This caused scope creep incidents where agents pushed commits to forks of unrelated projects.
+**F4 — No working-directory enforcement on agent dispatch.** Agents dispatched to Win-server (or any host) can create files anywhere — WSL home dirs, wrong drives, unrelated repos. The `cwd` parameter is passed through but never validated against a per-host policy. This caused scope creep incidents where agents pushed commits to forks of unrelated projects.
 
 **F5 — Agent CLI timeouts hardcoded at 600s.** All three agent CLIs (Codex, Gemini, Claude Code) share a flat 600s timeout in `config.py`. Codex xhigh tasks routinely need 1500–1800s. Claude Code with complex prompts needs 900–1200s. Tasks that are 80% complete get SIGTERM'd, wasting the entire run and the tokens that dispatched them.
 
@@ -33,7 +33,7 @@ In `transport.py` and `fleet.py`, catch specific exception types and return stru
 ```json
 {
   "error": "ssh_timeout",
-  "host": "eden",
+  "host": "win-server",
   "detail": "Command timed out after 300s",
   "command_preview": "python train.py --epochs 10..."
 }
@@ -65,15 +65,15 @@ Extend `hosts.yaml` with an optional `allowed_dirs` field:
 
 ```yaml
 hosts:
-  eden:
-    alias: ssh-eden
+  win-server:
+    alias: ssh-win-server
     shell: powershell
     allowed_dirs:
-      - "C:\\Users\\romul\\Development"
-  apollyon:
-    alias: ssh-apollyon
+      - "C:\\Users\\user\\Development"
+  gpu-server:
+    alias: ssh-gpu-server
     allowed_dirs:
-      - "/home/rmstxrx/Development"
+      - "/home/user/Development"
 ```
 
 The dispatch tools (`codex`, `claude`, `gemini`) validate `working_dir` against the host's `allowed_dirs` before invoking the CLI. If unset, no validation (backward compatible). The `exec` and `script` tools do NOT enforce this — they're intentionally general-purpose.
@@ -115,7 +115,7 @@ Update tool descriptions to guide correct usage:
 - Maestro restarts no longer orphan task metadata (F2).
 - Transfer relay works without a shared secret in every conversation (F3).
 - Debugging becomes tractable with categorized errors (F1).
-- Agent scope creep on Eden is prevented at the tool level (F4).
+- Agent scope creep on Win-server is prevented at the tool level (F4).
 
 ### Negative
 - Task registry persistence adds ~1 JSON write per state transition — negligible I/O but another file to manage.

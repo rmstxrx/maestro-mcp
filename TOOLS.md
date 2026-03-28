@@ -67,9 +67,9 @@ Returns structured JSON:
 ```json
 {
   "hosts": {
-    "apollyon": {"status": "connected", "local": true},
-    "eden": {"status": "connected", "local": false},
-    "judas": {"status": "offline", "local": false, "error": "..."}
+    "gpu-server": {"status": "connected", "local": true},
+    "win-server": {"status": "connected", "local": false},
+    "macbook": {"status": "offline", "local": false, "error": "..."}
   },
   "available": 2,
   "total": 3
@@ -95,7 +95,7 @@ No parameters. Read-only — does not modify any configuration.
 Returns JSON array:
 ```json
 [
-  {"alias": "eden", "hostname": "eden.home", "port": 22, "user": "romul", "in_fleet": true},
+  {"alias": "win-server", "hostname": "win-server.home", "port": 22, "user": "user", "in_fleet": true},
   {"alias": "myserver", "hostname": "10.0.0.5", "port": 22, "user": "", "in_fleet": false}
 ]
 ```
@@ -107,7 +107,7 @@ Add a new host to the fleet by writing to `hosts.yaml` and hot-reloading.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | yes | Fleet name for the host (e.g. "eden") |
+| `name` | string | yes | Fleet name for the host (e.g. "win-server") |
 | `alias` | string | yes | SSH alias from `~/.ssh/config` |
 | `description` | string | no | Human-readable description |
 | `remote_cli` | string | no | Default agent CLI: `"codex"`, `"gemini"`, or `"claude"` (default: `"codex"`) |
@@ -221,7 +221,7 @@ All execution tools use adaptive blocking based on client classification:
 Client classification:
 - **remote** — requests with `CF-Ray` header (Cloudflare tunnel)
 - **local** — requests from `127.0.0.1`, `::1`, or `localhost`
-- **lan** — requests from `10.42.69.*` subnet
+- **lan** — requests from `198.51.100.*` subnet
 
 
 ## HTTP Endpoints (non-MCP)
@@ -248,7 +248,7 @@ TASK_ID="<from dispatch response>"
 for i in $(seq 1 40); do
   HTTP_CODE=$(curl -s -o /tmp/result.json -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \
-    "https://maestro.rmstxrx.dev/tasks/$TASK_ID/result")
+    "https://maestro.yourdomain.dev/tasks/$TASK_ID/result")
   [ "$HTTP_CODE" = "200" ] && { cat /tmp/result.json; exit 0; }
   sleep 15
 done

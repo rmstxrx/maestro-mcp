@@ -76,7 +76,7 @@ TASK_ID="<task_id>"
 for i in $(seq 1 40); do
   HTTP_CODE=$(curl -s -o /tmp/task_result.json -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \
-    "https://maestro.rmstxrx.dev/tasks/$TASK_ID/result")
+    "https://maestro.yourdomain.dev/tasks/$TASK_ID/result")
   if [ "$HTTP_CODE" = "200" ]; then
     cat /tmp/task_result.json
     exit 0

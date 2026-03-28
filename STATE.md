@@ -25,7 +25,7 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 
 **Orchestra (7):** `codex`, `gemini`, `claude`, `poll`, `read_output`, `tasks`, `prepare_relay`.
 
-### Deployment (Cellar)
+### Deployment (Hub)
 
 | Component | Location |
 |---|---|
@@ -39,11 +39,11 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 
 | Host | Role | Status |
 |---|---|---|
-| Cellar | Hub (`is_local: true`), orchestration only | Docker, always-on |
-| Apollyon | Compute leaf, agent dispatch target | DGX Spark, GPU workloads |
-| Eden | Compute leaf, agent dispatch target | RTX 5090, PowerShell |
-| Judas | Compute leaf, agent dispatch target | MacBook Pro M3 Max |
-| Eden-WSL | Compute leaf (proxy through Eden) | WSL2 Ubuntu on Eden |
+| Hub | Hub (`is_local: true`), orchestration only | Docker, always-on |
+| GPU-server | Compute leaf, agent dispatch target | GPU workstation, GPU workloads |
+| Win-server | Compute leaf, agent dispatch target | RTX 5090, PowerShell |
+| Macbook | Compute leaf, agent dispatch target | MacBook Pro M3 Max |
+| Win-server-WSL | Compute leaf (proxy through Win-server) | WSL2 Ubuntu on Win-server |
 
 ## Active Branches
 
@@ -61,11 +61,11 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 2. **Stale items from previous cycles:**
    - Set `MAESTRO_DEFAULT_REPO` in `.env` to a real path (or remove the config field).
    - Delete stale remote branch `feat/adr-0004-0005-pin-rotation` if fully merged.
-   - Delete old `task_registry.json` on Cellar if present (in-memory registry handles HTTP result endpoint).
+   - Delete old `task_registry.json` on Hub if present (in-memory registry handles HTTP result endpoint).
 
 ## Completed (recent)
 
-- Output directory migrated: `~/.agent-orchestra/outputs/` → `~/.maestro/outputs/` on Apollyon. Old directory removed.
+- Output directory migrated: `~/.agent-orchestra/outputs/` → `~/.maestro/outputs/` on GPU-server. Old directory removed.
 - Dispatch guard regex anchored to start-of-command (fixed tmux false positives).
 - Mux tools renamed (`spawn`→`mux_start`, etc.) with neutral docstrings.
 - Critical Rule 9 added to CLAUDE.md: Claude.ai deferred tool loading via Tool Search.

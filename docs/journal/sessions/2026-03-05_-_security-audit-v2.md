@@ -3,10 +3,10 @@
 **Date:** 2026-03-05  
 **Auditor:** Claude (Opus 4.6)  
 **Prior audit:** 2026-03-03  
-**Codebase:** `/home/rmstxrx/Development/maestro-mcp/` on Apollyon  
+**Codebase:** `/home/user/Development/maestro-mcp/` on GPU-server  
 **HEAD commit:** `d2ea418` — *feat(orchestra): update agent routing, model defaults, and reasoning effort*  
-**Deployment:** `maestro.rmstxrx.dev` → Cloudflare Tunnel → `localhost:8222`  
-**fleet.rmstxrx.dev:** DNS no longer resolves (subdomain removed or tunnel reconfigured)
+**Deployment:** `maestro.yourdomain.dev` → Cloudflare Tunnel → `localhost:8222`  
+**fleet.yourdomain.dev:** DNS no longer resolves (subdomain removed or tunnel reconfigured)
 
 ---
 
@@ -48,8 +48,8 @@ Anyone can register a client with `redirect_uri = https://claude.ai/api/mcp/auth
 
 The `remote_path` query parameter flows unchecked to filesystem operations (local hosts) and SCP (remote hosts). During re-verification:
 
-- `remote_path=/etc/hostname` → returned `apollyon` (arbitrary file read)
-- `remote_path=/home/rmstxrx/../../etc/passwd` → returned all 54 lines (path traversal)
+- `remote_path=/etc/hostname` → returned `gpu-server` (arbitrary file read)
+- `remote_path=/home/user/../../etc/passwd` → returned all 54 lines (path traversal)
 
 The transfer token is a static bearer, embedded in user preferences, shared with every Claude conversation.
 
@@ -83,9 +83,9 @@ Sent 15 rapid-fire requests to `/token`; all returned HTTP 401, none returned 42
 **File:** `oauth_rewrite.py`  
 **Introduced in:** commit `74d5e99`
 
-The new `OAuthURLRewriteMiddleware` rewrites OAuth metadata URLs to match the incoming request's `Host` header for LAN/localhost clients. The middleware checks if the Host contains `maestro.rmstxrx.dev` — if not, it treats the Host value as the "effective base URL" and rewrites all OAuth endpoints in the metadata response.
+The new `OAuthURLRewriteMiddleware` rewrites OAuth metadata URLs to match the incoming request's `Host` header for LAN/localhost clients. The middleware checks if the Host contains `maestro.yourdomain.dev` — if not, it treats the Host value as the "effective base URL" and rewrites all OAuth endpoints in the metadata response.
 
-**Verified from Apollyon:**
+**Verified from GPU-server:**
 ```
 GET /.well-known/oauth-authorization-server  (Host: evil.attacker.com:8222)
 → issuer: http://evil.attacker.com:8222/
@@ -105,8 +105,8 @@ GET /.well-known/oauth-authorization-server  (Host: evil.attacker.com:8222)
 
 ```python
 ALLOWED_ORIGINS = {
-    "maestro.rmstxrx.dev": "https://maestro.rmstxrx.dev",
-    "10.42.69.167:8222": "http://10.42.69.167:8222",
+    "maestro.yourdomain.dev": "https://maestro.yourdomain.dev",
+    "198.51.100.167:8222": "http://198.51.100.167:8222",
     "localhost:8222": "http://localhost:8222",
     "127.0.0.1:8222": "http://127.0.0.1:8222",
 }
@@ -192,9 +192,9 @@ Total MCP tools: **21** (was 17+2, now 19+2 custom HTTP routes)
 
 `docs/adr/0001-agent-routing.md` establishes agent routing heuristics and model defaults. Good architectural hygiene.
 
-### I-NEW-1: `fleet.rmstxrx.dev` DNS Removed
+### I-NEW-1: `fleet.yourdomain.dev` DNS Removed
 
-`fleet.rmstxrx.dev` no longer resolves (DNS NXDOMAIN). The Cloudflare tunnel config still lists it as an ingress rule pointing to `localhost:8222`, but it appears the DNS record was removed. This is effectively a dead route — no security impact, but should be cleaned up in the tunnel config.
+`fleet.yourdomain.dev` no longer resolves (DNS NXDOMAIN). The Cloudflare tunnel config still lists it as an ingress rule pointing to `localhost:8222`, but it appears the DNS record was removed. This is effectively a dead route — no security impact, but should be cleaned up in the tunnel config.
 
 ---
 

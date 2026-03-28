@@ -1,6 +1,6 @@
-"""Cellar-local tmux multiplexer — ADR-0007.
+"""Hub-local tmux multiplexer — ADR-0007.
 
-All task execution runs inside tmux windows on the Cellar. Remote commands
+All task execution runs inside tmux windows on the Hub. Remote commands
 are wrapped in SSH sessions inside those windows. Maestro observes, steers,
 and detects completion locally — no network crossing required.
 
@@ -74,7 +74,7 @@ def _build_wrapper(
     sudo: bool = False,
     shell: str = "bash",
 ) -> str:
-    """Build wrapper script for a single command inside a Cellar-local tmux window."""
+    """Build wrapper script for a single command inside a Hub-local tmux window."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
     rc_file = OUTPUT_DIR / f"{task_id}.rc"
 
@@ -166,7 +166,7 @@ async def create_task_window(
     sudo: bool = False,
     shell: str = "bash",
 ) -> Path | None:
-    """Create a Cellar-local tmux window that SSHes to the target host.
+    """Create a Hub-local tmux window that SSHes to the target host.
 
     Returns the output file path (if tee=True), or None for interactive.
     """

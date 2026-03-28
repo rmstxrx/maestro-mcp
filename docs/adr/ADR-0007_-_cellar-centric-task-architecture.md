@@ -1,8 +1,8 @@
-# ADR-0007: Cellar-Centric Task Architecture
+# ADR-0007: Hub-Centric Task Architecture
 
 **Date:** 2026-03-27  
 **Status:** Accepted  
-**Deciders:** Rômulo (fleet operator), Claude Chat (orchestrator/implementer)  
+**Deciders:** (fleet operator), Claude Chat (orchestrator/implementer)  
 **Supersedes:** Portions of ADR-0003 (module decomposition), ADR-0006 (task ledger)  
 
 ---
@@ -13,11 +13,11 @@ Maestro's task execution model creates tmux sessions on remote hosts and observe
 
 1. **Blind between probes.** Checking on a task is rediscovering, not monitoring. If a host reboots or a process crashes, Maestro learns only on the next manual probe.
 2. **Two-system split.** Orchestra tasks (agent dispatches) have ledger entries and output files. Mux tasks (interactive sessions) have neither. No unified view of fleet activity exists.
-3. **Cross-host retrieval failure.** If SSH drops mid-task, the output may be partial on the Cellar while the process continues on the remote host. The ledger records the dispatch but cannot recover the result.
+3. **Cross-host retrieval failure.** If SSH drops mid-task, the output may be partial on the Hub while the process continues on the remote host. The ledger records the dispatch but cannot recover the result.
 4. **Fire-and-forget agents.** No ability to observe intermediate reasoning or steer agents mid-execution. A misread at minute two compounds silently for fifteen minutes.
 5. **Compulsive monitoring.** The orchestrator compulsively polls running tasks — via `poll` (returning useless status) or `exec` (SSHing into hosts to inspect log files). Both waste tokens without producing actionable information.
 
-These are not fixable individually. They share a root cause: the tmux session (the persistent substrate) lives on the remote host, while the observer (Maestro) lives on the Cellar. Observation requires crossing the network boundary every time.
+These are not fixable individually. They share a root cause: the tmux session (the persistent substrate) lives on the remote host, while the observer (Maestro) lives on the Hub. Observation requires crossing the network boundary every time.
 
 ---
 
@@ -25,24 +25,24 @@ These are not fixable individually. They share a root cause: the tmux session (t
 
 ### The Inversion
 
-All tmux sessions move from remote hosts to the Cellar. Every task Maestro executes becomes a tmux window on the Cellar's local tmux server. The command inside each window is an SSH session to the target host. Maestro observes, steers, and detects completion locally — no network crossing required for any of these operations.
+All tmux sessions move from remote hosts to the Hub. Every task Maestro executes becomes a tmux window on the Hub's local tmux server. The command inside each window is an SSH session to the target host. Maestro observes, steers, and detects completion locally — no network crossing required for any of these operations.
 
 ```
-Before: Cellar → SSH (ephemeral) → tmux on remote host → process
-After:  Cellar → tmux on Cellar → SSH (inside tmux window) → process on remote host
+Before: Hub → SSH (ephemeral) → tmux on remote host → process
+After:  Hub → tmux on Hub → SSH (inside tmux window) → process on remote host
 ```
 
 ### Core Principles
 
 **Only Maestro creates tmux sessions.** Dispatched agents do not create tmux sessions on remote hosts. This is enforced architecturally — the codebase has no function that creates remote tmux sessions.
 
-**Universal ledger tracking.** Every operation that touches a remote host — execution, file I/O, transfers — gets a ledger entry. The ledger is a recovery mechanism (transport failures are recoverable without re-running) and an audit trail ("what did we change on Apollyon today?").
+**Universal ledger tracking.** Every operation that touches a remote host — execution, file I/O, transfers — gets a ledger entry. The ledger is a recovery mechanism (transport failures are recoverable without re-running) and an audit trail ("what did we change on GPU-server today?").
 
 **Timeouts are system policy.** No tool exposes a timeout parameter. Block thresholds, hard ceilings, and overtime flags are set in `MaestroConfig` by the fleet operator.
 
 **Honest overtime accounting.** The caller declares `expected_runtime` — their estimate of how long the task will take. Maestro records it verbatim and flags the task as `overtime` at exactly that value. No hidden multipliers. The agent sees accurate feedback and learns to estimate better over time.
 
-**Double-entry output residency.** Agent outputs exist on both the target machine (project history, indefinite retention) and the Cellar (replica, 90-day retention). Either copy can recover the other.
+**Double-entry output residency.** Agent outputs exist on both the target machine (project history, indefinite retention) and the Hub (replica, 90-day retention). Either copy can recover the other.
 
 ### Completion Detection
 
@@ -108,7 +108,7 @@ Three independent concerns: block threshold (UX), hard ceiling (safety), overtim
 | `observe` | Capture live output of a running task (local pane, zero SSH cost). |
 | `steer` | Send input to a running task (local send-keys, logged to output). |
 | `stop` | Kill a task (kills tmux window → SSH → remote process). |
-| `read_output` | Read completed task output from Cellar disk. |
+| `read_output` | Read completed task output from Hub disk. |
 
 **Infrastructure (2):**
 
@@ -233,13 +233,13 @@ New fields on `TaskLedgerEntry`:
 
 ## Edge Cases
 
-**Eden (PowerShell).** Cellar-local tmux runs `ssh cellar-to-eden 'powershell ...'`. Wrapper, tee, wait-for are bash on Cellar. Eden never needs tmux. The inversion simplifies Eden handling.
+**Win-server (PowerShell).** Hub-local tmux runs `ssh ssh-win-server 'powershell ...'`. Wrapper, tee, wait-for are bash on Hub. Win-server never needs tmux. The inversion simplifies Win-server handling.
 
 **Container restart.** Tmux dies, SSH sessions terminate. Ledger marks running tasks as `orphaned`. `output_file_remote` enables future recovery.
 
-**SSH drop mid-task.** Cellar tmux detects SSH exit. Wrapper captures exit code, signals wait-for. Monitor updates ledger as failed. Remote output path provides recovery.
+**SSH drop mid-task.** Hub tmux detects SSH exit. Wrapper captures exit code, signals wait-for. Monitor updates ledger as failed. Remote output path provides recovery.
 
-**Interactive sessions.** `run host='apollyon' command='bash'` creates a tmux window with an SSH shell. Auto-promotes immediately. Interact via `observe`/`steer`.
+**Interactive sessions.** `run host='gpu-server' command='bash'` creates a tmux window with an SSH shell. Auto-promotes immediately. Interact via `observe`/`steer`.
 
 **Agent supervision (one-shot).** Tmux window captures output via `tee` and accepts input via `steer`. Full transcript in the output file.
 
@@ -285,7 +285,7 @@ Each phase is independently deployable.
 - 43% code reduction. Fewer bugs, easier maintenance.
 - Universal ledger + output capture eliminates re-runs from transport failures.
 - Honest overtime feedback enables calibration improvement over time.
-- Eden handling simplifies — no more "does this host support tmux?" branching.
+- Win-server handling simplifies — no more "does this host support tmux?" branching.
 
 **Negative:**
 - Every task requires an SSH session held open inside a tmux window. Resource usage scales with concurrent tasks. Mitigated by soft per-host limits.

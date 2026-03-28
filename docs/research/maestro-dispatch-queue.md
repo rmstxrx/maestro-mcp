@@ -1,7 +1,7 @@
 # Maestro v2 — Dispatch Queue
 
 Sequential phases. Fire each one AFTER the previous commit lands.
-All use: `codex_dispatch(host="apollyon", model="gpt-5.3-codex-spark", timeout=1800, working_dir="/home/rmstxrx/Development/maestro-mcp")`
+All use: `codex_dispatch(host="gpu-server", model="gpt-5.3-codex-spark", timeout=1800, working_dir="/home/user/Development/maestro-mcp")`
 
 ---
 
@@ -102,8 +102,8 @@ TASK: Implement Phase G — Client Classification + Per-Client Profiles.
 
    d. _classify_client(request: Request) -> str:
       - Check for CF-Ray header → "remote" (came through Cloudflare)
-      - Check client IP is localhost → "local" (Claude Code on Apollyon)
-      - Check client IP starts with "10.42.69." → "lan"
+      - Check client IP is localhost → "local" (Claude Code on gpu-server)
+      - Check client IP starts with "198.51.100." → "lan"
       - Default → "remote" (safe: treat unknown as constrained)
 
    e. set_client_context(request: Request) function that creates ClientContext and sets the contextvar
@@ -202,7 +202,7 @@ TASK: Implement Phase F — Tool Consolidation + Schema Compression.
    - poll: "Check task status or retrieve result."
 
 4. Update maestro_status to return structured JSON instead of ASCII art:
-   {"hosts": {"apollyon": {"status": "connected", "local": true}, ...}, "available": N, "total": N}
+   {"hosts": {"gpu-server": {"status": "connected", "local": true}, ...}, "available": N, "total": N}
 
 5. Commit as "feat(phase-f): consolidate tools 20→10, compress docstrings, structured status"
 

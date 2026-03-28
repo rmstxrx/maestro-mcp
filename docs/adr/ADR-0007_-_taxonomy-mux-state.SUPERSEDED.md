@@ -45,7 +45,7 @@ Every command Maestro executes on a host runs inside a tmux session. tmux is the
 
 #### Rationale
 
-Benchmarking on the Cellar → Apollyon path (SSH with ControlMaster) shows zero measurable overhead:
+Benchmarking on the Hub → GPU-server path (SSH with ControlMaster) shows zero measurable overhead:
 
 | Method | Avg latency (10 runs) |
 |--------|-----------------------|
@@ -156,15 +156,15 @@ raw = await mux.run(host, _wrap_command(cfg, command, cwd, sudo), timeout=timeou
 
 Auto-promote continues to work — it wraps `mux.run()` just as it wraps `_ssh_run()` today. The difference is that promoted tasks can optionally become persistent windows instead of orphaned background processes.
 
-#### Local host (Cellar)
+#### Local host (Hub)
 
 For the hub (`is_local: true`), `mux.py` runs tmux commands directly (via `local.py`) instead of via SSH. Same API, different transport — consistent with the existing `local.py` / `transport.py` split.
 
-#### Eden (Windows)
+#### Win-server (Windows)
 
-tmux is not available on Windows. **Eden-WSL is the primary fleet host for the Eden machine.** It runs tmux natively, has full bash, and can call Windows executables through WSL interop (`/mnt/c/...`, `.exe` invocations).
+tmux is not available on Windows. **Win-server-WSL is the primary fleet host for the Win-server machine.** It runs tmux natively, has full bash, and can call Windows executables through WSL interop (`/mnt/c/...`, `.exe` invocations).
 
-The direct PowerShell SSH entry (`eden`) remains in `hosts.yaml` as a **limited-access escape hatch** for cases that specifically require native PowerShell. It does not participate in the tmux substrate — commands sent to `eden` directly bypass mux and use raw SSH, as today.
+The direct PowerShell SSH entry (`win-server`) remains in `hosts.yaml` as a **limited-access escape hatch** for cases that specifically require native PowerShell. It does not participate in the tmux substrate — commands sent to `win-server` directly bypass mux and use raw SSH, as today.
 
 No `mux_via` routing concept is needed. Every host either has tmux and participates fully, or it doesn't.
 
@@ -172,7 +172,7 @@ No `mux_via` routing concept is needed. Every host either has tmux and participa
 
 `~/.maestro/` is Maestro's footprint on every fleet host, analogous to `~/.ssh/`.
 
-#### Hub (Cellar)
+#### Hub
 
 ```
 ~/.maestro/
@@ -182,7 +182,7 @@ No `mux_via` routing concept is needed. Every host either has tmux and participa
 └── outputs/              # Agent output files generated on hub
 ```
 
-#### Compute hosts (Apollyon, Eden-WSL, Judas)
+#### Compute hosts (GPU-server, Win-server-WSL, Macbook)
 
 ```
 ~/.maestro/
@@ -204,7 +204,7 @@ Agent scratch/temp files continue to go in `~/Development/General/tmp/` on compu
 
 The task ledger (`~/.maestro/task_ledger.json`) is retained as an **audit trail and history log**. It records every dispatched task with timestamps, agent, host, status, and outcome.
 
-However, the ledger is no longer the source of truth for **live task state**. That role transfers to the tmux session. This solves the **misdirected task problem**: currently, all live state is centralized in the Cellar's `TASK_REGISTRY`. Polling "what's running on Apollyon?" queries the Cellar's memory, not Apollyon. Registry eviction, restarts, and timing races cause tasks to be misattributed between hosts or lost entirely. With tmux, the host itself is the authority on its own live state.
+However, the ledger is no longer the source of truth for **live task state**. That role transfers to the tmux session. This solves the **misdirected task problem**: currently, all live state is centralized in the Hub's `TASK_REGISTRY`. Polling "what's running on GPU-server?" queries the Hub's memory, not GPU-server. Registry eviction, restarts, and timing races cause tasks to be misattributed between hosts or lost entirely. With tmux, the host itself is the authority on its own live state.
 
 | Question | Before (ADR-0006) | After (ADR-0007) |
 |----------|-------------------|-------------------|
@@ -226,7 +226,7 @@ The `poll` tool continues to query the ledger for historical status. A new tool 
 ### Phase 2: mux.py core
 1. Implement `mux.py` with `ensure_session`, `run`, `run_script`.
 2. Wire `fleet.exec()` and `fleet.script()` through `mux.run()`.
-3. For hosts without tmux (Eden/PowerShell), `mux.run()` falls back to raw SSH (current behavior).
+3. For hosts without tmux (Win-server/PowerShell), `mux.run()` falls back to raw SSH (current behavior).
 4. Tests: verify signal isolation (pkill inside tmux does not kill ControlMaster).
 
 ### Phase 3: Persistent windows + new tools
@@ -244,7 +244,7 @@ The `poll` tool continues to query the ledger for historical status. A new tool 
 
 **Positive:**
 - Signal isolation eliminates the pkill/ControlMaster kill class of bugs entirely.
-- **Eliminates misdirected task confusion.** The current architecture centralizes all live task state on the Cellar (`TASK_REGISTRY` in-memory, `task_registry.json` on disk). When polling or querying "what's running on host X?", the answer comes from the Cellar's registry, not from host X. Registry eviction, Maestro restarts, and timing races cause tasks to be misattributed or lost. With tmux, live state is **distributed** — each host's tmux server is the source of truth for what's running on that host. `list_windows(host="apollyon")` queries Apollyon directly. A pane either exists on that host or it doesn't. The centralized ledger remains as an audit trail ("what happened last week?"), but the live question ("what's happening right now?") goes to the host itself.
+- **Eliminates misdirected task confusion.** The current architecture centralizes all live task state on the Hub (`TASK_REGISTRY` in-memory, `task_registry.json` on disk). When polling or querying "what's running on host X?", the answer comes from the Hub's registry, not from host X. Registry eviction, Maestro restarts, and timing races cause tasks to be misattributed or lost. With tmux, live state is **distributed** — each host's tmux server is the source of truth for what's running on that host. `list_windows(host="gpu-server")` queries GPU-server directly. A pane either exists on that host or it doesn't. The centralized ledger remains as an audit trail ("what happened last week?"), but the live question ("what's happening right now?") goes to the host itself.
 - Consistent taxonomy reduces cognitive load in docs, conversation, and code navigation.
 - `~/.maestro/` convention makes fleet-wide cleanup and auditing trivial.
 - Persistent windows unlock agent interop — a qualitative capability gain.
@@ -252,7 +252,7 @@ The `poll` tool continues to query the ledger for historical status. A new tool 
 
 **Negative:**
 - tmux becomes a hard dependency on all primary fleet hosts (Linux/macOS). Must be pre-installed.
-- Eden (PowerShell) does not participate in the tmux substrate; Eden-WSL is the primary entry point for that machine.
+- Win-server (PowerShell) does not participate in the tmux substrate; Win-server-WSL is the primary entry point for that machine.
 - Agent dispatch tools moving from `fleet.py` to `orchestra.py` changes import paths (one-time migration).
 
 **Risks:**

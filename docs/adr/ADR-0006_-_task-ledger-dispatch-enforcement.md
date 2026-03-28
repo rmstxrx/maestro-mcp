@@ -2,7 +2,7 @@
 
 **Status:** Proposed  
 **Date:** 2026-03-22  
-**Deciders:** rmstxrx, Claude  
+**Deciders:** (maintainer), Claude  
 **Relates to:** BUG-0001 (cross-host poll leakage), ADR-0005 (host-aware routing)
 
 ## Context
@@ -60,7 +60,7 @@ Despite `exec`'s docstring saying "Do NOT use this to invoke agent CLIs,"
 the orchestrating LLM sometimes dispatches agents via raw `exec` commands:
 
 ```
-exec(host="apollyon", command="codex -q --model o4-mini ...")
+exec(host="gpu-server", command="codex -q --model o4-mini ...")
 ```
 
 This causes:
@@ -185,11 +185,11 @@ Response for a running task:
 {
     "task_id": "abc123",
     "agent": "codex",
-    "host": "apollyon",
+    "host": "gpu-server",
     "status": "running",
     "dispatched_at": "2026-03-22T14:30:00Z",
     "elapsed_seconds": 142.3,
-    "result_url": "https://maestro.rmstxrx.dev/tasks/abc123/result"
+    "result_url": "https://maestro.yourdomain.dev/tasks/abc123/result"
 }
 ```
 
@@ -198,13 +198,13 @@ Response for a completed task:
 {
     "task_id": "abc123",
     "agent": "codex",
-    "host": "apollyon",
+    "host": "gpu-server",
     "status": "done",
     "dispatched_at": "2026-03-22T14:30:00Z",
     "completed_at": "2026-03-22T14:35:12Z",
     "return_code": 0,
-    "output_file": "/home/rmstxrx/.agent-orchestra/outputs/codex_20260322_143000_abc123.txt",
-    "result_url": "https://maestro.rmstxrx.dev/tasks/abc123/result"
+    "output_file": "/home/user/.agent-orchestra/outputs/codex_20260322_143000_abc123.txt",
+    "result_url": "https://maestro.yourdomain.dev/tasks/abc123/result"
 }
 ```
 
@@ -290,7 +290,7 @@ becomes:
      ( for i in $(seq 1 40); do
          code=$(curl -s -o /tmp/task_XYZ.json -w '%{http_code}' \
            -H "Authorization: Bearer $KEY" \
-           "https://maestro.rmstxrx.dev/tasks/XYZ/result")
+           "https://maestro.yourdomain.dev/tasks/XYZ/result")
          [ "$code" = "200" ] && break
          sleep 15
        done ) &
@@ -308,7 +308,7 @@ conversation stays unblocked.
 | Persona | Before | After |
 |---|---|---|
 | **Claude.ai (orchestrator)** | Repeated `poll` calls or blocking curl loops | Dispatch → background watcher → check on demand |
-| **rmstxrx (user)** | "check on that task" → 5 rounds of poll | `tasks` tool → instant table of all work |
+| **operator** | "check on that task" → 5 rounds of poll | `tasks` tool → instant table of all work |
 | **Subagents** | Could be dispatched via `exec` with wrong args | Forced through dispatch tools with full scope + tracking |
 | **Ledger** | Did not exist | Permanent record of all dispatched work |
 

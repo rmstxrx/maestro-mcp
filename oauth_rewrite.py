@@ -5,14 +5,14 @@ based on the incoming request's Host header.
 Problem:
   Maestro's OAuth metadata is static (MAESTRO_ISSUER_URL), but clients
   connect via different paths:
-    - https://maestro.rmstxrx.dev  (Cloudflare tunnel — public)
-    - http://10.42.69.167:8222     (LAN — fleet machines)
-    - http://localhost:8222         (loopback — Apollyon itself)
+    - https://maestro.yourdomain.dev  (Cloudflare tunnel — public)
+    - http://198.51.100.167:8222      (LAN — fleet machines)
+    - http://localhost:8222            (loopback — hub itself)
 
   The MCP OAuth spec (RFC 9728) requires the `resource` in the protected
   resource metadata to match the URL the client is connecting to. If a
-  LAN client hits http://10.42.69.167:8222/mcp but gets metadata saying
-  the resource is https://maestro.rmstxrx.dev/mcp, the client rejects it.
+  LAN client hits http://198.51.100.167:8222/mcp but gets metadata saying
+  the resource is https://maestro.yourdomain.dev/mcp, the client rejects it.
 
 Solution:
   This middleware intercepts ALL responses for non-canonical hosts and:
@@ -46,7 +46,7 @@ def _parse_lan_origins(env_val: str) -> dict[str, str]:
     """Parse MAESTRO_LAN_ORIGINS env var into host→base_url mapping.
 
     Format: comma-separated 'host:port=scheme' pairs.
-    Example: '10.42.69.167:8222=http,192.168.1.100:8222=http'
+    Example: '198.51.100.167:8222=http,192.168.1.100:8222=http'
     """
     result: dict[str, str] = {}
     for entry in env_val.split(","):
@@ -80,7 +80,7 @@ class OAuthURLRewriteMiddleware:
 
     Args:
         inner: The wrapped ASGI application.
-        canonical_url: The static issuer URL (e.g. "https://maestro.rmstxrx.dev").
+        canonical_url: The static issuer URL (e.g. "https://maestro.yourdomain.dev").
             Responses containing this URL will have it replaced when the
             client connects via an allowed non-canonical host.
         allowed_origins: Mapping of Host header value → effective base URL.

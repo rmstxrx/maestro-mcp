@@ -2,9 +2,9 @@
 
 **Date:** 2026-03-03  
 **Auditor:** Claude (Opus 4.6)  
-**Codebase:** `/home/rmstxrx/Development/maestro-mcp/` on Apollyon  
+**Codebase:** `/home/user/Development/maestro-mcp/` on GPU-server  
 **Last commit:** `2c1fd52` — *fix: remove per-result local host hint to save context tokens*  
-**Deployment:** `maestro.rmstxrx.dev` + `fleet.rmstxrx.dev` → Cloudflare Tunnel → `localhost:8222`
+**Deployment:** `maestro.yourdomain.dev` + `fleet.yourdomain.dev` → Cloudflare Tunnel → `localhost:8222`
 
 ---
 
@@ -73,8 +73,8 @@ if client.client_id in TRUSTED_CLIENT_IDS:
 
 The `remote_path` parameter from query strings is passed directly to filesystem operations (local) and SCP commands (remote) with **zero validation**. An authenticated caller can:
 
-- Read any file: `GET /transfer/pull?host=apollyon&remote_path=/etc/shadow`
-- Write anywhere: `POST /transfer/push?host=apollyon&remote_path=/etc/cron.d/backdoor`
+- Read any file: `GET /transfer/pull?host=gpu-server&remote_path=/etc/shadow`
+- Write anywhere: `POST /transfer/push?host=gpu-server&remote_path=/etc/cron.d/backdoor`
 - Traverse paths: `remote_path=../../.ssh/authorized_keys`
 
 The transfer token is a static bearer token shared in the user preferences of every Claude.ai conversation, making it semi-public.
@@ -156,7 +156,7 @@ Registered clients persist in-memory indefinitely (until service restart). There
 
 No CORS headers are set on any endpoint. While Cloudflare Tunnel provides some protection, if the server is ever accessed directly (e.g., from local network), browser-based attacks could interact with the endpoints.
 
-**Recommendation:** Set explicit CORS policy allowing only `https://claude.ai` and `https://maestro.rmstxrx.dev`.
+**Recommendation:** Set explicit CORS policy allowing only `https://claude.ai` and `https://maestro.yourdomain.dev`.
 
 ---
 
@@ -202,7 +202,7 @@ The server exposes 17 MCP tools and 3 custom HTTP routes:
 - `/transfer/push` — File upload to hosts (separate bearer token)
 - `/transfer/pull` — File download from hosts (separate bearer token)
 
-**Hosts:** apollyon (local), eden (PowerShell), judas (MacBook), eden-wsl (WSL2 Ubuntu)
+**Hosts:** gpu-server (local), win-server (PowerShell), macbook (laptop), win-server-wsl (WSL2 Ubuntu)
 
 ### I-2: Dependency Versions
 

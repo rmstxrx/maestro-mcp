@@ -37,7 +37,7 @@ syntax.
 gemini
 # Then in the session:
 # > use maestro to check fleet status
-# > run `nvidia-smi` on eden via maestro
+# > run `nvidia-smi` on win-server via maestro
 ```
 
 **Headless (non-interactive):**
@@ -58,17 +58,17 @@ gemini -p "Call the maestro status tool and summarise the result."
 
 ### Execute a command on a host
 ```bash
-gemini -p "Use maestro exec to run 'nvidia-smi' on host eden and show the output."
+gemini -p "Use maestro exec to run 'nvidia-smi' on host win-server and show the output."
 ```
 
 ### Read a file (surgical)
 ```bash
-gemini -p "Use maestro read to get the last 50 lines of /var/log/syslog on apollyon."
+gemini -p "Use maestro read to get the last 50 lines of /var/log/syslog on gpu-server."
 ```
 
 ### Transfer a file
 ```bash
-gemini -p "Use maestro transfer to upload ./src/main.py to ~/workspace/main.py on judas."
+gemini -p "Use maestro transfer to upload ./src/main.py to ~/workspace/main.py on macbook."
 ```
 
 ### Discover SSH hosts
@@ -78,7 +78,7 @@ gemini -p "Use maestro list_ssh_hosts to show available SSH hosts and which are 
 
 ### Reconnect a host
 ```bash
-gemini -p "Use maestro reconnect_host to reset the SSH connection to eden."
+gemini -p "Use maestro reconnect_host to reset the SSH connection to win-server."
 ```
 
 ---
@@ -93,10 +93,10 @@ stays responsive.
 ### Dispatch a task
 ```bash
 gemini --approval-mode yolo -p "
-Use maestro to dispatch a gemini task on apollyon:
+Use maestro to dispatch a gemini task on gpu-server:
   prompt: 'Refactor the authentication logic in maestro_oauth.py'
   approval_mode: yolo
-  working_dir: /home/rmstxrx/Development/maestro-mcp
+  working_dir: /home/user/Development/maestro-mcp
 Then poll until complete and summarise the changes.
 "
 ```
@@ -114,7 +114,7 @@ Then poll until complete and summarise the changes.
 
 ### List previous sessions on a host
 ```bash
-gemini -p "Use the maestro gemini_sessions tool on host apollyon to list available sessions."
+gemini -p "Use the maestro gemini_sessions tool on host gpu-server to list available sessions."
 ```
 
 ### Poll a dispatched task
@@ -129,7 +129,7 @@ For long-running tasks, prefer the HTTP endpoint via bash (immune to BUG-0001):
 gemini --approval-mode yolo -p "
 Call maestro prepare_relay, then use bash to poll the task result:
   for i in \$(seq 1 40); do
-    HTTP_CODE=\$(curl -s -o /tmp/result.json -w '%{http_code}' -H 'Authorization: Bearer \$RELAY_KEY' 'https://maestro.rmstxrx.dev/tasks/TASK_ID/result')
+    HTTP_CODE=\$(curl -s -o /tmp/result.json -w '%{http_code}' -H 'Authorization: Bearer \$RELAY_KEY' 'https://maestro.yourdomain.dev/tasks/TASK_ID/result')
     [ \"\$HTTP_CODE\" = \"200\" ] && cat /tmp/result.json && break
     sleep 15
   done

@@ -21,7 +21,7 @@ CLIENT_PROFILES: dict[str, dict[str, Any]] = {
         "poll_cooldown": 10,          # min seconds between polls
     },
     "local": {
-        # Claude Code running on Apollyon — generous
+        # Claude Code running on the local hub — generous
         "block_timeout_agent": 30,    # try to complete inline
         "block_timeout_exec": 60,     # long inline for exec/script
         "poll_cooldown": 2,           # fast polls OK

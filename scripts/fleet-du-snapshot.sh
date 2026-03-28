@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./fleet-du-snapshot.sh              # Run on current machine (auto-detects hostname)
-#   ./fleet-du-snapshot.sh apollyon     # Force a specific profile
+#   ./fleet-du-snapshot.sh gpu-server     # Force a specific profile
 #
 # Output: Appends timestamped entry to ~/.local/share/fleet-du/snapshots.log
 # Rotate: Keeps last 52 entries (1 year of weekly snapshots).
@@ -12,8 +12,8 @@
 #   crontab -e
 #   0 9 * * 1 ~/Development/maestro-mcp/scripts/fleet-du-snapshot.sh
 #
-# On Eden (Task Scheduler):
-#   powershell -Command "wsl -d Ubuntu -- ~/Development/maestro-mcp/scripts/fleet-du-snapshot.sh eden"
+# On Win-server (Task Scheduler):
+#   powershell -Command "wsl -d Ubuntu -- ~/Development/maestro-mcp/scripts/fleet-du-snapshot.sh win-server"
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "=== ${HOST} @ ${timestamp} ===" >> "$LOG_FILE"
 
 case "$HOST" in
-    apollyon|DGX-Spark)
+    gpu-server|DGX-Spark)
         du -sh ~/Development ~/models ~/.cache ~/.ollama ~/Downloads 2>/dev/null >> "$LOG_FILE" || true
         du -sh ~/Development/*/ 2>/dev/null | sort -rh | head -5 >> "$LOG_FILE" || true
         du -sh ~/models/*/ 2>/dev/null | sort -rh >> "$LOG_FILE" || true
@@ -42,10 +42,10 @@ case "$HOST" in
         [ "${models_gb:-0}" -gt 200 ] && echo "ALERT: ~/models is ${models_gb}GB (threshold: 200GB)" >> "$LOG_FILE"
         ;;
 
-    eden|EDEN)
-        # Eden runs this via WSL, reading Windows paths through /mnt/c
-        win_dev="/mnt/c/Users/romul/Development"
-        win_dl="/mnt/c/Users/romul/Downloads"
+    win-server|WIN-SERVER)
+        # Win-server runs this via WSL, reading Windows paths through /mnt/c
+        win_dev="/mnt/c/Users/youruser/Development"
+        win_dl="/mnt/c/Users/youruser/Downloads"
         du -sh "$win_dev" "$win_dl" 2>/dev/null >> "$LOG_FILE" || true
         du -sh "$win_dev"/*/ 2>/dev/null | sort -rh | head -5 >> "$LOG_FILE" || true
         df -h /mnt/c | tail -1 >> "$LOG_FILE"
@@ -57,7 +57,7 @@ case "$HOST" in
         [ "${dev_gb:-0}" -gt 500 ] && echo "ALERT: Development is ${dev_gb}GB (threshold: 500GB)" >> "$LOG_FILE"
         ;;
 
-    judas|Judas*|*.local)
+    mac-laptop|Mac-laptop*|*.local)
         du -sh ~/Development ~/.cache ~/.ollama 2>/dev/null >> "$LOG_FILE" || true
         du -sh ~/Development/*/ 2>/dev/null | sort -rh | head -5 >> "$LOG_FILE" || true
         df -h / | tail -1 >> "$LOG_FILE"

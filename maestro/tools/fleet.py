@@ -144,7 +144,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     # --- Fleet tools ---
 
-    # --- ADR-0007: Cellar-local execution via run ---
+    # --- ADR-0007: Hub-local execution via run ---
 
     @mcp.tool()
     async def run(
@@ -158,7 +158,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
         Single commands and multi-line scripts are handled uniformly —
         Maestro detects multi-line input and pipes via bash -s automatically.
-        Every execution is ledger-tracked with output captured to Cellar disk.
+        Every execution is ledger-tracked with output captured to Hub disk.
 
         Guards: rejects raw agent CLI invocations (use dispatch instead).
         In stdio mode, rejects commands targeting the local host.
@@ -441,7 +441,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     async def stop(task_id: str) -> str:
         """Kill a running task (ADR-0007).
 
-        Kills the Cellar-local tmux window. The SSH session inside it dies,
+        Kills the Hub-local tmux window. The SSH session inside it dies,
         which terminates the remote process.
 
         Safety: refuses to kill the tmux server itself. Only task windows

@@ -469,7 +469,7 @@ class TestOrchestraRunCli:
         )
 
         async def _fake_raw_ps(host, cli_command, timeout, cwd=None):
-            assert host == "eden"
+            assert host == "win-server"
             assert cli_command == "claude --version 2>&1"
             assert timeout == 10
             assert cwd == "C:/work"
@@ -478,7 +478,7 @@ class TestOrchestraRunCli:
         monkeypatch.setattr("maestro.tools.orchestra._orchestra_run_cli_raw_ps", _fake_raw_ps)
 
         rc, output = await _orchestra_run_cli(
-            "eden",
+            "win-server",
             "claude --version 2>&1",
             timeout=10,
             cwd="C:/work",

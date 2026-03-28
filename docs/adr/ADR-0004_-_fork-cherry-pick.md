@@ -2,7 +2,7 @@
 
 **Status:** Proposed  
 **Date:** 2026-03-19  
-**Deciders:** rmstxrx, Claude  
+**Deciders:** (maintainer), Claude  
 **Relates to:** ADR-0003 (reliability refactor), BUG-0001 (cross-host poll leakage)
 
 ## Context
@@ -32,7 +32,7 @@ This ADR combines both into a single coherent refactoring pass.
 
 | Idea | Reason |
 |------|--------|
-| asyncssh connection pool | Breaks ProxyJump (Eden-WSL), requires reimplementing SSH config in Python, `known_hosts=None` is a security regression. ControlMaster is architecturally superior for our fleet. |
+| asyncssh connection pool | Breaks ProxyJump (Win-server-WSL), requires reimplementing SSH config in Python, `known_hosts=None` is a security regression. ControlMaster is architecturally superior for our fleet. |
 | Password/key_passphrase in HostConfig | Plaintext credentials in hosts.yaml. Our model: SSH agent + config handles auth. |
 | install_agent tool | Too coupled to specific CLI install procedures that change upstream. Manual install is fine for 3 hosts. |
 | Persistent tmux sessions (6 tools) | Overlaps auto-promote. Tool count explosion (12→18 just for this). Revisit as a single `persistent_exec` tool later if needed. |

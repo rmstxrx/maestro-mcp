@@ -12,12 +12,12 @@
 
 ### Exact sequence of events
 
-1. **`exec(host="eden-wsl", command="sleep 300 && tail -30 /tmp/nvfp4_awq_test.log")`**
-   - Returned: `{"auto_promoted": true, "task_id": "75ac9e4cd0a60439", "agent": "exec", "host": "eden-wsl", "status": "running", "elapsed_seconds": 5.0}`
+1. **`exec(host="win-server-wsl", command="sleep 300 && tail -30 /tmp/nvfp4_awq_test.log")`**
+   - Returned: `{"auto_promoted": true, "task_id": "75ac9e4cd0a60439", "agent": "exec", "host": "win-server-wsl", "status": "running", "elapsed_seconds": 5.0}`
 
 2. **`poll(task_id="75ac9e4cd0a60439", wait=360)`**
-   - **Expected:** Output from `tail -30 /tmp/nvfp4_awq_test.log` on eden-wsl
-   - **Actual:** Returned output from an **Apollyon** task (GPQA Diamond Benchmark):
+   - **Expected:** Output from `tail -30 /tmp/nvfp4_awq_test.log` on win-server-wsl
+   - **Actual:** Returned output from an **GPU-server** task (GPQA Diamond Benchmark):
      ```
      ============================================
       GPQA Diamond Benchmark — Full Pipeline
@@ -30,20 +30,20 @@
 
 ### Context
 
-- The GPQA benchmark was queued/running on **Apollyon** around the same time.
-- The exec task was dispatched to **eden-wsl**.
-- The task_id `75ac9e4cd0a60439` was returned by the eden-wsl exec call but poll returned Apollyon output.
+- The GPQA benchmark was queued/running on **GPU-server** around the same time.
+- The exec task was dispatched to **win-server-wsl**.
+- The task_id `75ac9e4cd0a60439` was returned by the win-server-wsl exec call but poll returned GPU-server output.
 
 ## Possible causes
 
 1. **Task ID collision** — If task IDs are generated without incorporating the host, two tasks on different hosts could collide in a shared registry.
-2. **Shared task registry without host scoping** — If the task store is a flat dict keyed only by task_id, a newer task on Apollyon could overwrite an eden-wsl entry with the same ID.
+2. **Shared task registry without host scoping** — If the task store is a flat dict keyed only by task_id, a newer task on GPU-server could overwrite an win-server-wsl entry with the same ID.
 3. **Race condition in auto-promote** — The `auto_promoted: true` flag suggests the exec was promoted to an async task. If promotion writes to a global store without host-namespacing, cross-host pollution is possible.
 
 ## Impact
 
 - **Silent data corruption**: The caller has no way to know the output is from the wrong host/task. It looks like a valid result.
-- **Debugging nightmare**: In this instance the output was obviously wrong (GPQA output for an Eden log tail), but if both tasks produced similar-looking text, this would be undetectable.
+- **Debugging nightmare**: In this instance the output was obviously wrong (GPQA output for an Win-server log tail), but if both tasks produced similar-looking text, this would be undetectable.
 
 ## Suggested fix
 
@@ -56,9 +56,9 @@
 ### Root cause analysis
 
 **The task registry is clean.** Task `75ac9e4cd0a60439` has the correct
-`host: "eden-wsl"` and correct `result_json` (an SSH timeout error) stored
+`host: "win-server-wsl"` and correct `result_json` (an SSH timeout error) stored
 in the registry. The GPQA output lives in a completely separate task
-(`6a422f33d8a2f468`) on apollyon with a different task_id.
+(`6a422f33d8a2f468`) on gpu-server with a different task_id.
 
 This means the contamination occurred at the **MCP Streamable HTTP transport
 layer** — somewhere between Maestro returning the correct `poll()` response

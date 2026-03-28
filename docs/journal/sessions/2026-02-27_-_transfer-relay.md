@@ -64,13 +64,13 @@ All tests passed from the sandboxed container via `curl`:
 | No auth token               | 401      | 401  |
 | Bad auth token              | 401      | 401  |
 | Missing params              | 400      | 400  |
-| Push text (local/apollyon)  | 200 + ok | ✓    |
-| Pull text (local/apollyon)  | match    | ✓    |
+| Push text (local/gpu-server)  | 200 + ok | ✓    |
+| Pull text (local/gpu-server)  | match    | ✓    |
 | Pull nonexistent            | 404      | 404  |
 | Invalid host                | 400      | 400  |
 | Binary 64KB roundtrip (SHA) | match    | ✓    |
-| Push via SCP (judas)        | 200 + ok | ✓    |
-| Pull via SCP (judas)        | match    | ✓    |
+| Push via SCP (macbook)        | 200 + ok | ✓    |
+| Pull via SCP (macbook)        | match    | ✓    |
 
 ## Usage
 
@@ -78,10 +78,10 @@ All tests passed from the sandboxed container via `curl`:
 # Push (container → host, zero context cost):
 curl -s -H "Authorization: Bearer $MAESTRO_TRANSFER_TOKEN" \
   -F "file=@/home/claude/output.py" \
-  "https://maestro.rmstxrx.dev/transfer/push?host=apollyon&remote_path=/home/rmstxrx/workspace/output.py"
+  "https://maestro.yourdomain.dev/transfer/push?host=gpu-server&remote_path=/home/user/workspace/output.py"
 
 # Pull (host → container, zero context cost):
 curl -s -H "Authorization: Bearer $MAESTRO_TRANSFER_TOKEN" \
   -o /home/claude/data.json \
-  "https://maestro.rmstxrx.dev/transfer/pull?host=apollyon&remote_path=/home/rmstxrx/workspace/data.json"
+  "https://maestro.yourdomain.dev/transfer/pull?host=gpu-server&remote_path=/home/user/workspace/data.json"
 ```

@@ -10,7 +10,7 @@ Identified during the Mar 12–13 2026 audit session. These are follow-ups to AD
 
 3. **Cross-reference HTTP alternatives in tool descriptions.** `poll` should mention `/tasks/{task_id}/result` as a zero-context HTTP alternative (use with `prepare_relay` key). `transfer` should mention `prepare_relay` + `curl push/pull` as the preferred path for large files. `read` should note that large files are better accessed via `exec` + `grep/head/sed`.
 
-4. **Set `MAESTRO_DEFAULT_REPO` in `.env`.** Even after making `working_dir` required, the config fallback should point somewhere real — `/home/rmstxrx/Development` not `~/workspace`.
+4. **Set `MAESTRO_DEFAULT_REPO` in `.env`.** Even after making `working_dir` required, the config fallback should point somewhere real — `/home/user/Development` not `~/workspace`.
 
 ## Discovery
 

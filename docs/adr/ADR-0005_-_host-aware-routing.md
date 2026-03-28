@@ -2,7 +2,7 @@
 
 **Status:** Proposed  
 **Date:** 2026-03-19  
-**Deciders:** rmstxrx, Claude  
+**Deciders:** (maintainer), Claude  
 **Relates to:** ADR-0004 (fork cherry-pick), BUG-0001 (cross-host poll leakage)
 
 ## Context
@@ -14,13 +14,13 @@ running on the hub machine.
 
 ### The problem
 
-When Claude Code runs on Apollyon (dispatched via `Maestro:claude`), it has
-two ways to execute commands on Apollyon:
+When Claude Code runs on GPU-server (dispatched via `Maestro:claude`), it has
+two ways to execute commands on GPU-server:
 
 1. **Native Bash tool** — direct subprocess, zero overhead, full terminal
    capabilities, immediate.
 
-2. **Maestro:exec(host="apollyon", ...)** — MCP stdio → Maestro → `is_local`
+2. **Maestro:exec(host="gpu-server", ...)** — MCP stdio → Maestro → `is_local`
    check → subprocess → MCP stdio response. Three layers of indirection
    for the same subprocess call.
 
@@ -42,7 +42,7 @@ This is not merely inefficient. It's architecturally wrong:
 
 The root cause: **agents don't know where they are.** Nothing in Maestro's
 MCP instructions or tool responses tells a stdio agent "you are running on
-apollyon." The agent sees named hosts and tools, with no sense of self-location.
+gpu-server." The agent sees named hosts and tools, with no sense of self-location.
 
 ### Current client classification
 
@@ -220,7 +220,7 @@ def get_client_context() -> ClientContext:
 
 - Local agents naturally partition their work: native tools for local,
   Maestro for remote. No wasted round-trips.
-- Clearer mental model for agents: "I am on apollyon, these are my
+- Clearer mental model for agents: "I am on gpu-server, these are my
   neighbors, here's how I reach them."
 - Reduced MCP traffic on stdio for local operations, which also reduces
   the serialization overhead on the host machine.
@@ -233,7 +233,7 @@ def get_client_context() -> ClientContext:
   reinforce the pattern.
 - Affect HTTP clients in any way — Claude.ai continues to use Maestro
   for everything, as it must.
-- Change how agent dispatch works — `Maestro:claude(host="apollyon", ...)`
+- Change how agent dispatch works — `Maestro:claude(host="gpu-server", ...)`
   remains valid from stdio clients because the dispatch tools provide
   coordination value (task registry, output capture, auto-promote).
 

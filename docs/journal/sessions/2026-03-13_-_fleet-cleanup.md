@@ -16,12 +16,12 @@ Session started: 2026-03-12
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
 
-## Phase 3: Apollyon models and envs
+## Phase 3: GPU-server models and envs
 
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
 
-## Phase 4: Eden stale repos and SOAR
+## Phase 4: Win-server stale repos and SOAR
 
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
@@ -31,7 +31,7 @@ Session started: 2026-03-12
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
 
-## Phase 6: Judas audit
+## Phase 6: Mac-laptop audit
 
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
@@ -42,7 +42,7 @@ Session started: 2026-03-12
 
 ### Phase 1 Results (2026-03-12)
 
-**Apollyon:**
+**GPU-server:**
 | Item | Size | Action |
 |------|------|--------|
 | ~/download_qwen3next.log | 4K | DELETED |
@@ -58,7 +58,7 @@ Session started: 2026-03-12
 | /tmp/sapiens_agu_test | 15M | DELETED |
 | /tmp/zip_test | 8.8M | DELETED |
 
-**Eden:**
+**Win-server:**
 | Item | Size | Action |
 |------|------|--------|
 | Mangled-path logs (3 files) | 0 bytes | DELETED |
@@ -72,32 +72,32 @@ Session started: 2026-03-12
 
 ### Phase 1 continued — SOAR consolidation + llama.cpp (2026-03-12)
 
-**Apollyon — scripts relocated to soar-challenge/scripts/:**
+**GPU-server — scripts relocated to soar-challenge/scripts/:**
 | Item | Size | Action |
 |------|------|--------|
 | ~/scripts/sglang-qwen35.sh | 1.2K | MOVED → soar-challenge/scripts/ (paths fixed by agent) |
 | ~/scripts/sglang-smoke-test.sh | 1.8K | MOVED → soar-challenge/scripts/ |
 | ~/scripts/gptq_quantize_sala.py | 5.7K | MOVED → soar-challenge/scripts/ (paths fixed by agent) |
 
-**Apollyon — venvs moved into soar-challenge/:**
+**GPU-server — venvs moved into soar-challenge/:**
 | Item | Size | Action |
 |------|------|--------|
 | ~/sglang-venv/ | 9.4GB | MOVED → soar-challenge/sglang-venv/ |
 | ~/gptq_env/ | 6.9GB | MOVED → soar-challenge/gptq_env/ |
 | ~/gptqmodel_offload/ | 4.7GB | MOVED → soar-challenge/gptqmodel_offload/ |
 
-**Apollyon — llama.cpp relocated:**
+**GPU-server — llama.cpp relocated:**
 | Item | Size | Action |
 |------|------|--------|
 | ~/llama.cpp/ | 596MB | MOVED → ~/Development/llama.cpp/ |
 
-**Eden — llama.cpp:** Already in C:\Users\romul\Development\llama.cpp — no action needed.
+**Win-server — llama.cpp:** Already in C:\Users\youruser\Development\llama.cpp — no action needed.
 
 **Agent debrief:** soar-challenge/docs/journal/debriefs/2026-03-12-fix-script-paths.md
 
 ### Phase 2 Results (2026-03-12)
 
-**Apollyon — HF cache eviction (~116GB):**
+**GPU-server — HF cache eviction (~116GB):**
 | Item | Size | Action |
 |------|------|--------|
 | unsloth/Nemotron-3-Nano-30B-A3B | 59GB | DELETED |
@@ -105,7 +105,7 @@ Session started: 2026-03-12
 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 | 19GB | DELETED |
 | Remaining: DeepSeek-OCR, e5-base, Docling, MiniLM | 8.1GB | KEPT (active) |
 
-**Eden — HF cache eviction (~195GB):**
+**Win-server — HF cache eviction (~195GB):**
 | Item | Size | Action |
 |------|------|--------|
 | unsloth/Nemotron-3-Nano-30B-A3B | 58.8GB | DELETED |
@@ -117,7 +117,7 @@ Session started: 2026-03-12
 | unsloth/Qwen3-8B-unsloth-bnb-4bit | 7.0GB | DELETED |
 | Remaining: e5-base, MiniLM, embeddinggemma, Docling + stubs | ~4GB | KEPT |
 
-**Apollyon — Docker (~38.7GB):**
+**GPU-server — Docker (~38.7GB):**
 | Item | Size | Action |
 |------|------|--------|
 | tensorrt-llm/release:1.2.0rc1 | 32.2GB | DELETED (image + container) |
@@ -127,13 +127,13 @@ Session started: 2026-03-12
 | Stopped containers (3) | ~1.1GB | DELETED |
 | KEPT: vllm cu130-nightly, relatoria-ingest(-ngc), pytorch 26.01+26.02, traefik v3 | | |
 
-**Eden — Docker (~26.5GB):**
+**Win-server — Docker (~26.5GB):**
 | Item | Size | Action |
 |------|------|--------|
 | vllm/vllm-openai:v0.8.5 | 26.5GB | DELETED |
 | Running container relatoria-vlm-9b | — | UNTOUCHED |
 
-**Apollyon — Other caches:**
+**GPU-server — Other caches:**
 | Item | Size | Action |
 |------|------|--------|
 | pip cache | 4.95GB | PURGED |
@@ -144,7 +144,7 @@ Session started: 2026-03-12
 
 ### Phase 3 Results (2026-03-13)
 
-**Apollyon — ~/models/ cleanup (451GB → 122GB, reclaimed ~329GB):**
+**GPU-server — ~/models/ cleanup (451GB → 122GB, reclaimed ~329GB):**
 
 GGUF purge (130GB):
 | Item | Size | Action |
@@ -183,7 +183,7 @@ DeepSeek-OCR removal (12.6GB):
 
 ### Phase 4 Results (2026-03-13)
 
-**Eden — relator.IA/training/models/ purge (147GB):**
+**Win-server — relator.IA/training/models/ purge (147GB):**
 | Item | Size | Action |
 |------|------|--------|
 | checkpoints/qwen3-14b-curriculum-phase1-GGUF | 63.4GB | DELETED |
@@ -196,20 +196,20 @@ DeepSeek-OCR removal (12.6GB):
 | Empty dirs (simpo, dpo, logs) | 0 | DELETED |
 Decision: will retrain from scratch; old Qwen3 training artifacts not preserved.
 
-**Eden — Downloads purge & rename:**
+**Win-server — Downloads purge & rename:**
 - Purged 10.6GB of installers/executables (46 items)
 - Renamed ~50 document files to ASCII-safe convention: `YYYY-MM-DD_descricao-breve.ext`
 - iCloud Drive structure surveyed at D:\iCloudDrive\Documents\ (AGU/NPDI, Acadêmico, Personal)
 - Files not yet moved to iCloud destinations — rename only, relocation deferred
 
-**Eden — Stale repos:** KEPT per decision (SOAR may resume)
+**Win-server — Stale repos:** KEPT per decision (SOAR may resume)
 - super-sapiens-crawler (2.1GB), sglang (30MB), SOAR-Toolkit (70MB), soar-challenge (4.9GB)
 
 **Phase 4 Total Reclaimed: ~158GB**
 
 ### Phase 4 Results (2026-03-13)
 
-**Eden — relator.IA/training/models/ purge (~147GB):**
+**Win-server — relator.IA/training/models/ purge (~147GB):**
 | Item | Size | Action |
 |------|------|--------|
 | checkpoints/qwen3-14b-curriculum-phase1-GGUF | 63.4GB | DELETED |
@@ -223,10 +223,10 @@ Decision: will retrain from scratch; old Qwen3 training artifacts not preserved.
 
 Decision: will retrain from scratch — old Qwen3 training outputs not worth preserving.
 
-**Eden — Downloads installer purge (~10.6GB):**
+**Win-server — Downloads installer purge (~10.6GB):**
 46 installers/setup files deleted. ~60 work documents remain — pending rename + relocation.
 
-**Eden — stale repos: KEPT (SOAR will resume)**
+**Win-server — stale repos: KEPT (SOAR will resume)**
 - super-sapiens-crawler (2.1GB), sglang (30MB), SOAR-Toolkit (70MB), soar-challenge (4.9GB)
 
 **Phase 4 Total Reclaimed: ~158GB**

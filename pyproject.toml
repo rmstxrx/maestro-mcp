@@ -21,4 +21,4 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [project.urls]
-Repository = "https://github.com/rmstxrx/maestro-mcp"
+Repository = "https://github.com/youruser/maestro-mcp"

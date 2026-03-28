@@ -1,11 +1,11 @@
 # ADR-0007 Clean Deployment Debrief
 
 **Date:** 2026-03-28
-**Operator:** Claude Code on Cellar bare metal
+**Operator:** Claude Code on Hub bare metal
 
 ## Context
 
-ADR-0007 (cellar-centric task architecture) was merged to `main` across 6 commits. The Docker image needed a clean `--no-cache` rebuild to ensure no stale cached layers.
+ADR-0007 (hub-centric task architecture) was merged to `main` across 6 commits. The Docker image needed a clean `--no-cache` rebuild to ensure no stale cached layers.
 
 ## Verification Results
 
@@ -33,7 +33,7 @@ Fix: removed `**legacy_kwargs`, the docstring mentioning legacy forwarding, and 
 
 1. `docker compose build --no-cache` — clean rebuild of both maestro and cloudflared images.
 2. `docker compose up -d --force-recreate` — required because initial `up -d` reused running containers instead of recreating from new images.
-3. SSH host keys re-accepted for all 5 hosts (cellar, apollyon, eden, judas, eden-wsl).
+3. SSH host keys re-accepted for all 5 hosts (hub, gpu-server, win-server, macbook, win-server-wsl).
 4. All tunnel connections re-established (4 QUIC connections to Cloudflare GIG PoPs).
 
 ## Validation
@@ -46,6 +46,6 @@ Fix: removed `**legacy_kwargs`, the docstring mentioning legacy forwarding, and 
 
 ## Notes
 
-- The dev path (`/home/rmstxrx/Development/maestro-mcp`) and deploy path (`/volume2/docker/maestro/repo`) are the same repo via symlink (same inodes).
+- The dev path (`/home/user/Development/maestro-mcp`) and deploy path (`/volume2/docker/maestro/repo`) are the same repo via symlink (same inodes).
 - `docker compose` must be run with `--project-directory /volume2/docker/maestro/repo` when CWD resolves through the symlink, otherwise `../config/.env` resolves incorrectly.
 - Two uncommitted infrastructure changes exist in the working tree (healthcheck in docker-compose.yml, watchdog in cloudflared-entrypoint.sh) — left uncommitted per scope.

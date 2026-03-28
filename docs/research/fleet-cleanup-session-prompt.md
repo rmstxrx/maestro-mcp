@@ -1,11 +1,11 @@
 # Fleet Cleanup Session
 
 ## Goal
-Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Agents have been downloading models, creating venvs, cloning repos, and leaving documents/outputs in scattered locations. Reclaim disk and establish conventions so it doesn't drift again.
+Audit and clean bloat across all machines (GPU-server, Win-server, Win-server-WSL, Mac-laptop). Agents have been downloading models, creating venvs, cloning repos, and leaving documents/outputs in scattered locations. Reclaim disk and establish conventions so it doesn't drift again.
 
 ## Reconnaissance (already done — Mar 12, 2026)
 
-### Apollyon (DGX Spark, 987GB used / 3.6TB)
+### GPU-server (DGX Spark, 987GB used / 3.6TB)
 
 **Model bloat:**
 - **HF cache: 134GB** at ~/.cache/huggingface/hub/
@@ -53,9 +53,9 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 - /tmp/: ruff_test, test_intake, sapiens_agu_test, zip_test — agent test artifacts
 - Downloads: 463MB (VS Code .deb, Chrome .deb, Acer utils)
 
-### Eden (Win11, 1275GB used on C:\)
+### Win-server (Win11, 1275GB used on C:\)
 
-**HF cache: ~196GB** at C:\Users\romul\.cache\huggingface\hub\
+**HF cache: ~196GB** at C:\Users\youruser\.cache\huggingface\hub\
 - `unsloth/Nemotron-3-Nano-30B-A3B` — 59GB
 - `unsloth/qwen3-30b-a3b` — 57GB (Qwen3 — ARCHIVED)
 - `unsloth/Qwen3-32B-unsloth-bnb-4bit` — 37GB (Qwen3 — ARCHIVED)
@@ -65,7 +65,7 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 - `unsloth/Qwen3-8B-unsloth-bnb-4bit` — 7GB (Qwen3 — ARCHIVED)
 - Small models (embeddings, sentence-transformers) — KEEP
 
-**relator.IA repo: 282GB** on C:\Users\romul\Development\relator.IA
+**relator.IA repo: 282GB** on C:\Users\youruser\Development\relator.IA
 - training/models/ — 167GB of model weights inside the repo
 - resources/ — 87GB (intake PDFs, benchmark data)
 - output/ — 13.4GB (LanceDB, ingestion output)
@@ -73,10 +73,10 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 - .venv-gpu/ — 4.4GB
 
 **Mangled-path log files in user home** (agents used escaped backslashes):
-- `E?Developmentrelator.IAtraininglogsdpo_v6_eden.log` (0 bytes)
+- `E?Developmentrelator.IAtraininglogsdpo_v6_win-server.log` (0 bytes)
 - `E?Developmentrelator.IAtraininglogspip_liger.log` (0 bytes)
 - `E??Development?relator.IA?training?logs?server.log` (0 bytes)
-- `ingest_all_eden.log`, `ingest_all_eden_err.log`, `ingest_all_err.log`, `ingest_all_out.log` — all 0 bytes, in user home instead of project dir
+- `ingest_all_win-server.log`, `ingest_all_win-server_err.log`, `ingest_all_err.log`, `ingest_all_out.log` — all 0 bytes, in user home instead of project dir
 
 **Other stray files in user home:**
 - AMD Ryzen Master logs (~18MB total)
@@ -84,9 +84,9 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 - `start-sshd.ps1` — one-off SSH setup script
 - `syncthing_stderr.txt`, `syncthing_stdout.txt`
 
-**Stale repos in C:\Users\romul\Development:**
+**Stale repos in C:\Users\youruser\Development:**
 - `super-sapiens-crawler` — 2.1GB, last write Jan 29 (dead project?)
-- `llama.cpp` — 520MB, last write Mar 1 (duplicate — also on Apollyon)
+- `llama.cpp` — 520MB, last write Mar 1 (duplicate — also on GPU-server)
 - `sglang` — 30MB, last write Feb 14 (stale SOAR experiment)
 - `SOAR-Toolkit` — 70MB, last write Mar 2 (competition specific)
 - `soar-challenge` — 4.9GB, last write Mar 4
@@ -94,12 +94,12 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 **Docker:** 57GB images, 31GB reclaimable. Old vLLM image.
 **Downloads:** 10.8GB
 
-### Eden-WSL (101GB total in WSL home)
+### Win-server-WSL (101GB total in WSL home)
 - **relator.IA clone: 11GB** at ~/Development/relator.IA — agent scope creep, not canonical
 - **Cache: 50GB** at ~/.cache/ — HF + pip from agent-triggered installs
 - **Old Docker image**: vllm/vllm-openai 10 months old — 26.5GB. Recent one (30.2GB) is presumably active.
 
-### Judas (MBP M3 Max) — not yet surveyed. Include in session.
+### Mac-laptop (MBP M3 Max) — not yet surveyed. Include in session.
 
 ## Decision framework
 
@@ -114,37 +114,37 @@ Audit and clean bloat across all machines (Apollyon, Eden, Eden-WSL, Judas). Age
 ## Execution plan
 
 ### Phase 1: Zero-risk wins (zero-byte files, mangled paths, empty scaffolds)
-- Apollyon: delete stray logs in ~/
-- Eden: delete all zero-byte mangled-path logs in C:\Users\romul\
-- Eden: delete empty ingest_all_*.log files
-- Apollyon: delete ~/nvidia-workbench/, ~/tiktoken_encodings/
+- GPU-server: delete stray logs in ~/
+- Win-server: delete all zero-byte mangled-path logs in C:\Users\youruser\
+- Win-server: delete empty ingest_all_*.log files
+- GPU-server: delete ~/nvidia-workbench/, ~/tiktoken_encodings/
 
 ### Phase 2: Caches and reclaimable Docker
-- `huggingface-cli delete-cache` on Apollyon — evict Nemotron, gpt-oss, Nemotron-NVFP4 (117GB)
-- `huggingface-cli delete-cache` on Eden — evict all Qwen3-family models (~136GB)
-- `docker system prune` on Apollyon — reclaim ~73GB (confirm DeepSeek-OCR container stays)
-- `docker image prune` on Eden — remove old vLLM image
-- `pip cache purge` on Apollyon
-- Clean /tmp on Apollyon
+- `huggingface-cli delete-cache` on GPU-server — evict Nemotron, gpt-oss, Nemotron-NVFP4 (117GB)
+- `huggingface-cli delete-cache` on Win-server — evict all Qwen3-family models (~136GB)
+- `docker system prune` on GPU-server — reclaim ~73GB (confirm DeepSeek-OCR container stays)
+- `docker image prune` on Win-server — remove old vLLM image
+- `pip cache purge` on GPU-server
+- Clean /tmp on GPU-server
 
-### Phase 3: Agent-created environments and scattered models (Apollyon)
+### Phase 3: Agent-created environments and scattered models (GPU-server)
 - ~/models/ (451GB) — go model by model. KEEP only what's actively served or needed. Everything else goes.
 - ~/gptq_env/ (6.9GB), ~/gptqmodel_offload/ (4.7GB), ~/sglang-venv/ (9.3GB) — stale experiment venvs. DELETE.
 - ~/llama.cpp/ (596MB) — duplicate, not in Development/. DELETE.
 - ~/scripts/ — archive useful ones to maestro-mcp or relator.IA docs, then DELETE dir.
 
-### Phase 4: Eden stale repos and SOAR artifacts
+### Phase 4: Win-server stale repos and SOAR artifacts
 - Evaluate: super-sapiens-crawler, llama.cpp, sglang, SOAR-Toolkit, soar-challenge
-- Eden relator.IA/training/models/ (167GB) — same treatment as Apollyon ~/models/
-- Eden Downloads (10.8GB) — purge
+- Win-server relator.IA/training/models/ (167GB) — same treatment as GPU-server ~/models/
+- Win-server Downloads (10.8GB) — purge
 
 ### Phase 5: WSL quarantine
-- Check for uncommitted changes in Eden-WSL relator.IA clone
+- Check for uncommitted changes in Win-server-WSL relator.IA clone
 - Remove ~/Development/relator.IA from WSL
 - Clear ~/.cache in WSL
 - Remove old Docker image
 
-### Phase 6: Judas audit
+### Phase 6: Mac-laptop audit
 - Run same reconnaissance
 - Apply same framework
 
