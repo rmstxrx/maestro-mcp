@@ -41,8 +41,8 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 |---|---|---|
 | Hub | Hub (`is_local: true`), orchestration only | Docker, always-on |
 | GPU-server | Compute leaf, agent dispatch target | GPU workstation, GPU workloads |
-| Win-server | Compute leaf, agent dispatch target | RTX 5090, PowerShell |
-| Macbook | Compute leaf, agent dispatch target | MacBook Pro M3 Max |
+| Win-server | Compute leaf, agent dispatch target | GPU workstation, PowerShell |
+| Macbook | Compute leaf, agent dispatch target | Laptop |
 | Win-server-WSL | Compute leaf (proxy through Win-server) | WSL2 Ubuntu on Win-server |
 
 ## Active Branches

@@ -123,7 +123,7 @@ All agent dispatches prepend `AGENT_SCOPE_PREFIX`, directing agents to read `~/D
 
 ## Deployment (Hub)
 
-Maestro runs as a Docker container on the Hub (TrueNAS SCALE, 198.51.100.2). The Hub is the fleet hub (`is_local: true`). All other hosts are SSH targets.
+Maestro runs as a Docker container on the Hub (NAS appliance, 198.51.100.2). The Hub is the fleet hub (`is_local: true`). All other hosts are SSH targets.
 
 **Development** happens on GPU-server (`/home/user/Development/maestro-mcp`). The Hub repo (`/volume2/docker/maestro/repo`) is a **read-only deployment target** — it only pulls from GitHub and rebuilds. No agent may be dispatched with `working_dir` pointing to the Maestro repo on the Hub.
 

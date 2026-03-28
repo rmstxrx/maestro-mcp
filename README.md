@@ -68,7 +68,7 @@ Maestro runs on one **hub machine** — the one with SSH access to all others. S
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/youruser/maestro-mcp.git
+git clone https://github.com/rmstxrx/maestro-mcp.git
 cd maestro-mcp
 
 python -m venv .venv
