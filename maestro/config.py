@@ -32,6 +32,7 @@ class MaestroConfig:
     default_expected_runtime_run: int
     default_expected_runtime_dispatch: int
     output_retention_days: int
+    host_output_retention_days: int
     max_tasks_per_host: int
     service_overtime_advisory: int
 
@@ -79,7 +80,10 @@ class MaestroConfig:
             dispatch_ceiling=int(os.environ.get("MAESTRO_DISPATCH_CEILING", "21600")),
             default_expected_runtime_run=15,
             default_expected_runtime_dispatch=1800,
-            output_retention_days=90,
+            output_retention_days=180,
+            host_output_retention_days=int(
+                os.environ.get("MAESTRO_HOST_RETENTION_DAYS", "30")
+            ),
             max_tasks_per_host=int(os.environ.get("MAESTRO_MAX_TASKS_PER_HOST", "10")),
             service_overtime_advisory=86400,
         )

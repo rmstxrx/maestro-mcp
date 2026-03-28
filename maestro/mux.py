@@ -19,14 +19,40 @@ logger = logging.getLogger("maestro")
 TMUX_SERVER = "maestro"
 TMUX_SESSION = "tasks"
 OUTPUT_DIR = Path("/root/.maestro/task_output")
+HOST_OUTPUT_RETENTION_DAYS = 30
 
 
-def configure_mux(*, output_dir: Path | None = None) -> None:
+def configure_mux(
+    *,
+    output_dir: Path | None = None,
+    host_output_retention_days: int | None = None,
+) -> None:
     """Set the output directory for task captures. Called once at startup."""
-    global OUTPUT_DIR
+    global OUTPUT_DIR, HOST_OUTPUT_RETENTION_DAYS
     if output_dir is not None:
         OUTPUT_DIR = output_dir
+    if host_output_retention_days is not None:
+        HOST_OUTPUT_RETENTION_DAYS = host_output_retention_days
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _remote_preamble(task_id: str, shell: str) -> str:
+    """Build remote output-dir bootstrap and retention cleanup commands."""
+    _ = task_id
+    if shell == "powershell":
+        return (
+            "if (!(Test-Path ~/.maestro/task_output)) { "
+            "New-Item -ItemType Directory -Path ~/.maestro/task_output -Force | Out-Null }; "
+            "Get-ChildItem ~/.maestro/task_output -Filter '*.txt' | "
+            "Where-Object { $_.LastWriteTime -lt "
+            f"(Get-Date).AddDays(-{HOST_OUTPUT_RETENTION_DAYS}) }} | "
+            "Remove-Item -Force 2>$null;"
+        )
+    return (
+        "mkdir -p ~/.maestro/task_output && "
+        f"find ~/.maestro/task_output -name '*.txt' -mtime +{HOST_OUTPUT_RETENTION_DAYS} "
+        "-delete 2>/dev/null;"
+    )
 
 
 async def _tmux(*args: str, timeout: int = 10) -> str:
@@ -77,6 +103,8 @@ def _build_wrapper(
     """Build wrapper script for a single command inside a Hub-local tmux window."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
     rc_file = OUTPUT_DIR / f"{task_id}.rc"
+    remote_output_file = f"~/.maestro/task_output/{task_id}.txt"
+    remote_preamble = _remote_preamble(task_id, shell)
 
     # Build the remote command
     if shell == "powershell":
@@ -84,7 +112,14 @@ def _build_wrapper(
         if cwd:
             remote_parts.append(f"Set-Location -LiteralPath '{cwd}';")
         remote_parts.append(f"sudo {command}" if sudo else command)
-        remote_cmd = " ".join(remote_parts)
+        remote_core_cmd = " ".join(remote_parts)
+        if tee:
+            remote_cmd = (
+                f"{remote_preamble} {remote_core_cmd} 2>&1 | "
+                f"Tee-Object -FilePath {remote_output_file}"
+            )
+        else:
+            remote_cmd = f"{remote_preamble} {remote_core_cmd}"
     else:
         remote_parts = []
         if cwd:
@@ -92,7 +127,11 @@ def _build_wrapper(
         if sudo:
             remote_parts.append("sudo")
         remote_parts.append(command)
-        remote_cmd = " ".join(remote_parts)
+        remote_core_cmd = " ".join(remote_parts)
+        if tee:
+            remote_cmd = f"{remote_preamble} {remote_core_cmd} 2>&1 | tee {remote_output_file}"
+        else:
+            remote_cmd = f"{remote_preamble} {remote_core_cmd}"
 
     ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
 
@@ -120,9 +159,10 @@ def _build_script_wrapper(
     """Build wrapper for multi-line scripts piped via stdin."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
     rc_file = OUTPUT_DIR / f"{task_id}.rc"
+    remote_output_file = f"~/.maestro/task_output/{task_id}.txt"
 
     if shell == "powershell":
-        script_lines = ["$ErrorActionPreference = 'Stop'"]
+        script_lines = ["$ErrorActionPreference = 'Stop'", _remote_preamble(task_id, shell)]
         if cwd:
             script_lines.append(f"Set-Location -LiteralPath '{cwd}'")
         script_lines.append(script_body)
@@ -134,7 +174,14 @@ def _build_script_wrapper(
             script_lines.append(f"cd {shlex.quote(cwd)}")
         script_lines.append(script_body)
         escaped_script = "\n".join(script_lines)
-        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} 'bash -s'"
+        remote_script_file = f"/tmp/_maestro_{task_id}.sh"
+        remote_preamble = _remote_preamble(task_id, shell)
+        if tee:
+            remote_exec = f"{remote_preamble} bash {remote_script_file} 2>&1 | tee {remote_output_file}"
+        else:
+            remote_exec = f"{remote_preamble} bash {remote_script_file}"
+        remote_cmd = f"cat > {remote_script_file} && {remote_exec}; rm -f {remote_script_file}"
+        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
 
     heredoc = f"cat << '__MAESTRO_SCRIPT__'\n{escaped_script}\n__MAESTRO_SCRIPT__"
     full_cmd = f"{heredoc} | {ssh_cmd}"
@@ -143,6 +190,16 @@ def _build_script_wrapper(
     if tee:
         lines.append(f"{full_cmd} 2>&1 | tee {shlex.quote(str(output_file))}")
         lines.append(f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(rc_file))}")
+        if shell == "powershell":
+            lines.append(
+                f"ssh {shlex.quote(ssh_alias)} "
+                "'if (!(Test-Path ~/.maestro/task_output)) { "
+                "New-Item -ItemType Directory -Path ~/.maestro/task_output -Force | Out-Null }'"
+            )
+            lines.append(
+                f"scp {shlex.quote(str(output_file))} "
+                f"{shlex.quote(f'{ssh_alias}:{remote_output_file}')} 2>/dev/null || true"
+            )
     else:
         lines.append(full_cmd)
         lines.append(f"echo $? > {shlex.quote(str(rc_file))}")
@@ -288,4 +345,3 @@ def cleanup_task_files(task_id: str) -> None:
     """Remove wrapper and rc files for a completed task. Output file is retained."""
     for suffix in (".sh", ".rc"):
         (OUTPUT_DIR / f"{task_id}{suffix}").unlink(missing_ok=True)
-
