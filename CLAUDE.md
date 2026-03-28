@@ -125,6 +125,16 @@ All agent dispatches prepend `AGENT_SCOPE_PREFIX`, directing agents to read `~/D
 
 Maestro runs as a Docker container on the Cellar (TrueNAS SCALE, 10.42.69.2). The Cellar is the fleet hub (`is_local: true`). All other hosts are SSH targets.
 
+**Development** happens on Apollyon (`/home/rmstxrx/Development/maestro-mcp`). The Cellar repo (`/volume2/docker/maestro/repo`) is a **read-only deployment target** — it only pulls from GitHub and rebuilds. No agent may be dispatched with `working_dir` pointing to the Maestro repo on the Cellar.
+
+```
+Apollyon (dev)                    GitHub                    Cellar (deploy)
+  edit + commit
+  git push origin main    →    origin/main    ←    git pull
+                                                  docker compose build --no-cache
+                                                  docker compose up -d --force-recreate
+```
+
 ```
 /volume2/docker/maestro/
 ├── repo/          # git clone (Dockerfile, docker-compose.yml, source)
@@ -135,12 +145,9 @@ Maestro runs as a Docker container on the Cellar (TrueNAS SCALE, 10.42.69.2). Th
 Task output persists at `state/task_output/` via the Docker volume mount `../state:/root/.maestro`.
 
 ```bash
-# Update + rebuild
+# Deploy from Cellar (after pushing from Apollyon)
 cd /volume2/docker/maestro/repo
-git pull && docker compose up -d --build
-
-# Restart (ALWAYS both containers)
-docker compose restart
+git pull && docker compose build --no-cache && docker compose up -d --force-recreate
 ```
 
 Wait 15-30s after rebuild and poll `/.well-known/oauth-authorization-server` for HTTP 200 before issuing tool calls.
