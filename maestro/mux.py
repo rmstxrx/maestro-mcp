@@ -114,7 +114,7 @@ def _build_wrapper(
         remote_core_cmd = " ".join(remote_parts)
         if tee:
             remote_cmd = (
-                f"{remote_preamble} {remote_core_cmd} 2>&1 | "
+                f"{remote_preamble} & {{ {remote_core_cmd} }} 2>&1 | "
                 f"Tee-Object -FilePath {remote_output_file}"
             )
         else:
@@ -128,7 +128,7 @@ def _build_wrapper(
         remote_parts.append(command)
         remote_core_cmd = " ".join(remote_parts)
         if tee:
-            remote_cmd = f"{remote_preamble} {remote_core_cmd} 2>&1 | tee {remote_output_file}"
+            remote_cmd = f"{remote_preamble} {{ {remote_core_cmd}; }} 2>&1 | tee {remote_output_file}"
         else:
             remote_cmd = remote_core_cmd
 
