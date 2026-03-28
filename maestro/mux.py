@@ -36,9 +36,8 @@ def configure_mux(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _remote_preamble(task_id: str, shell: str) -> str:
+def _remote_preamble(shell: str) -> str:
     """Build remote output-dir bootstrap and retention cleanup commands."""
-    _ = task_id
     if shell == "powershell":
         return (
             "if (!(Test-Path ~/.maestro/task_output)) { "
@@ -46,7 +45,7 @@ def _remote_preamble(task_id: str, shell: str) -> str:
             "Get-ChildItem ~/.maestro/task_output -Filter '*.txt' | "
             "Where-Object { $_.LastWriteTime -lt "
             f"(Get-Date).AddDays(-{HOST_OUTPUT_RETENTION_DAYS}) }} | "
-            "Remove-Item -Force 2>$null;"
+            "Remove-Item -Force -ErrorAction SilentlyContinue;"
         )
     return (
         "mkdir -p ~/.maestro/task_output && "
@@ -104,7 +103,7 @@ def _build_wrapper(
     output_file = OUTPUT_DIR / f"{task_id}.txt"
     rc_file = OUTPUT_DIR / f"{task_id}.rc"
     remote_output_file = f"~/.maestro/task_output/{task_id}.txt"
-    remote_preamble = _remote_preamble(task_id, shell)
+    remote_preamble = _remote_preamble(shell)
 
     # Build the remote command
     if shell == "powershell":
@@ -119,7 +118,7 @@ def _build_wrapper(
                 f"Tee-Object -FilePath {remote_output_file}"
             )
         else:
-            remote_cmd = f"{remote_preamble} {remote_core_cmd}"
+            remote_cmd = remote_core_cmd
     else:
         remote_parts = []
         if cwd:
@@ -131,7 +130,7 @@ def _build_wrapper(
         if tee:
             remote_cmd = f"{remote_preamble} {remote_core_cmd} 2>&1 | tee {remote_output_file}"
         else:
-            remote_cmd = f"{remote_preamble} {remote_core_cmd}"
+            remote_cmd = remote_core_cmd
 
     ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
 
@@ -162,7 +161,7 @@ def _build_script_wrapper(
     remote_output_file = f"~/.maestro/task_output/{task_id}.txt"
 
     if shell == "powershell":
-        script_lines = ["$ErrorActionPreference = 'Stop'", _remote_preamble(task_id, shell)]
+        script_lines = ["$ErrorActionPreference = 'Stop'", _remote_preamble(shell)]
         if cwd:
             script_lines.append(f"Set-Location -LiteralPath '{cwd}'")
         script_lines.append(script_body)
@@ -175,7 +174,7 @@ def _build_script_wrapper(
         script_lines.append(script_body)
         escaped_script = "\n".join(script_lines)
         remote_script_file = f"/tmp/_maestro_{task_id}.sh"
-        remote_preamble = _remote_preamble(task_id, shell)
+        remote_preamble = _remote_preamble(shell)
         if tee:
             remote_exec = f"{remote_preamble} bash {remote_script_file} 2>&1 | tee {remote_output_file}"
         else:
