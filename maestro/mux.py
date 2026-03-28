@@ -21,19 +21,12 @@ TMUX_SESSION = "tasks"
 OUTPUT_DIR = Path("/root/.maestro/task_output")
 
 
-def configure_mux(*, output_dir: Path | None = None, **legacy_kwargs) -> None:
-    """Set the output directory for task captures. Called once at startup.
-
-    Forwards legacy kwargs (config, resolve_host, ssh_run, etc.) to
-    _mux_legacy.configure_mux so existing callers keep working.
-    """
+def configure_mux(*, output_dir: Path | None = None) -> None:
+    """Set the output directory for task captures. Called once at startup."""
     global OUTPUT_DIR
     if output_dir is not None:
         OUTPUT_DIR = output_dir
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Forward to legacy module so fleet.py/orchestra.py keep working
-    if legacy_kwargs:
-        configure_mux_legacy(**legacy_kwargs)
 
 
 async def _tmux(*args: str, timeout: int = 10) -> str:
