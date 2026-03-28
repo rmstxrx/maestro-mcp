@@ -31,7 +31,7 @@ Session started: 2026-03-12
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
 
-## Phase 6: Mac-laptop audit
+## Phase 6: Macbook audit
 
 | Host | Item | Size | Action | Timestamp |
 |------|------|------|--------|-----------|
@@ -91,7 +91,7 @@ Session started: 2026-03-12
 |------|------|--------|
 | ~/llama.cpp/ | 596MB | MOVED → ~/Development/llama.cpp/ |
 
-**Win-server — llama.cpp:** Already in C:\Users\youruser\Development\llama.cpp — no action needed.
+**Win-server — llama.cpp:** Already in C:\Users\user\Development\llama.cpp — no action needed.
 
 **Agent debrief:** soar-challenge/docs/journal/debriefs/2026-03-12-fix-script-paths.md
 

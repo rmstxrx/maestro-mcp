@@ -53,10 +53,10 @@ and "mcp-" aliases for the same hosts.
 
 Results:
 - GPU-server: 21 → 4 known_hosts entries, 2 config blocks eliminated
-- Mac-laptop: 42 → 2 known_hosts entries, 6 config blocks eliminated
+- Macbook: 42 → 2 known_hosts entries, 6 config blocks eliminated
 - Win-server: 21 → ~2 entries (pending verification), simplified config
 
-NVIDIA Sync Include preserved on both Mac-laptop and Win-server (tool-managed).
+NVIDIA Sync Include preserved on both Macbook and Win-server (tool-managed).
 Backups created on all machines before changes.
 
 ## 4. Host-aware agent routing (ADR-0005)

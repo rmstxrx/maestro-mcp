@@ -1,11 +1,11 @@
 # Fleet Cleanup Session
 
 ## Goal
-Audit and clean bloat across all machines (GPU-server, Win-server, Win-server-WSL, Mac-laptop). Agents have been downloading models, creating venvs, cloning repos, and leaving documents/outputs in scattered locations. Reclaim disk and establish conventions so it doesn't drift again.
+Audit and clean bloat across all machines (GPU-server, Win-server, Win-server-WSL, Macbook). Agents have been downloading models, creating venvs, cloning repos, and leaving documents/outputs in scattered locations. Reclaim disk and establish conventions so it doesn't drift again.
 
 ## Reconnaissance (already done — Mar 12, 2026)
 
-### GPU-server (DGX Spark, 987GB used / 3.6TB)
+### GPU-server (GPU workstation, 987GB used / 3.6TB)
 
 **Model bloat:**
 - **HF cache: 134GB** at ~/.cache/huggingface/hub/
@@ -99,7 +99,7 @@ Audit and clean bloat across all machines (GPU-server, Win-server, Win-server-WS
 - **Cache: 50GB** at ~/.cache/ — HF + pip from agent-triggered installs
 - **Old Docker image**: vllm/vllm-openai 10 months old — 26.5GB. Recent one (30.2GB) is presumably active.
 
-### Mac-laptop (MBP M3 Max) — not yet surveyed. Include in session.
+### Macbook — not yet surveyed. Include in session.
 
 ## Decision framework
 
@@ -144,7 +144,7 @@ Audit and clean bloat across all machines (GPU-server, Win-server, Win-server-WS
 - Clear ~/.cache in WSL
 - Remove old Docker image
 
-### Phase 6: Mac-laptop audit
+### Phase 6: Macbook audit
 - Run same reconnaissance
 - Apply same framework
 

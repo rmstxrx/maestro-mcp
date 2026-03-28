@@ -29,7 +29,7 @@ timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "=== ${HOST} @ ${timestamp} ===" >> "$LOG_FILE"
 
 case "$HOST" in
-    gpu-server|DGX-Spark)
+    gpu-server)
         du -sh ~/Development ~/models ~/.cache ~/.ollama ~/Downloads 2>/dev/null >> "$LOG_FILE" || true
         du -sh ~/Development/*/ 2>/dev/null | sort -rh | head -5 >> "$LOG_FILE" || true
         du -sh ~/models/*/ 2>/dev/null | sort -rh >> "$LOG_FILE" || true
@@ -57,7 +57,7 @@ case "$HOST" in
         [ "${dev_gb:-0}" -gt 500 ] && echo "ALERT: Development is ${dev_gb}GB (threshold: 500GB)" >> "$LOG_FILE"
         ;;
 
-    mac-laptop|Mac-laptop*|*.local)
+    macbook|Macbook*|*.local)
         du -sh ~/Development ~/.cache ~/.ollama 2>/dev/null >> "$LOG_FILE" || true
         du -sh ~/Development/*/ 2>/dev/null | sort -rh | head -5 >> "$LOG_FILE" || true
         df -h / | tail -1 >> "$LOG_FILE"

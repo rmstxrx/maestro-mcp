@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-03-05
-- **Context:** Maestro MCP orchestrates three CLI agents (Claude Code, Codex CLI, Gemini CLI) across a fleet of hosts (GPU-server, Win-server, Mac-laptop). Usage has been heavily skewed toward Claude Code, underutilizing paid Codex (ChatGPT Pro) and Gemini (AI Ultra) subscriptions. Model defaults in Maestro's tool definitions reference deprecated models (GPT-5.1-Codex-Max, GPT-5-Codex-Mini).
+- **Context:** Maestro MCP orchestrates three CLI agents (Claude Code, Codex CLI, Gemini CLI) across a fleet of hosts (GPU-server, Win-server, Macbook). Usage has been heavily skewed toward Claude Code, underutilizing paid Codex (ChatGPT Pro) and Gemini (AI Ultra) subscriptions. Model defaults in Maestro's tool definitions reference deprecated models (GPT-5.1-Codex-Max, GPT-5-Codex-Mini).
 
 ## Decision
 
@@ -36,9 +36,9 @@ The routing decision is **task-type first, then host-aware**. The orchestrator (
 
 | Host | Strengths | Preferred for |
 |---|---|---|
-| **GPU-server** (DGX Spark, Linux) | Main dev, 128GB unified, all agents available, stable SSH | Default for all agent types; canonical working copies live here. |
-| **Win-server** (Win11, 5090, 96GB) | Strong GPU, Windows-native | Codex tasks targeting Windows repos (`C:\Users\youruser\Development\*`); GPU-adjacent work. Note: `maestro_status` reports offline — use direct tool calls. |
-| **Mac-laptop** (MBP M3 Max, 36GB) | Portable, macOS-native | Lightweight dispatch, macOS-specific testing. Currently needs CLI updates and PATH fix (see §3). |
+| **GPU-server** (GPU workstation, Linux) | Main dev, 128GB unified, all agents available, stable SSH | Default for all agent types; canonical working copies live here. |
+| **Win-server** (Win11, high-end GPU, 96GB) | Strong GPU, Windows-native | Codex tasks targeting Windows repos (`C:\Users\user\Development\*`); GPU-adjacent work. Note: `maestro_status` reports offline — use direct tool calls. |
+| **Macbook** (laptop, 36GB) | Portable, macOS-native | Lightweight dispatch, macOS-specific testing. Currently needs CLI updates and PATH fix (see §3). |
 
 ### 3. Reasoning Effort Defaults
 
@@ -77,10 +77,10 @@ Claude Code exposes High/Medium/Low effort settings. Anthropic manages model sel
 
 | Item | Current | Target | Host |
 |---|---|---|---|
-| Codex CLI version | 0.63.0 | ≥0.107.0 | Mac-laptop |
-| Gemini CLI version | 0.17.1 | ≥0.31.0 | Mac-laptop |
+| Codex CLI version | 0.63.0 | ≥0.107.0 | Macbook |
+| Gemini CLI version | 0.17.1 | ≥0.31.0 | Macbook |
 | Gemini CLI version | 0.25.1 | ≥0.31.0 | Win-server |
-| Maestro SSH PATH | Minimal (`/usr/bin:/bin`) | Source `.zshrc` or set `SendEnv`/`AcceptEnv` | Mac-laptop |
+| Maestro SSH PATH | Minimal (`/usr/bin:/bin`) | Source `.zshrc` or set `SendEnv`/`AcceptEnv` | Macbook |
 | Maestro default Codex model | `gpt-5.1-codex-max` | `gpt-5.3-codex` | All (tool definition) |
 | Maestro default Codex fallback | `gpt-5-codex-mini` | Keep as cost fallback | — |
 | Maestro default Codex reasoning | (none) | `xhigh` | All (tool definition) |
@@ -101,6 +101,6 @@ The bias toward Claude Code exists because it's the path of least resistance fro
 ## Consequences
 
 - Maestro tool definitions must be updated to reflect new default models.
-- CLI versions must be updated on Mac-laptop and Win-server before these routing rules are fully effective.
+- CLI versions must be updated on Macbook and Win-server before these routing rules are fully effective.
 - The orchestrator should reference this document when deciding which agent to dispatch.
 - Model defaults should be reviewed monthly or whenever a new model generation ships.

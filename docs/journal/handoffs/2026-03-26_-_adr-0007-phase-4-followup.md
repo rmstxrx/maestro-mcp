@@ -17,7 +17,7 @@ ADR-0007 is functionally complete through Phase 3. Four commits on `main`, all p
 620af59 docs: ADR-0007 — taxonomy, tmux multiplexer layer, state conventions
 ```
 
-68/68 tests passing. tmux installed on all primary hosts (GPU-server 3.4, Win-server-WSL 3.4, Mac-laptop 3.6a, Hub via Docker).
+68/68 tests passing. tmux installed on all primary hosts (GPU-server 3.4, Win-server-WSL 3.4, Macbook 3.6a, Hub via Docker).
 
 ## What Works
 
@@ -92,7 +92,7 @@ docs/journal/debriefs/          — 3 Codex debriefs (one per phase)
 
 ## Key Context for Next Session
 
-- tmux is installed on Mac-laptop via homebrew (`/opt/homebrew/bin/tmux`). If Mac-laptop PATH issues recur in non-interactive SSH, the fix is `~/.zshenv` (not `.zshrc`).
+- tmux is installed on Macbook via homebrew (`/opt/homebrew/bin/tmux`). If Macbook PATH issues recur in non-interactive SSH, the fix is `~/.zshenv` (not `.zshrc`).
 - The Hub's `task_registry.json` still exists on disk (46KB) but is no longer written to. Safe to delete after confirming the in-memory registry handles the HTTP result endpoint correctly.
 - Win-server-WSL is the primary host for the Win-server machine. Direct PowerShell SSH to Win-server is the escape hatch. This is documented in ADR-0007.
 - The `_orchestra_run_cli_raw_ps` function in orchestra.py is the PowerShell fallback — it retains the original raw SSH execution with retries. Don't delete it.
