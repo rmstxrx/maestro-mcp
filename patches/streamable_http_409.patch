@@ -1,0 +1,17 @@
+--- /usr/local/lib/python3.12/site-packages/mcp/server/streamable_http.py
++++ /usr/local/lib/python3.12/site-packages/mcp/server/streamable_http.py
+@@ -696,12 +696,8 @@
+ 
+         # Check if we already have an active GET stream
+         if GET_STREAM_KEY in self._request_streams:
+-            response = self._create_error_response(
+-                "Conflict: Only one SSE stream is allowed per session",
+-                HTTPStatus.CONFLICT,
+-            )
+-            await response(request.scope, request.receive, send)
+-            return
++            logger.info("Replacing stale SSE stream for session %s", self.mcp_session_id)
++            await self._clean_up_memory_streams(GET_STREAM_KEY)
+ 
+         # Create SSE stream
+         sse_stream_writer, sse_stream_reader = anyio.create_memory_object_stream[dict[str, str]](0)
