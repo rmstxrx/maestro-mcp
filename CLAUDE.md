@@ -97,9 +97,15 @@ Ledger fields: `task_id`, `agent`, `host`, `prompt`, `status`, `task_type`, `exp
 
 ### 5. Agent Supervision
 
+Maestro still supports interactive agent work, but `observe` and `steer` are no longer recommended as monitoring loops for autonomous workflows. ADR-0008 documents the transport reliability issue: repeated pane polling/keystrokes can fail in long loops over Cloudflare tunnel connections. Use them for ad-hoc inspection and one-off steering only.
+
+For production monitoring, prefer:
+- **Service monitoring:** start long-running work with `service(..., capture=True)` and read stable log files with periodic `run` calls.
+- **Agent progress:** start agents with `dispatch`, then check completion via `tasks(status=\"running\")`, and fetch final output through `read_output(file_path)`.
+
 Two modes for `dispatch`:
 - **Oneshot** (default): Agent receives prompt via CLI flag, runs autonomously.
-- **Interactive**: Agent starts bare. Drive via alternating `observe`/`steer` calls.
+- **Interactive**: Agent starts bare and is driven via alternating `observe`/`steer` calls. This remains available for experimentation, but avoid closed-loop use in production.
 
 ### 6. Dispatch Guard
 
