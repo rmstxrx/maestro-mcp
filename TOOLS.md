@@ -223,22 +223,6 @@ Client classification:
 - **local** — requests from `127.0.0.1`, `::1`, or `localhost`
 - **lan** — requests from `198.51.100.*` subnet
 
-## Observe/Steer Monitoring Guidance (ADR-0008)
-
-`observe` and `steer` are retained for occasional, ad-hoc inspection and
-interactive experimentation, but they are not reliable as tight monitoring loops
-for production workflows under `remote` transport conditions. Keep loops short or
-replace them with log-driven checks.
-
-- Service workflow pattern:
-  `service(..., capture=True)` -> `run(host, "tail -50 /path/to/output")`
-- Agent workflow pattern:
-  `dispatch(...)` -> `tasks(status="running")` -> `read_output(file_path)`
-
-Interactive mode (`mode="interactive"`) remains available but is considered an
-experimental conductor path until transport reliability improves.
-
-
 ## HTTP Endpoints (non-MCP)
 
 ### `GET /tasks/{task_id}/result`

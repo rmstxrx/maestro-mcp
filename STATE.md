@@ -1,6 +1,6 @@
 # STATE.md — maestro-mcp
 
-**Last Updated:** 2026-03-26
+**Last Updated:** 2026-03-28
 
 ---
 
@@ -21,9 +21,8 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 
 ### Tool Inventory (23 tools)
 
-**Fleet (16):** `exec`, `script`, `read`, `write`, `transfer`, `status`, `reconnect_host`, `list_ssh_hosts`, `add_host`, `agent_status`, `gemini_sessions`, `mux_start`, `mux_read`, `mux_input`, `mux_stop`, `mux_list`.
-
-**Orchestra (7):** `codex`, `gemini`, `claude`, `poll`, `read_output`, `tasks`, `prepare_relay`.
+**Tool count (13 → 11):** `observe`/`steer` removed under ADR-0008.
+**Active tool surface (11):** `run`, `read`, `write`, `transfer`, `status`, `stop`, `service`, `dispatch`, `tasks`, `read_output`, `prepare_relay`.
 
 ### Deployment (Hub)
 

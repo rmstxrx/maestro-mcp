@@ -883,23 +883,9 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         context_files: list[str] | None = None,
         resume: str = "",
         allowed_tools: str = "",
-        mode: str = "oneshot",
     ) -> str:
         """Build the CLI command string for a given agent."""
-        if mode == "interactive":
-            # Interactive: start agent bare, no prompt flag
-            if agent == "codex":
-                return f"codex -C {shlex.quote(working_dir)}"
-            elif agent == "gemini":
-                model_flag = f"--model {shlex.quote(model)} " if model else ""
-                approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
-                return f"gemini {model_flag}{approval_flag}"
-            elif agent == "claude":
-                return "claude"
-            else:
-                raise ValueError(f"Unknown agent: {agent}")
-
-        # One-shot: full CLI with prompt
+        # One-shot: full CLI with scoped prompt
         scoped_prompt = AGENT_SCOPE_PREFIX + prompt
         escaped_prompt = shlex.quote(scoped_prompt)
 
@@ -946,7 +932,6 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         agent: str,
         prompt: str,
         working_dir: str,
-        mode: str = "oneshot",
         expected_runtime: int | None = None,
         model: str = "",
         reasoning_effort: str = "xhigh",
@@ -957,12 +942,9 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
     ) -> str:
         """Dispatch a task to an AI agent (codex, gemini, or claude).
 
-        mode: "oneshot" (default) fires with prompt, runs to completion.
-              "interactive" starts the agent bare — drive it via observe/steer.
-
         All dispatches run in the background (block_timeout=0). Returns
-        {auto_promoted: true, task_id}. Use observe(task_id) for live output,
-        steer(task_id) to redirect, tasks() for status, read_output for results.
+        {auto_promoted: true, task_id}. Use tasks() for status,
+        read_output(file_path) for completion output.
 
         Timeout: 6h hard ceiling (system policy). 30min default overtime flag.
         expected_runtime: your estimate (seconds). Recorded verbatim in ledger.
@@ -972,8 +954,6 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         valid_agents = ("codex", "gemini", "claude")
         if agent not in valid_agents:
             return json.dumps({"error": "validation_error", "detail": f"agent must be one of {valid_agents}, got '{agent}'"})
-        if mode not in ("oneshot", "interactive"):
-            return json.dumps({"error": "validation_error", "detail": f"mode must be 'oneshot' or 'interactive', got '{mode}'"})
         try:
             cfg = _resolve_host_config(host)
         except ValueError as e:
@@ -996,7 +976,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             agent, prompt, working_dir,
             model=model, reasoning_effort=reasoning_effort,
             approval_mode=approval_mode, context_files=context_files,
-            resume=resume, allowed_tools=allowed_tools, mode=mode,
+            resume=resume, allowed_tools=allowed_tools,
         )
 
         async def _execute() -> str:
@@ -1005,7 +985,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 host_cfg.alias,
                 cli_cmd,
                 tee=True,
-                interactive=(mode == "interactive"),
+                interactive=False,
                 cwd=working_dir,
                 shell=host_cfg.shell.value,
             )
@@ -1026,7 +1006,6 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             return json.dumps({
                 "agent": agent,
                 "host": host,
-                "mode": mode,
                 "success": rc == 0,
                 "return_code": rc,
                 "output_file": str(out_path),

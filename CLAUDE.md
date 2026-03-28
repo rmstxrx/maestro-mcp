@@ -1,15 +1,15 @@
 # Maestro MCP — Developer Guide
 
-Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It turns a collection of SSH-accessible machines into a unified workspace with Hub-local tmux for observation, steering, and completion detection (ADR-0007).
+Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It turns a collection of SSH-accessible machines into a unified workspace with Hub-local tmux for execution and completion detection (ADR-0007).
 
 ## Architecture
 
-All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service` creates a tmux window on the Hub that runs `ssh host 'command'` inside it. Maestro observes, steers, and detects completion locally — no network crossing needed.
+All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service` creates a tmux window on the Hub that runs `ssh host 'command'` inside it. Maestro captures output and completion status locally — no network crossing needed.
 
 - **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server (stdio or streamable-http).
 - **Core Package (`maestro/`):**
-    - **`mux.py`:** Hub-local tmux primitives — `create_task_window`, `wait_for_completion`, `capture_pane`, `send_keys`, `kill_window`, `list_windows`. Output at `/root/.maestro/task_output/`.
-    - **`tools/fleet.py`:** Fleet tools: `run`, `read`, `write`, `transfer`, `status`, `observe`, `steer`, `stop`, `service`.
+    - **`mux.py`:** Hub-local tmux primitives — `create_task_window`, `wait_for_completion`, `kill_window`, `list_windows`. Output at `/root/.maestro/task_output/`.
+    - **`tools/fleet.py`:** Fleet tools: `run`, `read`, `write`, `transfer`, `status`, `stop`, `service`.
     - **`tools/orchestra.py`:** Orchestra tools: `dispatch`, `tasks`, `read_output`, `prepare_relay`. Plus task ledger, auto-promote, scope prefix, agent output management.
     - **`hosts.py`:** Fleet topology management and `hosts.yaml` parsing. Per-host `allowed_dirs` enforcement.
     - **`transport.py`:** Persistent SSH ControlMaster lifecycle.
@@ -19,7 +19,7 @@ All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service
     - **`config.py`:** Environment-based configuration (`MaestroConfig`).
     - **`oauth_state.py`:** Atomic JSON persistence for OAuth state.
 
-## Tool Surface (13 tools)
+## Tool Surface (11 tools)
 
 ### Fleet I/O (4)
 
@@ -34,16 +34,14 @@ All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service
 
 | Tool | Purpose |
 |---|---|
-| `dispatch` | Start codex/gemini/claude (oneshot or interactive). 6h ceiling. |
+| `dispatch` | Start codex/gemini/claude (oneshot). 6h ceiling. |
 | `service` | Start a long-running process (vLLM, Jupyter, etc.). No ceiling. |
 
-### Task Lifecycle (5)
+### Task Lifecycle (3)
 
 | Tool | Purpose |
 |---|---|
 | `tasks` | Query the ledger. Surfaces overtime flags. Filter by status/agent/host/type. |
-| `observe` | Capture live output of a running task (local pane read, zero SSH cost). |
-| `steer` | Send input to a running task (logged to output file). |
 | `stop` | Kill a task (kills tmux window → SSH → remote process). |
 | `read_output` | Read completed task output from Hub disk. |
 
@@ -62,7 +60,7 @@ Every task is a tmux window on the Hub. The command inside each window is an SSH
 
 ```
 Hub tmux window → SSH session → remote process
-observe/steer/stop → local tmux operations → relayed through SSH
+stop → local tmux operations → relayed through SSH
 ```
 
 Only Maestro creates tmux sessions. Agents run foreground inside Maestro-owned windows.
@@ -72,7 +70,7 @@ Only Maestro creates tmux sessions. Agents run foreground inside Maestro-owned w
 Execution tools use `_auto_promote()` for long-running tasks:
 - **Inline:** Try to finish within `block_timeout` (client-dependent: 5s remote, 60s local).
 - **Background:** If timeout exceeds, task continues in tmux. Returns `{task_id}`.
-- **Monitoring:** Use `observe(task_id)` for live output, `tasks()` for status with overtime flags.
+- **Monitoring:** Use `tasks()` for status with overtime flags and read log/output files for progress.
 
 Client profiles (from `client.py`):
 - **remote** (Claude.ai via Cloudflare): `block_timeout_agent=0` (always dispatch), `block_timeout_exec=5`
@@ -97,15 +95,13 @@ Ledger fields: `task_id`, `agent`, `host`, `prompt`, `status`, `task_type`, `exp
 
 ### 5. Agent Supervision
 
-Maestro still supports interactive agent work, but `observe` and `steer` are no longer recommended as monitoring loops for autonomous workflows. ADR-0008 documents the transport reliability issue: repeated pane polling/keystrokes can fail in long loops over Cloudflare tunnel connections. Use them for ad-hoc inspection and one-off steering only.
+ADR-0008 removed `observe` and `steer` from the MCP surface due transport reliability concerns.
 
 For production monitoring, prefer:
 - **Service monitoring:** start long-running work with `service(..., capture=True)` and read stable log files with periodic `run` calls.
 - **Agent progress:** start agents with `dispatch`, then check completion via `tasks(status=\"running\")`, and fetch final output through `read_output(file_path)`.
 
-Two modes for `dispatch`:
-- **Oneshot** (default): Agent receives prompt via CLI flag, runs autonomously.
-- **Interactive**: Agent starts bare and is driven via alternating `observe`/`steer` calls. This remains available for experimentation, but avoid closed-loop use in production.
+`dispatch` is now one-shot only.
 
 ### 6. Dispatch Guard
 

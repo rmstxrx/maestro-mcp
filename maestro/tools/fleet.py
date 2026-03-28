@@ -32,13 +32,11 @@ from maestro.local import (
     _local_write_file,
 )
 from maestro.mux import (
-    capture_pane,
     cleanup_task_files,
     create_task_window,
     get_output_path,
     kill_window,
     list_windows,
-    send_keys,
     wait_for_completion,
     TMUX_SESSION,
 )
@@ -168,7 +166,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         verbatim in the ledger. Task flagged as overtime at exactly this value.
 
         Returns inline result or {auto_promoted: true, task_id} for long tasks.
-        Use observe(task_id) for live output, tasks() for status."""
+        Use tasks() for status and read_output(file) for full output."""
         if block := _check_local_self_reference(host):
             return block
         if block := _check_agent_dispatch_bypass(command):
@@ -389,55 +387,6 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     # --- ADR-0007: Task lifecycle tools ---
 
     @mcp.tool()
-    async def observe(task_id: str, lines: int = 50) -> str:
-        """Capture live output from a running task's tmux pane (ADR-0007).
-
-        Local pane read — zero SSH cost, instant response.
-        Works on any task: run, dispatch, service, interactive.
-        Use to monitor agent progress, check command output, or
-        verify a service is running.
-
-        Returns the last N lines of visible pane content."""
-        try:
-            content = await capture_pane(task_id, lines)
-            return json.dumps({
-                "task_id": task_id,
-                "lines": lines,
-                "content": content,
-            })
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
-    async def steer(task_id: str, keys: str) -> str:
-        """Send input to a running task's tmux pane (ADR-0007).
-
-        Keystrokes are sent locally and relayed through SSH to the remote process.
-        Everything sent is logged to the task's output file (audit trail).
-
-        Use to: course-correct an agent, answer a prompt, send Ctrl-C (use 'C-c'),
-        type Enter (use 'Enter'), or drive an interactive agent session.
-
-        Special keys: Enter, C-c (Ctrl+C), C-d (Ctrl+D), Escape, Tab."""
-        try:
-            await send_keys(task_id, keys)
-
-            # Log the steering input to the output file for audit trail
-            from maestro.mux import get_output_path
-            output_file = get_output_path(task_id)
-            if output_file.exists():
-                with open(output_file, "a") as f:
-                    f.write(f"\n[STEER] {keys}\n")
-
-            return json.dumps({
-                "task_id": task_id,
-                "sent": keys,
-                "logged": True,
-            })
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
     async def stop(task_id: str) -> str:
         """Kill a running task (ADR-0007).
 
@@ -488,11 +437,11 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         For services like vLLM, Jupyter, training runs, or any process
         that runs indefinitely. No hard ceiling — runs until stopped.
 
-        The service is observable via observe(task_id) for live pane output
-        and steerable via steer(task_id). Stop with stop(task_id).
+        The service can be monitored by reading its log file with periodic
+        run(host, "tail -50 <log_path>") calls. Stop with stop(task_id).
 
         capture: if True, tee output to disk (caution: service logs grow).
-        Default is False — rely on observe for live reads.
+        Recommended: keep capture=True and monitor via `run`.
 
         Overtime advisory at 24h (configurable). This is informational, not
         a kill signal.
@@ -537,5 +486,5 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             "host": host,
             "label": label or command[:80],
             "capture": capture,
-            "hint": "Use observe(task_id) for live output, stop(task_id) to kill.",
+            "hint": "Read output logs with run(...) for progress, stop(task_id) to kill.",
         })
