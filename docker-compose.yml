@@ -15,35 +15,3 @@ services:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8222/.well-known/oauth-authorization-server')"]
       interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 45s
-
-  cloudflared:
-    build:
-      context: .
-      dockerfile: cloudflared.Dockerfile
-    container_name: maestro-cloudflared
-    restart: unless-stopped
-    volumes:
-      - ../config/cloudflared:/mnt/cloudflared:ro
-    network_mode: "service:maestro"
-    depends_on:
-      maestro:
-        condition: service_healthy
-        restart: true
-
-# ┌─────────────────────────────────────────────────────────┐
-# │ NETWORK NAMESPACE COUPLING                              │
-# │                                                         │
-# │ cloudflared shares maestro's network namespace via      │
-# │ network_mode: "service:maestro".                        │
-# │                                                         │
-# │ If maestro restarts, cloudflared's namespace goes stale │
-# │ and all outbound connections fail. Two safeguards:      │
-# │                                                         │
-# │ 1. depends_on.restart: true — Compose-initiated         │
-# │    restarts automatically cascade to cloudflared.       │
-# │ 2. Watchdog in cloudflared-entrypoint.sh — detects      │
-# │    stale namespace after daemon auto-restarts and       │
-# │    exits, triggering Docker's restart policy.           │
-# └─────────────────────────────────────────────────────────┘
