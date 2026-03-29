@@ -132,10 +132,10 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 interactive=False,
                 cwd=cwd,
                 sudo=sudo,
-                shell=cfg.shell.value,
                 staged=True,
             )
-            return json.dumps({"task_id": task_id, "status": "running", "host": host})
+            rc = await wait_for_completion(task_id, timeout=config.run_ceiling)
+            return json.dumps({"task_id": task_id, "host": host, "return_code": rc})
 
         return await _auto_promote(
             _execute,
