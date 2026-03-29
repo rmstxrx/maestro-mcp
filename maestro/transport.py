@@ -234,10 +234,10 @@ async def _scp_run(
 ) -> str:
     config = _resolve_host(host_name)
     if upload:
-        scp_args = ["scp", source, f"{config.alias}:{destination}"]
+        scp_args = ["scp", "-O", source, f"{config.alias}:{destination}"]
         action_desc = f"upload {source} -> {host_name}:{destination}"
     else:
-        scp_args = ["scp", f"{config.alias}:{source}", destination]
+        scp_args = ["scp", "-O", f"{config.alias}:{source}", destination]
         action_desc = f"download {host_name}:{source} -> {destination}"
     last_error = ""
     config_obj = _require_config()
