@@ -535,7 +535,11 @@ class TestDispatchGuard:
             return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
 
         monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        async def _fake_wait(task_id, timeout=300):
+            return 0
+
         monkeypatch.setattr("maestro.tools.fleet.create_task_window", _fake_window)
+        monkeypatch.setattr("maestro.tools.fleet.wait_for_completion", _fake_wait)
         monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
