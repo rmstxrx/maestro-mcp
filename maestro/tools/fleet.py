@@ -129,10 +129,8 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 task_id,
                 cfg.alias,
                 tee=False,
-                interactive=False,
                 cwd=cwd,
                 sudo=sudo,
-                staged=True,
             )
             rc = await wait_for_completion(task_id, timeout=config.run_ceiling)
             return json.dumps({"task_id": task_id, "host": host, "return_code": rc})
@@ -342,9 +340,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             task_id,
             cfg.alias,
             tee=capture,
-            interactive=False,
             cwd=cwd,
-            staged=True,
             stream=True,
         )
 

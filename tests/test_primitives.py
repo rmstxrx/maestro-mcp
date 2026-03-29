@@ -432,34 +432,37 @@ class TestPollTool:
 
 class TestOrchestraRunCli:
     @pytest.mark.asyncio
-    async def test_uses_mux_spawn_for_named_bash_windows(self, monkeypatch):
+    async def test_uses_transport_for_bash_cli(self, monkeypatch):
         monkeypatch.setattr(
             "maestro.tools.orchestra._RESOLVE_HOST",
-            lambda host: SimpleNamespace(shell=HostShell.BASH),
+            lambda host: SimpleNamespace(shell=HostShell.BASH, alias=host),
         )
 
-        async def _fake_spawn(host, cli_command, name, timeout, cwd=None, sudo=False, cleanup=False):
-            assert host == "test-host"
+        def _fake_wrap_command(cfg, cli_command, cwd, sudo):
             assert cli_command == "codex --version 2>&1"
-            assert name == "codex-feedface"
-            assert timeout == 10
             assert cwd == "/tmp/work"
+            assert cfg.alias == "test-host"
             assert not sudo
-            assert not cleanup
-            return "codex ok\n[exit code: 7]"
+            return "wrapped_codex_command"
 
-        monkeypatch.setattr("maestro.mux.mux_spawn", _fake_spawn)
+        async def _fake_async_run(command, timeout):
+            assert command == ["ssh", "test-host", "wrapped_codex_command"]
+            assert timeout == 10
+            return 7, "codex ok", ""
+
+        monkeypatch.setattr("maestro.tools.orchestra._WRAP_COMMAND", _fake_wrap_command)
+        monkeypatch.setattr("maestro.tools.orchestra._ASYNC_RUN", _fake_async_run)
+        monkeypatch.setattr("maestro.tools.orchestra._FORMAT_RESULT", lambda stdout, stderr, rc: stdout.strip())
 
         rc, output = await _orchestra_run_cli(
             "test-host",
             "codex --version 2>&1",
             timeout=10,
             cwd="/tmp/work",
-            window_name="codex-feedface",
         )
 
         assert rc == 7
-        assert output == "codex ok\n[exit code: 7]"
+        assert output == "codex ok"
 
     @pytest.mark.asyncio
     async def test_powershell_uses_raw_fallback(self, monkeypatch):
@@ -482,7 +485,6 @@ class TestOrchestraRunCli:
             "claude --version 2>&1",
             timeout=10,
             cwd="C:/work",
-            window_name="claude-feedface",
         )
 
         assert rc == 0
@@ -524,7 +526,7 @@ class TestDispatchGuard:
             shell = HostShell.BASH
 
         async def _fake_window(task_id, *_, **kwargs):
-            captured["staged"] = kwargs["staged"]
+            captured["kwargs"] = kwargs
             return None
 
         async def _fake_auto_promote(exec_fn, **kwargs):
@@ -548,7 +550,7 @@ class TestDispatchGuard:
         )
 
         result = json.loads(call_result["result"])
-        assert captured["staged"] is True
+        assert "staged" not in captured["kwargs"]
         assert captured["agent"] == "exec"
         assert captured["prompt"] == "task-id"
         assert captured["block_timeout"] == 0

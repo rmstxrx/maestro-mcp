@@ -672,14 +672,10 @@ async def _orchestra_run_cli(
     cli_command: str,
     timeout: int,
     cwd: str | None = None,
-    window_name: str | None = None,
-    cleanup: bool = False,
 ) -> tuple[int, str]:
     """Run a CLI command on a host, returning (rc, formatted_output).
 
-    Uses the SSH transport layer directly (ADR-0007).
-    The window_name parameter is accepted for signature compatibility
-    but ignored — dispatch has its own tmux code path."""
+    Uses the SSH transport layer directly (ADR-0007)."""
     from maestro.hosts import HostShell
 
     assert _FORMAT_RESULT and _ASYNC_RUN and _RESOLVE_HOST
@@ -688,27 +684,6 @@ async def _orchestra_run_cli(
     if cfg.shell == HostShell.POWERSHELL:
         rc, stdout, stderr = await _orchestra_run_cli_raw_ps(host, cli_command, timeout, cwd)
         return rc, _FORMAT_RESULT(stdout, stderr, rc)
-
-    if window_name:
-        from maestro.mux import mux_spawn
-
-        ssh_target = getattr(cfg, "alias", host)
-        output = await mux_spawn(
-            ssh_target,
-            cli_command,
-            window_name,
-            timeout=timeout,
-            cwd=cwd,
-            sudo=False,
-            cleanup=cleanup,
-        )
-        import re
-
-        rc = 0
-        match = re.search(r"\[exit code:\s*(-?\d+)\]\s*$", output)
-        if match:
-            rc = int(match.group(1))
-        return rc, output
 
     full_cmd = _WRAP_COMMAND(cfg, cli_command, cwd, False)
     rc, stdout, stderr = await _ASYNC_RUN(["ssh", cfg.alias, full_cmd], timeout=timeout)
@@ -1006,9 +981,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 task_id,
                 host_cfg.alias,
                 tee=True,
-                interactive=False,
                 cwd=working_dir,
-                staged=True,
                 stream=True,
             )
             rc = await wait_for_completion(task_id, timeout=config.dispatch_ceiling)
