@@ -673,6 +673,7 @@ async def _orchestra_run_cli(
     timeout: int,
     cwd: str | None = None,
     window_name: str | None = None,
+    cleanup: bool = False,
 ) -> tuple[int, str]:
     """Run a CLI command on a host, returning (rc, formatted_output).
 
@@ -688,10 +689,29 @@ async def _orchestra_run_cli(
         rc, stdout, stderr = await _orchestra_run_cli_raw_ps(host, cli_command, timeout, cwd)
         return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
+    if window_name:
+        from maestro.mux import mux_spawn
+
+        ssh_target = getattr(cfg, "alias", host)
+        output = await mux_spawn(
+            ssh_target,
+            cli_command,
+            window_name,
+            timeout=timeout,
+            cwd=cwd,
+            sudo=False,
+            cleanup=cleanup,
+        )
+        import re
+
+        rc = 0
+        match = re.search(r"\[exit code:\s*(-?\d+)\]\s*$", output)
+        if match:
+            rc = int(match.group(1))
+        return rc, output
+
     full_cmd = _WRAP_COMMAND(cfg, cli_command, cwd, False)
-    rc, stdout, stderr = await _ASYNC_RUN(
-        ["ssh", cfg.alias, full_cmd], timeout=timeout,
-    )
+    rc, stdout, stderr = await _ASYNC_RUN(["ssh", cfg.alias, full_cmd], timeout=timeout)
     return rc, _FORMAT_RESULT(stdout, stderr, rc)
 
 
@@ -1027,30 +1047,6 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
-    async def read_output(file_path: str, start_line: int = 0, max_lines: int = 200) -> str:
-        """Read full or partial output from a previous agent run. Restricted to files in the orchestra output directory.
-
-        Use start_line and max_lines for windowed reads to control context cost. Returns total_lines and has_more for pagination."""
-        fp = Path(file_path)
-        try:
-            fp.resolve().relative_to(config.orchestra_output_dir.resolve())
-        except ValueError:
-            return json.dumps({"error": f"Access denied: only files in {config.orchestra_output_dir}"})
-        if not fp.exists():
-            return json.dumps({"error": f"File not found: {file_path}"})
-        lines = fp.read_text(encoding="utf-8").splitlines()
-        total = len(lines)
-        selected = lines[start_line : start_line + max_lines]
-        return json.dumps({
-            "file": str(fp),
-            "total_lines": total,
-            "start_line": start_line,
-            "lines_returned": len(selected),
-            "has_more": start_line + max_lines < total,
-            "content": "\n".join(selected),
-        }, indent=2, ensure_ascii=False)
-
-    @mcp.tool()
     async def prepare_relay() -> str:
         """Get an ephemeral bearer token for the HTTP transfer relay and task result endpoints. Valid for 1 hour. Use with: curl -H "Authorization: Bearer <token>" on /transfer/push, /transfer/pull, /tasks/{id}/result."""
         import secrets as _s
@@ -1092,13 +1088,14 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 "agent": entry.agent,
                 "host": entry.host,
                 "status": entry.status,
-                "task_type": entry.task_type or None,
                 "dispatched_at": _format_relative_time(entry.dispatched_at, now),
                 "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
                 "return_code": entry.return_code,
                 "output_file": entry.output_file,
                 "result_url": entry.result_url,
             }
+            if entry.task_type:
+                row["task_type"] = entry.task_type
             if entry.status == "running":
                 elapsed = (now - entry.dispatched_at).total_seconds()
                 row["elapsed_seconds"] = round(elapsed, 1)
@@ -1107,3 +1104,36 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                     row["overtime"] = elapsed > entry.expected_runtime
             rows.append(row)
         return json.dumps({"tasks": rows}, ensure_ascii=False)
+
+    @mcp.tool()
+    async def poll(task_id: str) -> str:
+        """Poll a specific task for latest status."""
+        from maestro.tools.orchestra import get_task_ledger
+
+        ledger = get_task_ledger()
+        if ledger is None:
+            return json.dumps({"error": "Task ledger is not configured"})
+
+        entry = ledger.get(task_id)
+        if entry is None:
+            return json.dumps({"error": "Task not found", "task_id": task_id})
+
+        result = {
+            "task_id": entry.task_id,
+            "agent": entry.agent,
+            "host": entry.host,
+            "status": entry.status,
+            "prompt": entry.prompt,
+            "dispatched_at": entry.dispatched_at.isoformat(),
+            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
+            "return_code": entry.return_code,
+            "output_file": entry.output_file,
+            "result_url": entry.result_url,
+        }
+
+        if entry.status == "running":
+            result["elapsed_seconds"] = round(
+                (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds(),
+                1,
+            )
+        return json.dumps(result)

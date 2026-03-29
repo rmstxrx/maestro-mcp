@@ -41,6 +41,12 @@ _EPHEMERAL_TOKENS: dict[str, float] = {}  # token → expiry_timestamp
 _SYSTEM_DIRS = frozenset({
     "/etc", "/proc", "/sys", "/dev", "/boot", "/sbin", "/bin", "/usr", "/lib", "/var",
 })
+def _is_maestro_path(path: str) -> bool:
+    normalized = path.strip()
+    return (
+        normalized == "/tmp/maestro" or
+        normalized.startswith("/tmp/maestro/")
+    )
 
 
 def configure_relay(
@@ -76,12 +82,17 @@ def _validate_transfer_path(remote_path: str, is_local: bool) -> str | None:
     if not remote_path or not remote_path.strip():
         return "remote_path is empty"
 
+    if _is_maestro_path(remote_path):
+        return None
+
     path_parts = Path(remote_path).parts
     if ".." in path_parts:
         return "path contains '..' components"
 
     if is_local:
         resolved = Path(remote_path).expanduser().resolve()
+        if _is_maestro_path(str(resolved)):
+            return None
         if not any(
             resolved == allowed or resolved.is_relative_to(allowed)
             for allowed in _TRANSFER_ALLOWED_DIRS
@@ -97,6 +108,8 @@ def _validate_transfer_path(remote_path: str, is_local: bool) -> str | None:
                     return "path resolves to a protected system directory"
     else:
         expanded = remote_path.replace("~", "/home/_placeholder_")
+        if _is_maestro_path(expanded):
+            return None
         resolved_str = str(Path(expanded).resolve())
         for sys_dir in _SYSTEM_DIRS:
             if resolved_str == sys_dir or resolved_str.startswith(sys_dir + "/"):

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import secrets
 from pathlib import Path
 
 logger = logging.getLogger("maestro")
@@ -20,6 +21,8 @@ TMUX_SERVER = "maestro"
 TMUX_SESSION = "tasks"
 OUTPUT_DIR = Path("/root/.maestro/task_output")
 HOST_OUTPUT_RETENTION_DAYS = 30
+STAGING_INBOX = Path("/tmp/maestro/inbox")
+STAGING_OUTBOX = Path("/tmp/maestro/outbox")
 
 
 def configure_mux(
@@ -42,6 +45,13 @@ def _remote_preamble(shell: str) -> str:
         return (
             "if (!(Test-Path ~/.maestro/task_output)) { "
             "New-Item -ItemType Directory -Path ~/.maestro/task_output -Force | Out-Null }; "
+            f"if (!(Test-Path {STAGING_INBOX})) {{ "
+            "New-Item -ItemType Directory -Path /tmp/maestro/inbox -Force | Out-Null }; "
+            f"if (!(Test-Path {STAGING_OUTBOX})) {{ "
+            "New-Item -ItemType Directory -Path /tmp/maestro/outbox -Force | Out-Null }; "
+            "Get-ChildItem /tmp/maestro -Recurse -File -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-60) } | "
+            "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
             "Get-ChildItem ~/.maestro/task_output -Filter '*.txt' | "
             "Where-Object { $_.LastWriteTime -lt "
             f"(Get-Date).AddDays(-{HOST_OUTPUT_RETENTION_DAYS}) }} | "
@@ -49,6 +59,8 @@ def _remote_preamble(shell: str) -> str:
         )
     return (
         "mkdir -p ~/.maestro/task_output && "
+        "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox && "
+        "find /tmp/maestro -mmin +60 -delete 2>/dev/null && "
         f"find ~/.maestro/task_output -name '*.txt' -mtime +{HOST_OUTPUT_RETENTION_DAYS} "
         "-delete 2>/dev/null;"
     )
@@ -145,62 +157,39 @@ def _build_wrapper(
     return "\n".join(lines)
 
 
-def _build_script_wrapper(
+def _build_staged_wrapper(
     task_id: str,
     ssh_alias: str,
-    script_body: str,
     *,
     tee: bool = True,
     cwd: str | None = None,
     sudo: bool = False,
-    shell: str = "bash",
 ) -> str:
-    """Build wrapper for multi-line scripts piped via stdin."""
+    """Build wrapper that executes a pre-staged script from /tmp/maestro/inbox."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
     rc_file = OUTPUT_DIR / f"{task_id}.rc"
-    remote_output_file = f"~/.maestro/task_output/{task_id}.txt"
+    inbox_script = f"/tmp/maestro/inbox/{task_id}.sh"
+    outbox_out = f"/tmp/maestro/outbox/{task_id}.out"
+    outbox_rc = f"/tmp/maestro/outbox/{task_id}.rc"
 
-    if shell == "powershell":
-        script_lines = ["$ErrorActionPreference = 'Stop'", _remote_preamble(shell)]
-        if cwd:
-            script_lines.append(f"Set-Location -LiteralPath '{cwd}'")
-        script_lines.append(script_body)
-        escaped_script = "\n".join(script_lines)
-        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} 'powershell -Command -'"
-    else:
-        script_lines = ["set -euo pipefail"]
-        if cwd:
-            script_lines.append(f"cd {shlex.quote(cwd)}")
-        script_lines.append(script_body)
-        escaped_script = "\n".join(script_lines)
-        remote_script_file = f"/tmp/_maestro_{task_id}.sh"
-        remote_preamble = _remote_preamble(shell)
-        if tee:
-            remote_exec = f"{remote_preamble} bash {remote_script_file} 2>&1 | tee {remote_output_file}"
-        else:
-            remote_exec = f"{remote_preamble} bash {remote_script_file}"
-        remote_cmd = f"cat > {remote_script_file} && {remote_exec}; rm -f {remote_script_file}"
-        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
+    remote_parts = [
+        "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox",
+        "find /tmp/maestro -mmin +60 -delete 2>/dev/null",
+    ]
+    if cwd:
+        remote_parts.append(f"cd {shlex.quote(cwd)}")
+    exec_cmd = f"sudo bash {inbox_script}" if sudo else f"bash {inbox_script}"
+    remote_parts.append(f"{{ {exec_cmd}; }} > {outbox_out} 2>&1; echo $? > {outbox_rc}")
+    remote_cmd = " && ".join(remote_parts)
 
-    heredoc = f"cat << '__MAESTRO_SCRIPT__'\n{escaped_script}\n__MAESTRO_SCRIPT__"
-    full_cmd = f"{heredoc} | {ssh_cmd}"
+    ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
 
     lines = ["#!/bin/bash"]
     if tee:
-        lines.append(f"{full_cmd} 2>&1 | tee {shlex.quote(str(output_file))}")
+        lines.append(f"{ssh_cmd} 2>&1 | tee {shlex.quote(str(output_file))}")
         lines.append(f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(rc_file))}")
-        if shell == "powershell":
-            lines.append(
-                f"ssh {shlex.quote(ssh_alias)} "
-                "'if (!(Test-Path ~/.maestro/task_output)) { "
-                "New-Item -ItemType Directory -Path ~/.maestro/task_output -Force | Out-Null }'"
-            )
-            lines.append(
-                f"scp {shlex.quote(str(output_file))} "
-                f"{shlex.quote(f'{ssh_alias}:{remote_output_file}')} 2>/dev/null || true"
-            )
     else:
-        lines.append(full_cmd)
+        lines.append(ssh_cmd)
         lines.append(f"echo $? > {shlex.quote(str(rc_file))}")
     lines.append(f"tmux -L {TMUX_SERVER} wait-for -S 'done-{task_id}'")
     return "\n".join(lines)
@@ -213,14 +202,14 @@ def _build_script_wrapper(
 async def create_task_window(
     task_id: str,
     ssh_alias: str,
-    command: str,
+    command: str | None = None,
     *,
     tee: bool = True,
     interactive: bool = False,
-    is_script: bool = False,
     cwd: str | None = None,
     sudo: bool = False,
     shell: str = "bash",
+    staged: bool = False,
 ) -> Path | None:
     """Create a Hub-local tmux window that SSHes to the target host.
 
@@ -228,12 +217,19 @@ async def create_task_window(
     """
     await ensure_server()
 
-    if is_script:
-        wrapper = _build_script_wrapper(
-            task_id, ssh_alias, command,
-            tee=tee, cwd=cwd, sudo=sudo, shell=shell,
+    if staged:
+        # Deprecated command wrappers are retained for dispatch compatibility in ADR-0007/4.
+        wrapper = _build_staged_wrapper(
+            task_id,
+            ssh_alias,
+            tee=tee,
+            cwd=cwd,
+            sudo=sudo,
         )
     else:
+        if command is None:
+            raise ValueError("command is required unless staged=True")
+        # Deprecated command-based wrapper kept for compatibility until ADR-0009 phase 4.
         wrapper = _build_wrapper(
             task_id, ssh_alias, command,
             tee=(tee and not interactive), cwd=cwd, sudo=sudo, shell=shell,
@@ -255,6 +251,44 @@ async def create_task_window(
     output_file = OUTPUT_DIR / f"{task_id}.txt" if (tee and not interactive) else None
     logger.info("mux: window '%s' → %s (task %s)", window_name, ssh_alias, task_id)
     return output_file
+
+
+async def mux_spawn(
+    host: str,
+    command: str,
+    name: str,
+    timeout: int,
+    *,
+    cwd: str | None = None,
+    sudo: bool = False,
+    cleanup: bool = False,
+) -> str:
+    """Compatibility wrapper for callers expecting named-window command execution."""
+    task_id = secrets.token_hex(8)
+    await create_task_window(
+        task_id,
+        host,
+        command,
+        tee=True,
+        interactive=False,
+        cwd=cwd,
+        sudo=sudo,
+        shell="bash",
+    )
+    rc = await wait_for_completion(task_id, timeout=timeout)
+
+    output = ""
+    output_file = get_output_path(task_id)
+    if output_file.exists():
+        output = output_file.read_text(encoding="utf-8", errors="replace").rstrip("\n")
+    if output:
+        output = f"{output}\n[exit code: {rc}]"
+    else:
+        output = f"[exit code: {rc}]"
+
+    if cleanup:
+        cleanup_task_files(task_id)
+    return output
 
 
 async def wait_for_completion(task_id: str, timeout: int = 300) -> int:

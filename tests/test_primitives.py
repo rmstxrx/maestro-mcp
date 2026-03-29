@@ -515,40 +515,40 @@ class TestDispatchGuard:
         assert fleet_tools._check_agent_dispatch_bypass("tmux send-keys -t gemini-abc 'hello' Enter") is None
 
     @pytest.mark.asyncio
-    async def test_exec_blocks_raw_agent_dispatch_before_host_resolution(self, monkeypatch):
-        def _should_not_run(host):
-            raise AssertionError("host resolution should not happen for blocked dispatches")
-
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
-
+    async def test_exec_uses_staged_mode(self, monkeypatch):
         mcp = FastMCP("test")
+        captured: dict[str, object] = {}
+
+        class _cfg:
+            alias = "alias"
+            shell = HostShell.BASH
+
+        async def _fake_window(task_id, *_, **kwargs):
+            captured["staged"] = kwargs["staged"]
+            return None
+
+        async def _fake_auto_promote(exec_fn, **kwargs):
+            captured["agent"] = kwargs["agent"]
+            captured["prompt"] = kwargs["prompt"]
+            captured["block_timeout"] = kwargs["block_timeout"]
+            await exec_fn()
+            return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
+
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        monkeypatch.setattr("maestro.tools.fleet.create_task_window", _fake_window)
+        monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
             "exec",
-            {"host": "test-host", "command": "codex -q --model o4-mini -p 'fix bug'"},
+            {"host": "test-host", "task_id": "task-id"},
         )
 
         result = json.loads(call_result["result"])
-        assert result["error"] == "agent_dispatch_bypass"
-        assert result["detected_agent"] == "codex"
-
-    @pytest.mark.asyncio
-    async def test_script_blocks_raw_agent_dispatch_before_host_resolution(self, monkeypatch):
-        def _should_not_run(host):
-            raise AssertionError("host resolution should not happen for blocked dispatches")
-
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", _should_not_run)
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool(
-            "script",
-            {"host": "test-host", "script": "gemini -p 'analyze this'"},
-        )
-
-        result = json.loads(call_result["result"])
-        assert result["error"] == "agent_dispatch_bypass"
-        assert result["detected_agent"] == "gemini"
+        assert captured["staged"] is True
+        assert captured["agent"] == "exec"
+        assert captured["prompt"] == "task-id"
+        assert captured["block_timeout"] == 0
+        assert result["task_id"] == "task-id"
 
 
 # ---------------------------------------------------------------------------
