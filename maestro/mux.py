@@ -164,6 +164,7 @@ def _build_staged_wrapper(
     tee: bool = True,
     cwd: str | None = None,
     sudo: bool = False,
+    stream: bool = False,
 ) -> str:
     """Build wrapper that executes a pre-staged script from /tmp/maestro/inbox."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
@@ -174,12 +175,15 @@ def _build_staged_wrapper(
 
     remote_parts = [
         "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox",
-        "find /tmp/maestro -mmin +60 -delete 2>/dev/null",
+        "find /tmp/maestro -mmin +60 -delete 2>/dev/null || true",
     ]
     if cwd:
         remote_parts.append(f"cd {shlex.quote(cwd)}")
     exec_cmd = f"sudo bash {inbox_script}" if sudo else f"bash {inbox_script}"
-    remote_parts.append(f"{{ {exec_cmd}; }} > {outbox_out} 2>&1; echo $? > {outbox_rc}")
+    if stream:
+        remote_parts.append(exec_cmd)
+    else:
+        remote_parts.append(f"{{ {exec_cmd}; }} > {outbox_out} 2>&1; _RC=$?; echo $_RC > {outbox_rc}; exit $_RC")
     remote_cmd = " && ".join(remote_parts)
 
     ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
@@ -193,6 +197,36 @@ def _build_staged_wrapper(
         lines.append(f"echo $? > {shlex.quote(str(rc_file))}")
     lines.append(f"tmux -L {TMUX_SERVER} wait-for -S 'done-{task_id}'")
     return "\n".join(lines)
+
+
+async def stage_script(task_id: str, ssh_alias: str, content: str) -> None:
+    """Write a script to the remote host's /tmp/maestro/inbox via SSH.
+
+    Used by dispatch and service to pre-stage their commands before
+    triggering execution via create_task_window(staged=True).
+    """
+    inbox_path = f"/tmp/maestro/inbox/{task_id}.sh"
+    cmd = f"mkdir -p /tmp/maestro/inbox && cat > {inbox_path} && chmod +x {inbox_path}"
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", ssh_alias, cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(input=content.encode("utf-8")), timeout=30,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"stage_script timed out on {ssh_alias}")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"stage_script failed on {ssh_alias}: "
+            f"{stderr_bytes.decode(errors='replace').strip()}"
+        )
+    logger.debug("mux: staged script %s on %s (%d bytes)", inbox_path, ssh_alias, len(content))
 
 
 # -----------------------------------------------------------------------
@@ -210,6 +244,7 @@ async def create_task_window(
     sudo: bool = False,
     shell: str = "bash",
     staged: bool = False,
+    stream: bool = False,
 ) -> Path | None:
     """Create a Hub-local tmux window that SSHes to the target host.
 
@@ -225,6 +260,7 @@ async def create_task_window(
             tee=tee,
             cwd=cwd,
             sudo=sudo,
+            stream=stream,
         )
     else:
         if command is None:
