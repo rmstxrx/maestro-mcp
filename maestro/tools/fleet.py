@@ -24,6 +24,7 @@ from maestro.mux import (
     create_task_window,
     get_output_path,
     kill_window,
+    stage_script,
     wait_for_completion,
     TMUX_SESSION,
 )
@@ -335,14 +336,16 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         task_id = secrets.token_hex(8)
         ctx = get_client_context()
 
+        script_content = f"#!/bin/bash\n{command}\n"
+        await stage_script(task_id, cfg.alias, script_content)
         await create_task_window(
             task_id,
             cfg.alias,
-            command,
             tee=capture,
             interactive=False,
             cwd=cwd,
-            shell=cfg.shell.value,
+            staged=True,
+            stream=True,
         )
 
         # Record in ledger
