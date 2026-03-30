@@ -961,6 +961,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
         from maestro.mux import create_task_window, wait_for_completion, get_output_path, stage_script
         from maestro.hosts import _resolve_host
+        from maestro.hosts import HostShell
 
         ctx = get_client_context()
         task_id = secrets.token_hex(8)
@@ -976,13 +977,14 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
         async def _execute() -> str:
             script_content = f"#!/bin/bash\n{cli_cmd}\n"
-            await stage_script(task_id, host_cfg.alias, script_content)
+            await stage_script(task_id, host_cfg.alias, script_content, host_cfg.shell)
             output_file = await create_task_window(
                 task_id,
                 host_cfg.alias,
                 tee=True,
                 cwd=working_dir,
                 stream=True,
+                shell=host_cfg.shell,
             )
             rc = await wait_for_completion(task_id, timeout=config.dispatch_ceiling)
 

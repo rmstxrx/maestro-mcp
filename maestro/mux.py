@@ -14,6 +14,8 @@ import logging
 import shlex
 from pathlib import Path
 
+from maestro.hosts import HostShell
+
 logger = logging.getLogger("maestro")
 
 TMUX_SERVER = "maestro"
@@ -22,6 +24,15 @@ OUTPUT_DIR = Path("/root/.maestro/task_output")
 HOST_OUTPUT_RETENTION_DAYS = 30
 STAGING_INBOX = Path("/tmp/maestro/inbox")
 STAGING_OUTBOX = Path("/tmp/maestro/outbox")
+
+
+def _staging_mkdir_cmd(shell: HostShell) -> str:
+    if shell == HostShell.POWERSHELL:
+        return (
+            "New-Item -ItemType Directory -Force -ErrorAction SilentlyContinue -Path '/tmp/maestro/inbox'; "
+            "New-Item -ItemType Directory -Force -ErrorAction SilentlyContinue -Path '/tmp/maestro/outbox'"
+        )
+    return "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox"
 
 
 def configure_mux(
@@ -81,6 +92,7 @@ def _build_staged_wrapper(
     cwd: str | None = None,
     sudo: bool = False,
     stream: bool = False,
+    shell: HostShell = HostShell.BASH,
 ) -> str:
     """Build wrapper that executes a pre-staged script from /tmp/maestro/inbox."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
@@ -90,7 +102,7 @@ def _build_staged_wrapper(
     outbox_rc = f"/tmp/maestro/outbox/{task_id}.rc"
 
     remote_parts = [
-        "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox",
+        _staging_mkdir_cmd(shell),
         "find /tmp/maestro -mmin +60 -delete 2>/dev/null || true",
     ]
     if cwd:
@@ -115,14 +127,26 @@ def _build_staged_wrapper(
     return "\n".join(lines)
 
 
-async def stage_script(task_id: str, ssh_alias: str, content: str) -> None:
+async def stage_script(
+    task_id: str,
+    ssh_alias: str,
+    content: str,
+    shell: HostShell = HostShell.BASH,
+) -> None:
     """Write a script to the remote host's /tmp/maestro/inbox via SSH.
 
     Used by dispatch and service to pre-stage their commands before
     triggering execution via create_task_window.
     """
     inbox_path = f"/tmp/maestro/inbox/{task_id}.sh"
-    cmd = f"mkdir -p /tmp/maestro/inbox && cat > {inbox_path} && chmod +x {inbox_path}"
+    if shell == HostShell.POWERSHELL:
+        cmd = (
+            "New-Item -ItemType Directory -Force -ErrorAction SilentlyContinue -Path '/tmp/maestro/inbox'; "
+            "$script = [System.IO.StreamReader]::new([System.Console]::OpenStandardInput()).ReadToEnd(); "
+            f"Set-Content -Path {shlex.quote(inbox_path)} -Value $script -Encoding UTF8 -Force"
+        )
+    else:
+        cmd = f"mkdir -p /tmp/maestro/inbox && cat > {inbox_path} && chmod +x {inbox_path}"
     proc = await asyncio.create_subprocess_exec(
         "ssh", ssh_alias, cmd,
         stdin=asyncio.subprocess.PIPE,
@@ -158,6 +182,7 @@ async def create_task_window(
     cwd: str | None = None,
     sudo: bool = False,
     stream: bool = False,
+    shell: HostShell = HostShell.BASH,
 ) -> Path | None:
     """Create a Hub-local tmux window that SSHes to the target host.
 
@@ -172,6 +197,7 @@ async def create_task_window(
         cwd=cwd,
         sudo=sudo,
         stream=stream,
+        shell=shell,
     )
 
     # Write wrapper to temp file and run it in a new tmux window

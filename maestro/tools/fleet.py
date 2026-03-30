@@ -131,6 +131,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 tee=False,
                 cwd=cwd,
                 sudo=sudo,
+                shell=cfg.shell,
             )
             rc = await wait_for_completion(task_id, timeout=config.run_ceiling)
             return json.dumps({"task_id": task_id, "host": host, "return_code": rc})
@@ -335,13 +336,14 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         ctx = get_client_context()
 
         script_content = f"#!/bin/bash\n{command}\n"
-        await stage_script(task_id, cfg.alias, script_content)
+        await stage_script(task_id, cfg.alias, script_content, cfg.shell)
         await create_task_window(
             task_id,
             cfg.alias,
             tee=capture,
             cwd=cwd,
             stream=True,
+            shell=cfg.shell,
         )
 
         # Record in ledger
