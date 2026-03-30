@@ -33,7 +33,10 @@ from maestro.tools.orchestra import (
     _orchestra_run_cli,
 )
 from maestro.transport import (
+    _async_run,
     _check_control_master,
+    _ensure_connection,
+    _is_transient_failure,
     _structured_error,
     _teardown_connection,
     _warmup_connection,
@@ -46,6 +49,40 @@ _AGENT_CLI_PATTERNS = re.compile(
     r"^\s*(codex|gemini|claude)\b.*(?:-[pq]|--prompt|--model|--message)(?:\s|=|$)",
     re.IGNORECASE | re.DOTALL,
 )
+
+_READ_WRITE_MAX_BYTES = 4096
+_READ_WRITE_TIMEOUT = 10
+
+
+def _shell_quote(s: str) -> str:
+    """Single-quote a string for safe use in shell commands."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+async def _raw_ssh(host: str, cmd: str, timeout: int, stdin_data: str | None = None) -> tuple[int, str, str]:
+    """Run a single SSH command and return raw (rc, stdout, stderr).
+
+    Includes connection-ensure and one retry on transient failure.
+    Does NOT format the result — caller gets raw streams.
+    """
+    from maestro.hosts import _resolve_host as resolve_host
+
+    cfg = resolve_host(host)
+    rc, stdout, stderr = 0, "", ""
+    for attempt in (1, 2):
+        await _ensure_connection(cfg.alias, host)
+        rc, stdout, stderr = await _async_run(
+            ["ssh", cfg.alias, cmd],
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
+        if not _is_transient_failure(rc, stderr):
+            return rc, stdout, stderr
+        if attempt < 2:
+            logger.warning(f"read/write {host}: transient failure, retrying: {stderr.strip()}")
+            await _teardown_connection(cfg.alias)
+            await asyncio.sleep(0.5)
+    return rc, stdout, stderr
 
 
 def _check_local_self_reference(host: str) -> str | None:
@@ -368,4 +405,96 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             "label": label or command[:80],
             "capture": capture,
             "hint": "Read output logs with run(...) for progress, stop(task_id) to kill.",
+        })
+
+    # --- ADR-0007: Direct file I/O (orchestrator only) ---
+
+    @mcp.tool()
+    async def read(host: str, path: str) -> str:
+        """Read a small file from a fleet host (≤4 KB, 10 s timeout).
+
+        Returns file content directly. For larger files, use the
+        transfer relay (prepare_relay + curl pull).
+
+        This is an orchestrator tool — dispatched agents use their
+        native filesystem instead."""
+        if block := _check_local_self_reference(host):
+            return block
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        cmd = f"head -c {_READ_WRITE_MAX_BYTES} -- {_shell_quote(path)} || true"
+        rc, stdout, stderr = await _raw_ssh(host, cmd, timeout=_READ_WRITE_TIMEOUT)
+
+        if rc not in (0, 141):  # 141 = SIGPIPE from head, expected for large files
+            return json.dumps({
+                "error": "read_failed",
+                "host": host,
+                "path": path,
+                "exit_code": rc,
+                "stderr": stderr.strip(),
+            })
+
+        return json.dumps({
+            "host": host,
+            "path": path,
+            "bytes": len(stdout.encode()),
+            "truncated": len(stdout.encode()) >= _READ_WRITE_MAX_BYTES,
+            "content": stdout,
+        })
+
+    @mcp.tool()
+    async def write(host: str, path: str, content: str) -> str:
+        """Write a small file to a fleet host (≤4 KB, 10 s timeout).
+
+        Content is piped via stdin — no shell escaping issues.
+        For larger files, use the transfer relay (prepare_relay + curl push).
+
+        This is an orchestrator tool — dispatched agents use their
+        native filesystem instead."""
+        if block := _check_local_self_reference(host):
+            return block
+        try:
+            _resolve_host(host)
+        except ValueError as e:
+            return _structured_error("validation_error", host, str(e))
+
+        content_bytes = len(content.encode())
+        if content_bytes > _READ_WRITE_MAX_BYTES:
+            return json.dumps({
+                "error": "content_too_large",
+                "host": host,
+                "path": path,
+                "bytes": content_bytes,
+                "limit": _READ_WRITE_MAX_BYTES,
+                "message": (
+                    f"Content is {content_bytes} bytes (limit: {_READ_WRITE_MAX_BYTES}). "
+                    f"Use the transfer relay instead."
+                ),
+            })
+
+        parent = str(Path(path).parent)
+        cmd = f"mkdir -p -- {_shell_quote(parent)} && cat > {_shell_quote(path)}"
+        rc, stdout, stderr = await _raw_ssh(
+            host, cmd,
+            timeout=_READ_WRITE_TIMEOUT,
+            stdin_data=content,
+        )
+
+        if rc != 0:
+            return json.dumps({
+                "error": "write_failed",
+                "host": host,
+                "path": path,
+                "exit_code": rc,
+                "stderr": stderr.strip(),
+            })
+
+        return json.dumps({
+            "host": host,
+            "path": path,
+            "bytes": content_bytes,
+            "status": "ok",
         })
