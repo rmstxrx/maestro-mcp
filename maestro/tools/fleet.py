@@ -142,22 +142,66 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     # --- ADR-0007: Hub-local execution via exec ---
 
+    _INLINE_EXEC_MAX_TIMEOUT = 20
+
     @mcp.tool()
     async def exec(
         host: str,
-        task_id: str,
+        task_id: str = "",
+        command: str = "",
         cwd: str | None = None,
         expected_runtime: int | None = None,
         sudo: bool = False,
     ) -> str:
-        """Trigger execution of a pre-staged script on a host. The script must already exist at /tmp/maestro/inbox/<task_id>.sh (pushed via relay). Returns task_id for status tracking."""
+        """Execute a command on a fleet host. Two modes:
+
+        Inline mode (command=): Runs via SSH with a hard 20 s timeout.
+        Returns stdout/stderr directly. For quick commands (git status,
+        ls, cat, pip install). No tmux, no ledger, no polling.
+
+        Staged mode (task_id=): Triggers a pre-staged script at
+        /tmp/maestro/inbox/<task_id>.sh. Runs in tmux, returns task_id
+        for polling. For long-running tasks.
+
+        Provide exactly one of task_id or command."""
         if block := _check_local_self_reference(host):
             return block
+        if not task_id and not command:
+            return json.dumps({"error": "validation_error", "detail": "Provide either task_id (staged) or command (inline)."})
+        if task_id and command:
+            return json.dumps({"error": "validation_error", "detail": "Provide task_id or command, not both."})
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
 
+        # --- Inline mode: synchronous SSH, hard timeout, no tmux ---
+        if command:
+            if sudo:
+                cmd = f"sudo sh -c {_shell_quote(command)}"
+            else:
+                cmd = command
+            if cwd:
+                cmd = f"cd {_shell_quote(cwd)} && {cmd}"
+
+            rc, stdout, stderr = await _raw_ssh(
+                host, cmd, timeout=_INLINE_EXEC_MAX_TIMEOUT,
+            )
+            result: dict[str, Any] = {
+                "host": host,
+                "mode": "inline",
+                "exit_code": rc,
+            }
+            if stdout:
+                result["stdout"] = stdout
+            if stderr:
+                result["stderr"] = stderr
+            if rc == -1 and "timeout" in stderr.lower():
+                result["error"] = "timeout"
+                result["detail"] = f"Command exceeded {_INLINE_EXEC_MAX_TIMEOUT}s hard limit."
+            return json.dumps(result)
+
+        # --- Staged mode: tmux window, async, poll for result ---
         ctx = get_client_context()
         ert = expected_runtime if expected_runtime is not None else config.default_expected_runtime_run
 
