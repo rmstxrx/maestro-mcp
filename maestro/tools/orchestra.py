@@ -1011,7 +1011,15 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 "output_bytes": len(raw_output),
             }, indent=2, ensure_ascii=False)
 
-        return await _auto_promote(
+        warning = None
+        if host_cfg.shell == HostShell.POWERSHELL:
+            warning = (
+                f"Host '{host}' uses PowerShell. Agent dispatches (codex/gemini/claude) "
+                "use bash-based wrappers that may fail. Consider dispatching to a "
+                "bash-compatible host (e.g., eden-wsl instead of eden)."
+            )
+
+        result = await _auto_promote(
             _execute,
             block_timeout=0,  # dispatches always go background
             agent=agent,
@@ -1022,6 +1030,13 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             expected_runtime=ert,
             output_file_factory=lambda tid: _orchestra_output_path(agent, tid),
         )
+
+        if warning is None:
+            return result
+
+        payload = json.loads(result)
+        payload["warning"] = warning
+        return json.dumps(payload)
 
     @mcp.tool()
     async def prepare_relay() -> str:

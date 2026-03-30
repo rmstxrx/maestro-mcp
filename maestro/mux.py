@@ -35,6 +35,16 @@ def _staging_mkdir_cmd(shell: HostShell) -> str:
     return "mkdir -p /tmp/maestro/inbox /tmp/maestro/outbox"
 
 
+def _staging_cleanup_cmd(shell: HostShell) -> str:
+    if shell == HostShell.POWERSHELL:
+        return (
+            "Get-ChildItem '/tmp/maestro' -Recurse -File | "
+            "Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-60) } | "
+            "Remove-Item -Force -ErrorAction SilentlyContinue"
+        )
+    return "find /tmp/maestro -mmin +60 -delete 2>/dev/null || true"
+
+
 def configure_mux(
     *,
     output_dir: Path | None = None,
@@ -103,7 +113,7 @@ def _build_staged_wrapper(
 
     remote_parts = [
         _staging_mkdir_cmd(shell),
-        "find /tmp/maestro -mmin +60 -delete 2>/dev/null || true",
+        _staging_cleanup_cmd(shell),
     ]
     if cwd:
         remote_parts.append(f"cd {shlex.quote(cwd)}")
