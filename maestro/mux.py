@@ -301,6 +301,10 @@ async def list_windows() -> list[dict[str, str]]:
     return windows
 
 
+def get_output_dir() -> Path:
+    """Return the canonical task output directory."""
+    return OUTPUT_DIR
+
 def get_output_path(task_id: str) -> Path:
     """Get the expected output file path for a task."""
     return OUTPUT_DIR / f"{task_id}.txt"

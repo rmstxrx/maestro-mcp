@@ -503,6 +503,7 @@ async def _evict_stale_tasks() -> None:
     """Remove completed tasks older than task_eviction_seconds from registry."""
     cfg = _cfg()
     now = datetime.now(timezone.utc)
+    stale = []
     async with _REGISTRY_LOCK:
         stale = [
             tid for tid, ts in TASK_REGISTRY.items()
@@ -512,16 +513,35 @@ async def _evict_stale_tasks() -> None:
             ts = TASK_REGISTRY.pop(tid)
             if ts.asyncio_task and not ts.asyncio_task.done():
                 ts.asyncio_task.cancel()
-            if ts.output_file and ts.output_file.exists():
-                try:
-                    age = (now - ts.started_at).total_seconds()
-                    if age > cfg.task_output_retention_seconds:
-                        ts.output_file.unlink()
-                except OSError:
-                    pass
+
+    pruned_output_files = 0
+    output_dir = _task_output_dir()
+    if output_dir.exists():
+        cutoff = now - timedelta(days=cfg.output_retention_days)
+        for path in output_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
+            if modified_at >= cutoff:
+                continue
+            try:
+                path.unlink()
+                pruned_output_files += 1
+            except OSError:
+                pass
+
     if stale:
         logger.info(f"Orchestra: evicted {len(stale)} stale tasks from registry")
         _save_registry()
+    if pruned_output_files:
+        logger.info(
+            "Orchestra: pruned %d task_output files older than %d days",
+            pruned_output_files,
+            cfg.output_retention_days,
+        )
 
 
 async def _periodic_eviction() -> None:
@@ -551,16 +571,10 @@ def cancel_eviction_loop() -> None:
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def _orchestra_output_dir() -> Path:
-    """Ensure orchestra output directory exists."""
-    cfg = _cfg()
-    cfg.orchestra_output_dir.mkdir(parents=True, exist_ok=True)
-    return cfg.orchestra_output_dir
+def _task_output_dir() -> Path:
+    from maestro.mux import get_output_dir
 
-
-def _orchestra_output_path(agent: str, task_id: str) -> Path:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return _orchestra_output_dir() / f"{agent}_{ts}_{task_id}.txt"
+    return get_output_dir()
 
 
 def _orchestra_truncate(text: str, max_len: int | None = None) -> tuple[str, bool]:
@@ -1135,17 +1149,14 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 raw_output = _extract_gemini_response(raw_output)
 
             # Build structured result
-            preview, was_truncated = _orchestra_truncate(raw_output)
-            return json.dumps({
-                "agent": agent,
-                "host": host,
-                "success": rc == 0,
-                "return_code": rc,
-                "output_file": str(out_path),
-                "output_preview": preview,
-                "truncated": was_truncated,
-                "output_bytes": len(raw_output),
-            }, indent=2, ensure_ascii=False)
+            return _orchestra_build_result(
+                agent=agent,
+                host=host,
+                prompt=prompt,
+                raw_output=raw_output,
+                return_code=rc,
+                output_file=out_path,
+            )
 
         if host_cfg.shell == HostShell.POWERSHELL:
             val_warnings.append(
@@ -1163,7 +1174,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             client_class=ctx.classification,
             task_id=task_id,
             expected_runtime=ert,
-            output_file_factory=lambda tid: _orchestra_output_path(agent, tid),
+            output_file_factory=get_output_path,
         )
 
         if not val_warnings:
