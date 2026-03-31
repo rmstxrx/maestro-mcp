@@ -4,7 +4,7 @@
 
 **Maestro** is an MCP server that turns a heterogeneous machine fleet into a unified workspace for AI agents. SSH into any host, run commands across platforms, transfer files, and dispatch coding agents — all through a single orchestration layer.
 
-Built for developers/power users in general who work across multiple machines and want their AI assistant to do the same.
+Built for developers/power users who work across multiple machines and want their AI assistant to do the same.
 
 ---
 
@@ -23,26 +23,36 @@ Maestro gives your AI agent the same mental model you have: named hosts, persist
 - **Named hosts** with per-host shell awareness (Bash, PowerShell, WSL)
 - **SSH ControlMaster** lifecycle — persistent multiplexed connections with auto-reconnect and exponential backoff
 - **Local routing** — the hub machine bypasses SSH entirely for zero-overhead local execution
-- **Cross-platform commands** — `exec` adapts to each host's shell automatically
-- **Multi-line scripts** — `script` pipes scripts via `bash -s` or PowerShell stdin
-- **File operations** — `read`, `write`, and `transfer` (SCP) across any host
+- **Dual-mode execution** — inline commands (20s, synchronous) for quick ops, staged scripts (async, tmux) for long-running tasks
+- **Direct file I/O** — `read` and `write` small files (≤4 KB) over SSH with hard timeouts
+- **Transfer relay** — push/pull larger files via HTTP endpoints with Bearer token auth
 - **Fleet status** — one-command health check across all hosts with auto-reconnection
-- **Agent orchestra** *(optional)* — dispatch [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) as async background tasks with budget caps, output pagination, and polling
-- **Remote access** *(optional)* — OAuth 2.1 with PIN-gated consent for exposing Maestro over HTTP (e.g., from Claude.ai via Cloudflare Tunnel). Not needed for stdio usage with Codex CLI, Claude Code, or Claude Desktop
+- **Agent orchestra** — dispatch [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) as async background tasks with ledger tracking, live observation, and steering
+- **Task ledger** — persistent task history surviving restarts, with automatic 30-day pruning
+- **Remote access** *(optional)* — OAuth 2.1 with PIN-gated consent for exposing Maestro over HTTP (e.g., from Claude.ai via Cloudflare Tunnel)
 
 ---
 
 ## Architecture
 
-Maestro runs on one **hub machine** — the one with SSH access to all others. Star topology: every host is one hop from the hub. The hub itself executes locally, no SSH overhead.
+Maestro runs on one **hub machine** — the one with SSH access to all others. Star topology: every host is one hop from the hub. The hub itself is marked `is_local: true` and executes locally with no SSH overhead.
+
+Dispatched agents (Codex, Gemini, Claude Code) run in **hub-local tmux windows** that SSH into the target host. The orchestrator can observe their output, send keystrokes, and stop them — all without entering the agent's context.
 
 ```
-                  AI Agent (MCP client)
+              AI Agent (Claude.ai / Claude Code / Codex CLI)
                          │
                     MCP protocol
+                    (stdio or HTTP)
                          │
                   ┌──────┴──────┐
                   │   Maestro   │  ← hub machine (is_local: true)
+                  │  ┌────────┐ │
+                  │  │ ledger │ │     persistent task history
+                  │  └────────┘ │
+                  │  ┌────────┐ │
+                  │  │  tmux  │ │     agent dispatch windows
+                  │  └────────┘ │
                   └──┬───┬───┬──┘
                      │   │   │
               SSH ControlMaster pool
@@ -52,7 +62,7 @@ Maestro runs on one **hub machine** — the one with SSH access to all others. S
             linux-box  win-pc   macbook
             (bash)     (pwsh)   (bash)
                          │
-                         └─► WSL (ProxyJump)
+                         └─► WSL (ProxyCommand)
 ```
 
 ---
@@ -108,7 +118,7 @@ hosts:
 
   windows-wsl:
     alias: ssh-winpc-wsl
-    description: "WSL2 on windows-pc (ProxyJump)"
+    description: "WSL2 on windows-pc (ProxyCommand)"
     # shell: bash (default)
 ```
 
@@ -130,7 +140,8 @@ cp .env.example .env
 MAESTRO_AUTHORIZE_PIN_HASH="your_sha256_hash_here"
 SSH_TIMEOUT=300
 MAESTRO_ISSUER_URL=https://your-domain.example.com  # Required for HTTP transport
-# MAESTRO_DEFAULT_REPO=~/workspace                  # Default working dir for agent tools
+# MAESTRO_TRANSFER_ALLOWED_DIRS="~/,/tmp"           # Paths the relay can write to
+# MAESTRO_DEFAULT_REPO=~/workspace                   # Default working dir for agents
 ```
 
 ### 4. Run
@@ -174,30 +185,62 @@ Point the MCP connector to your tunnel URL. OAuth consent is handled automatical
 
 ## Tools Reference
 
-### Fleet Core
+### Fleet Tools
 
 | Tool | Description |
 |------|-------------|
-| `exec` | Execute a shell command on any host |
-| `script` | Run a multi-line script (piped via `bash -s` or PowerShell) |
-| `read` | Read a text file (with optional `head`/`tail` line limits) |
-| `write` | Write or append to a file (creates parent dirs automatically) |
-| `transfer` | SCP a file to or from a remote host |
-| `status` | Health check all hosts, auto-reconnect stale connections |
+| `exec` | Execute on any host. **Inline mode** (`command=`): synchronous SSH, 20s hard timeout, returns stdout/stderr directly. **Staged mode** (`task_id=`): runs a pre-staged script in tmux, returns task_id for polling. |
+| `read` | Read a file from any host (≤4 KB, 10s timeout). Returns content directly. |
+| `write` | Write a file to any host (≤4 KB, 10s timeout). Content piped via stdin. |
+| `status` | Fleet health check with auto-reconnect. Optional `agents=True` to probe CLI availability. |
+| `service` | Start a long-running process (vLLM, Jupyter, etc.). No hard ceiling — runs until stopped. |
+| `observe` | Capture live output from a running task's tmux pane (~50 lines). |
+| `steer` | Send keystrokes to a running task (approval prompts, Ctrl+C, input). |
+| `stop` | Kill a running task's tmux window. Updates the ledger. |
 
 ### Agent Orchestra
 
 | Tool | Description |
 |------|-------------|
-| `claude` | Run Claude Code with inline-or-background auto-promote |
-| `codex` | Run OpenAI Codex CLI with inline-or-background auto-promote |
-| `gemini` | Run Gemini CLI with `approval_mode` and `resume` support |
-| `gemini_sessions` | List previous Gemini CLI sessions on a host |
-| `poll` | Check status of an auto-promoted task |
-| `read_output` | Read full or partial output from a completed task |
-| `agent_status` | Check which CLI agents are available on a host |
+| `dispatch` | Dispatch a coding agent (Codex, Gemini, or Claude Code) to any host. Runs in a hub-local tmux window. Returns task_id for tracking. |
+| `poll` | Check status of a dispatched task. Shows elapsed time and overtime flag. |
+| `tasks` | List recent tasks from the persistent ledger. Filter by status, agent, host, or task type. |
+| `prepare_relay` | Get an ephemeral Bearer token (1h TTL) for the HTTP file transfer relay. |
+| `gemini_sessions` | List previous Gemini CLI sessions on a host. |
 
-> **Why did Gemini change?** The `mode` parameter was replaced with `approval_mode` to align directly with Gemini CLI flags (`plan`, `yolo`, `auto_edit`). Added `resume` support for continuing sessions and `gemini_sessions` for easier session management.
+### Execution Tiers
+
+| Tier | Tool | Timeout | Use case |
+|------|------|---------|----------|
+| 1 | `read` / `write` | 10s | File I/O under 4 KB |
+| 2 | `exec` inline | 20s | Quick commands, no reasoning needed |
+| 3 | `exec` staged | 6h | Long scripts, builds, deployments |
+| 4 | `dispatch` | 6h | Agent tasks requiring reasoning |
+
+---
+
+## File Transfer
+
+Maestro provides two mechanisms for moving files:
+
+**Direct I/O** (`read`/`write`) — for small files (≤4 KB). Uses SSH, returns content in the tool response. Fast, simple, one tool call.
+
+**Transfer relay** (`prepare_relay` + HTTP push/pull) — for larger files. The relay endpoints accept multipart uploads and stream downloads, authenticated with ephemeral Bearer tokens. This keeps large file content out of the LLM context window.
+
+```bash
+# Get a relay token (via MCP tool)
+# prepare_relay → {"value": "abc123...", "ttl_seconds": 3600}
+
+# Push a file to a host
+curl -H "Authorization: Bearer abc123..." \
+  -F "file=@local_file.py" \
+  "https://your-maestro/transfer/push?host=gpu-box&remote_path=/home/user/file.py"
+
+# Pull a file from a host
+curl -H "Authorization: Bearer abc123..." \
+  -o local_file.py \
+  "https://your-maestro/transfer/pull?host=gpu-box&remote_path=/home/user/file.py"
+```
 
 ---
 
@@ -228,12 +271,10 @@ Host ssh-winpc
     HostName 192.168.1.200
     User admin
 
-# WSL via ProxyJump through Windows host
+# WSL via ProxyCommand through Windows host
 Host ssh-winpc-wsl
-    HostName localhost
-    Port 2222
     User user
-    ProxyJump ssh-winpc
+    ProxyCommand ssh ssh-winpc "wsl -d Ubuntu -e nc localhost 22"
 ```
 
 ```bash
@@ -245,7 +286,38 @@ mkdir -p ~/.ssh/sockets
 
 ## Deployment
 
-### As a systemd service
+### Docker Compose (recommended for HTTP transport)
+
+```yaml
+services:
+  maestro:
+    build: .
+    container_name: maestro
+    restart: unless-stopped
+    ports:
+      - "8222:8222"
+    env_file:
+      - ./config/.env
+    volumes:
+      - ./config/ssh:/mnt/ssh:ro          # SSH keys and config
+      - ./config/hosts.yaml:/app/hosts.yaml:ro
+      - ./state:/root/.maestro            # Task ledger, OAuth state
+      # For is_local hub: mount host paths the relay needs to access
+      # - /home/user/workspace:/home/user/workspace
+      # - /tmp/maestro:/tmp/maestro
+```
+
+### Exposing via Cloudflare Tunnel
+
+If you want Claude.ai to reach your Maestro instance:
+
+```bash
+cloudflared tunnel --url http://localhost:8222
+```
+
+Or as a persistent named tunnel — see [Cloudflare's documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
+
+### As a systemd service (stdio or HTTP)
 
 ```ini
 # /etc/systemd/system/maestro.service
@@ -259,7 +331,7 @@ Type=simple
 User=youruser
 WorkingDirectory=/path/to/maestro-mcp
 EnvironmentFile=/path/to/maestro-mcp/.env
-ExecStart=/path/to/maestro-mcp/.venv/bin/python server.py --transport streamable-http --port 8222 --host 127.0.0.1
+ExecStart=/path/to/maestro-mcp/.venv/bin/python server.py --transport streamable-http --port 8222
 Restart=on-failure
 RestartSec=5
 
@@ -267,60 +339,50 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-### Exposing via Cloudflare Tunnel
-
-If you want Claude.ai to reach your Maestro instance:
-
-```bash
-cloudflared tunnel --url http://localhost:8222
-```
-
-Or as a persistent named tunnel — see [Cloudflare's documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
-
 ---
 
 ## Project Structure
 
 ```
 maestro-mcp/
-├── server.py                  # Main MCP server — fleet tools + agent orchestra
+├── server.py                  # Entry point — FastMCP wiring, routes, middleware
+├── maestro/
+│   ├── tools/
+│   │   ├── fleet.py           # Fleet tools: exec, read, write, status, observe, steer, stop, service
+│   │   └── orchestra.py       # Agent dispatch: codex, gemini, claude, poll, tasks, prepare_relay
+│   ├── client.py              # Client classification (remote/local/LAN/stdio)
+│   ├── config.py              # MaestroConfig from environment
+│   ├── hosts.py               # Host registry, status tracking, command wrapping
+│   ├── mux.py                 # Hub-local tmux multiplexer for agent dispatch
+│   ├── relay.py               # HTTP file transfer relay (push/pull/task results)
+│   └── transport.py           # SSH execution layer (async_run, retries, connection lifecycle)
 ├── maestro_oauth.py           # OAuth 2.1 provider with PIN-gated consent
+├── oauth_rewrite.py           # URL rewrite middleware for multi-origin OAuth
 ├── hosts.yaml                 # Your fleet definition (git-ignored)
 ├── hosts.example.yaml         # Example fleet config
 ├── .env                       # Secrets — PIN hash, tokens (git-ignored)
 ├── .env.example               # Template for .env
-├── pyproject.toml             # Project metadata
+├── docker-compose.yml         # Docker deployment config
+├── Dockerfile                 # Container build
 ├── requirements.txt           # Python dependencies
-├── maestro.service            # systemd unit file (example)
-├── cloudflared-maestro.service # Cloudflare Tunnel unit (example)
 └── LICENSE                    # Apache 2.0
 ```
 
 ---
 
-## Context Budget Awareness
-
-A key design insight from daily usage with Claude: **tool responses consume LLM context**. Every byte returned by `read` enters the conversation permanently. For large files, this causes context exhaustion.
-
-Best practice:
-- Use `exec` with `grep`, `head`, `tail`, `sed`, `awk`, `jq` for surgical reads
-- Use `transfer` to move files to the hub disk (response is just `[OK]`, ≈0 context cost)
-- Use `read` with `head`/`tail` parameters for bounded reads
-- Reserve `read` (no limits) for files under ~100 lines
-
-The agent orchestra tools follow the same principle: full output is saved to disk, and only a truncated summary enters the conversation. Use `read_output` with line ranges for targeted inspection.
-
----
-
 ## Gotchas
 
-Claude.ai's MCP connector can silently filter tools whose name or description suggests credential generation. If a tool disappears from discovery, inspect the tool name and description for terms like `token`, `secret`, `key`, `auth`, `bearer`, `credential`, or `session key`, then rename the tool and sanitize the description. The filtering is intent-based, not pure keyword matching.
+- **Claude.ai tool filtering:** Claude.ai's MCP connector can silently filter tools whose name or description suggests credential generation. If a tool disappears from discovery, inspect the tool name and description for terms like `token`, `secret`, `key`, `auth`, `bearer`, or `credential`, then rename and sanitize. The filtering is intent-based, not pure keyword matching.
+
+- **Tool definition caching:** After rebuilding the Maestro container, you must fully disconnect and reconnect the MCP connector in Claude.ai settings. Tool definitions are cached at the OAuth session level.
+
+- **Context budget:** Tool responses consume LLM context. Use `exec` with `grep`, `head`, `tail`, `jq` for surgical reads. Use `read` only for files under 4 KB. For larger files, use the transfer relay — the response is just `{"status": "ok"}`, near-zero context cost.
 
 ---
 
 ## Origin
 
-Maestro was born from necessity. I work across three machines — a Linux box for inference, a Windows PC for training, and a MacBook for when I'm away from the desk. I got tired of my AI assistant only seeing one machine at a time while I had to manually bridge the gaps.
+Maestro was born from necessity. I work across multiple machines — a Linux box for inference, a Windows PC for training, and a MacBook for when I'm away from the desk. I got tired of my AI assistant only seeing one machine at a time while I had to manually bridge the gaps.
 
 What started as a simple SSH relay grew into a full orchestration layer: persistent connections, cross-platform shell awareness, agent dispatch, and eventually OAuth for remote access from Claude.ai. The name came naturally — if the models are the instruments, someone needs to conduct.
 

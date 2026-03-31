@@ -11,6 +11,8 @@ services:
       - ../config/ssh:/mnt/ssh:ro
       - ../config/hosts.yaml:/app/hosts.yaml:ro
       - ../state:/root/.maestro
+      - /home/rmstxrx/Development:/home/rmstxrx/Development
+      - /tmp/maestro:/tmp/maestro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8222/.well-known/oauth-authorization-server')"]
       interval: 15s
