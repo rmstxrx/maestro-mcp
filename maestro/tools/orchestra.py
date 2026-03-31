@@ -27,6 +27,105 @@ AGENT_SCOPE_PREFIX = (
     "TASK:\n"
 )
 
+# ---------------------------------------------------------------------------
+# Agent catalog — single source of truth for dispatch validation
+# ---------------------------------------------------------------------------
+
+AGENT_CATALOG: dict[str, dict] = {
+    "codex": {
+        "models": {
+            "gpt-5.4":             "Flagship reasoning, 1M ctx. Complex multi-file, architectural.",
+            "gpt-5.4-mini":        "Faster, cost-effective reasoning. Medium complexity.",
+            "gpt-5.4-nano":        "Fastest, cheapest. Simple well-defined tasks only.",
+            "gpt-5.3-codex":       "Advanced coding. Standard implementation tasks.",
+            "gpt-5.3-codex-spark": "Blazing fast. ONLY tightly-scoped single-file tasks.",
+        },
+        "default_model": "gpt-5.3-codex",
+        "has_effort": True,
+        "valid_efforts": {"low", "medium", "high", "xhigh"},
+        "default_effort": "xhigh",
+        "role": "Implementation. Code writing, refactoring, diffs, bug fixes.",
+    },
+    "gemini": {
+        "models": {
+            "gemini-3.1-pro-preview": "Deep research, thorough review, complex analysis.",
+            "gemini-3-flash-preview":  "Quick review, summaries, simple research.",
+        },
+        "default_model": "gemini-3.1-pro-preview",
+        "has_effort": False,
+        "role": (
+            "Reviewer and researcher. Google search, 1M context. "
+            "NEVER for writing production code."
+        ),
+    },
+    "claude": {
+        "models": {},
+        "default_model": None,
+        "has_effort": False,
+        "role": (
+            "Architectural judgment. Ambiguous cross-domain tasks, whole-project "
+            "reasoning. Credits compete with orchestrator — use sparingly."
+        ),
+    },
+}
+
+ALL_VALID_MODELS: set[str] = {
+    m for cat in AGENT_CATALOG.values() for m in cat.get("models", {})
+}
+
+
+def _validate_dispatch_args(
+    agent: str, model: str, reasoning_effort: str,
+) -> tuple[str, str, list[str]]:
+    """Validate and resolve dispatch arguments against the catalog.
+
+    Returns (resolved_model, resolved_effort, warnings).
+    Raises ValueError on hard validation failures.
+    """
+    if agent not in AGENT_CATALOG:
+        raise ValueError(
+            f"agent must be one of {list(AGENT_CATALOG)}, got '{agent}'"
+        )
+
+    cat = AGENT_CATALOG[agent]
+    warnings: list[str] = []
+
+    # --- Model resolution ---
+    if model:
+        valid_models = cat.get("models", {})
+        if not valid_models:
+            warnings.append(
+                f"Agent '{agent}' ignores --model (passed '{model}'). Proceeding without it."
+            )
+            model = ""
+        elif model not in valid_models:
+            raise ValueError(
+                f"Invalid model '{model}' for agent '{agent}'. "
+                f"Valid: {list(valid_models)}"
+            )
+    else:
+        model = cat.get("default_model") or ""
+
+    # --- Effort resolution ---
+    if cat.get("has_effort"):
+        valid_efforts = cat["valid_efforts"]
+        if reasoning_effort:
+            if reasoning_effort not in valid_efforts:
+                raise ValueError(
+                    f"Invalid reasoning_effort '{reasoning_effort}' for agent '{agent}'. "
+                    f"Valid: {sorted(valid_efforts)}"
+                )
+        else:
+            reasoning_effort = cat["default_effort"]
+    else:
+        if reasoning_effort:
+            warnings.append(
+                f"Agent '{agent}' has no effort toggle (passed '{reasoning_effort}'). Ignored."
+            )
+        reasoning_effort = ""
+
+    return model, reasoning_effort, warnings
+
 
 # ---------------------------------------------------------------------------
 # Task state + registry
@@ -873,20 +972,27 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         working_dir: str,
         *,
         model: str = "",
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: str = "",
         approval_mode: str = "plan",
         context_files: list[str] | None = None,
         resume: str = "",
         allowed_tools: str = "",
     ) -> str:
-        """Build the CLI command string for a given agent."""
-        # One-shot: full CLI with scoped prompt
+        """Build the CLI command string for a given agent.
+
+        Expects model and reasoning_effort to be already resolved
+        by _validate_dispatch_args (catalog defaults applied, invalid
+        values rejected).
+        """
         scoped_prompt = AGENT_SCOPE_PREFIX + prompt
         escaped_prompt = shlex.quote(scoped_prompt)
 
         if agent == "codex":
             model_flag = f"--model {shlex.quote(model)} " if model else ""
-            effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
+            effort_flag = (
+                f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
+                if reasoning_effort else ""
+            )
             return (
                 f"codex exec --dangerously-bypass-approvals-and-sandbox --json "
                 f"{model_flag}{effort_flag}"
@@ -929,7 +1035,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         working_dir: str,
         expected_runtime: int | None = None,
         model: str = "",
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: str = "",
         approval_mode: str = "plan",
         context_files: list[str] | None = None,
         resume: str = "",
@@ -937,18 +1043,44 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
     ) -> str:
         """Dispatch a task to an AI agent (codex, gemini, or claude).
 
-        All dispatches run in the background (block_timeout=0). Returns
-        {auto_promoted: true, task_id}. Use tasks() for status,
-        read_output(file_path) for completion output.
+        AGENT SELECTION GUIDE — read before every call:
 
-        Timeout: 6h hard ceiling (system policy). 30min default overtime flag.
-        expected_runtime: your estimate (seconds). Recorded verbatim in ledger.
+          codex  — Implementation. Code writing, refactoring, diffs, bug fixes.
+                   Models: gpt-5.4 (flagship 1M ctx), gpt-5.4-mini (faster),
+                   gpt-5.4-nano (cheapest), gpt-5.3-codex (standard coding),
+                   gpt-5.3-codex-spark (blazing fast, ONLY well-scoped tasks).
+                   Default: gpt-5.3-codex @ xhigh effort.
+                   Effort: low | medium | high | xhigh.
 
-        Validates working_dir against host's allowed_dirs.
-        Injects AGENT_SCOPE_PREFIX (pointer to AGENTS.md) automatically."""
-        valid_agents = ("codex", "gemini", "claude")
-        if agent not in valid_agents:
-            return json.dumps({"error": "validation_error", "detail": f"agent must be one of {valid_agents}, got '{agent}'"})
+          gemini — Reviewer/researcher. Google search, 1M context window.
+                   NEVER for writing production code.
+                   Models: gemini-3.1-pro-preview (deep work),
+                           gemini-3-flash-preview (quick work).
+                   Default: gemini-3.1-pro-preview. No effort flag.
+
+          claude — Architectural judgment. Ambiguous cross-domain tasks needing
+                   whole-project understanding. Credits compete with orchestrator.
+                   No model or effort flags. Use sparingly.
+
+        TASK ROUTING — before calling dispatch, ask:
+          • Is this a simple file read, ls, cat, or grep? → Use exec, not dispatch.
+          • Is this code implementation? → codex.
+          • Is this review, research, or reading a large file? → gemini.
+          • Is this ambiguous and cross-domain? → claude.
+
+        Returns {auto_promoted: true, task_id}. Use tasks() for status.
+        Timeout: 6h hard ceiling (system policy).
+        expected_runtime: your honest estimate (seconds). Recorded verbatim.
+        Validates model and reasoning_effort against the agent catalog."""
+        # --- Validate agent, model, effort against catalog (fail fast) ---
+        try:
+            resolved_model, resolved_effort, val_warnings = _validate_dispatch_args(
+                agent, model, reasoning_effort,
+            )
+        except ValueError as e:
+            return json.dumps({"error": "validation_error", "detail": str(e)})
+
+        # --- Validate host + working_dir ---
         try:
             cfg = _resolve_host_config(host)
         except ValueError as e:
@@ -970,7 +1102,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
         cli_cmd = _build_agent_cli(
             agent, prompt, working_dir,
-            model=model, reasoning_effort=reasoning_effort,
+            model=resolved_model, reasoning_effort=resolved_effort,
             approval_mode=approval_mode, context_files=context_files,
             resume=resume, allowed_tools=allowed_tools,
         )
@@ -1011,9 +1143,8 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 "output_bytes": len(raw_output),
             }, indent=2, ensure_ascii=False)
 
-        warning = None
         if host_cfg.shell == HostShell.POWERSHELL:
-            warning = (
+            val_warnings.append(
                 f"Host '{host}' uses PowerShell. Agent dispatches (codex/gemini/claude) "
                 "use bash-based wrappers that may fail. Consider dispatching to a "
                 "bash-compatible host (e.g., eden-wsl instead of eden)."
@@ -1031,11 +1162,11 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             output_file_factory=lambda tid: _orchestra_output_path(agent, tid),
         )
 
-        if warning is None:
+        if not val_warnings:
             return result
 
         payload = json.loads(result)
-        payload["warning"] = warning
+        payload["warnings"] = val_warnings
         return json.dumps(payload)
 
     @mcp.tool()
