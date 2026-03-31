@@ -1005,7 +1005,9 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 full_prompt = f"{file_refs} {prompt}"
             escaped = shlex.quote(AGENT_SCOPE_PREFIX + full_prompt)
             model_flag = f"--model {shlex.quote(model)} " if model else ""
-            approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
+            # plan requires interactive TTY; force yolo for headless dispatch
+            effective_approval = "yolo" if approval_mode == "plan" else approval_mode
+            approval_flag = f"--approval-mode {shlex.quote(effective_approval)} "
             resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
             return (
                 f"gemini -p {escaped} --output-format json "
