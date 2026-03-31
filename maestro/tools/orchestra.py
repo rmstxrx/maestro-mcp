@@ -1012,7 +1012,9 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             return (
                 f"gemini -p {escaped} --output-format json "
                 f"{model_flag}{approval_flag}{resume_flag}"
+                f"< /dev/null"  # stdin EOF: prevents readStdin() hang in non-TTY
             )
+
         elif agent == "claude":
             default_tools = (
                 "Edit,Write,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pip:*),"
