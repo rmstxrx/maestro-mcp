@@ -819,6 +819,7 @@ async def _auto_promote(
     output_holder: list[Path | None] | None = None,
     task_id: str | None = None,
     expected_runtime: int | None = None,
+    task_type: str = "",
 ) -> str:
     """Run execute_fn with adaptive blocking.
 
@@ -842,6 +843,7 @@ async def _auto_promote(
         dispatched_at=started_at,
         output_file=output_file,
         expected_runtime=expected_runtime,
+        task_type=task_type,
     )
 
     work_task = asyncio.create_task(execute_fn())
@@ -926,21 +928,31 @@ async def _auto_promote(
     async def _monitor() -> None:
         try:
             result = await work_task
-            ts.status = "done"
-            ts.result_json = result
+            if ts.status != "killed":
+                ts.status = "done"
+                ts.result_json = result
         except asyncio.CancelledError:
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": "cancelled", "task_id": task_id, "agent": agent,
-            })
+            if ts.status != "killed":
+                ts.status = "failed"
+                ts.result_json = json.dumps({
+                    "error": "cancelled", "task_id": task_id, "agent": agent,
+                })
         except Exception as exc:
-            logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": str(exc), "task_id": task_id, "agent": agent,
-            })
+            if ts.status != "killed":
+                logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
+                ts.status = "failed"
+                ts.result_json = json.dumps({
+                    "error": str(exc), "task_id": task_id, "agent": agent,
+                })
         finally:
-            ts.finished_at = datetime.now(timezone.utc)
+            if ts.status == "killed" and ts.result_json is None:
+                ts.result_json = json.dumps({
+                    "task_id": task_id,
+                    "agent": agent,
+                    "host": host,
+                    "status": "killed",
+                })
+            ts.finished_at = ts.finished_at or datetime.now(timezone.utc)
             ts._done_event.set()
             _complete_ledger_entry(
                 task_id=task_id,
@@ -1046,7 +1058,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             raise ValueError(f"Unknown agent: {agent}")
 
     @mcp.tool()
-    async def dispatch(
+    async def dispatch_agent(
         host: str,
         agent: str,
         prompt: str,
@@ -1081,12 +1093,12 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                    No model or effort flags. Use sparingly.
 
         TASK ROUTING — before calling dispatch, ask:
-          • Is this a simple file read, ls, cat, or grep? → Use exec, not dispatch.
+          • Is this a simple file read, ls, cat, or grep? → Use run_task, not dispatch_agent.
           • Is this code implementation? → codex.
           • Is this review, research, or reading a large file? → gemini.
           • Is this ambiguous and cross-domain? → claude.
 
-        Returns {auto_promoted: true, task_id}. Use tasks() for status.
+        Returns {auto_promoted: true, task_id}. Use current_tasks() for status.
         Timeout: 6h hard ceiling (system policy).
         expected_runtime: your honest estimate (seconds). Recorded verbatim.
         Validates model and reasoning_effort against the agent catalog."""
@@ -1175,6 +1187,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             task_id=task_id,
             expected_runtime=ert,
             output_file_factory=get_output_path,
+            task_type="dispatch",
         )
 
         if not val_warnings:
@@ -1195,7 +1208,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"value": value, "ttl_seconds": 3600})
 
     @mcp.tool()
-    async def tasks(
+    async def current_tasks(
         status: str | None = None,
         agent: str | None = None,
         host: str | None = None,

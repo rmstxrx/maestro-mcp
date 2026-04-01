@@ -228,7 +228,7 @@ async def create_task_window(
     return output_file
 
 
-async def wait_for_completion(task_id: str, timeout: int = 300) -> int:
+async def wait_for_completion(task_id: str, timeout: int | None = 300) -> int:
     """Block until a task signals completion. Zero-CPU wait. Returns exit code (-1 on timeout)."""
     proc = await asyncio.create_subprocess_exec(
         "tmux", "-L", TMUX_SERVER, "wait-for", f"done-{task_id}",
@@ -236,11 +236,14 @@ async def wait_for_completion(task_id: str, timeout: int = 300) -> int:
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        if timeout is None:
+            await proc.wait()
+        else:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        logger.warning("mux: task %s hit ceiling after %ds", task_id, timeout)
+        logger.warning("mux: task %s hit ceiling after %ss", task_id, timeout)
         return -1
 
     rc_file = OUTPUT_DIR / f"{task_id}.rc"

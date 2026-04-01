@@ -285,7 +285,7 @@ class TestMaestroConfig:
 # Fleet tools
 # ---------------------------------------------------------------------------
 
-class TestTasksTool:
+class TestCurrentTasksTool:
     @pytest.mark.asyncio
     async def test_returns_compact_filtered_rows(self, monkeypatch):
         now = datetime.now(timezone.utc)
@@ -317,7 +317,7 @@ class TestTasksTool:
         mcp = FastMCP("test")
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
-            "tasks",
+            "current_tasks",
             {"status": "done", "agent": "codex", "host": "test-host", "last": 5},
         )
 
@@ -426,13 +426,21 @@ class TestDispatchGuard:
         assert fleet_tools._check_agent_dispatch_bypass("tmux send-keys -t gemini-abc 'hello' Enter") is None
 
     @pytest.mark.asyncio
-    async def test_exec_uses_staged_mode(self, monkeypatch):
+    async def test_run_task_uses_client_block_timeout(self, monkeypatch, tmp_path):
         mcp = FastMCP("test")
         captured: dict[str, object] = {}
 
         class _cfg:
             alias = "alias"
             shell = HostShell.BASH
+
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_client_context",
+            lambda: SimpleNamespace(
+                classification="remote",
+                profile={"block_timeout_exec": 5},
+            ),
+        )
 
         async def _fake_window(task_id, *_, **kwargs):
             captured["kwargs"] = kwargs
@@ -442,10 +450,15 @@ class TestDispatchGuard:
             captured["agent"] = kwargs["agent"]
             captured["prompt"] = kwargs["prompt"]
             captured["block_timeout"] = kwargs["block_timeout"]
+            captured["task_type"] = kwargs["task_type"]
             await exec_fn()
             return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
 
         monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_output_path",
+            lambda task_id: tmp_path / f"{task_id}.txt",
+        )
         async def _fake_wait(task_id, timeout=300):
             return 0
 
@@ -454,7 +467,7 @@ class TestDispatchGuard:
         monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
-            "exec",
+            "run_task",
             {"host": "test-host", "task_id": "task-id"},
         )
 
@@ -462,8 +475,89 @@ class TestDispatchGuard:
         assert "staged" not in captured["kwargs"]
         assert captured["agent"] == "exec"
         assert captured["prompt"] == "task-id"
-        assert captured["block_timeout"] == 0
+        assert captured["block_timeout"] == 5
+        assert captured["task_type"] == "run"
         assert result["task_id"] == "task-id"
+
+    @pytest.mark.asyncio
+    async def test_run_task_persistent_forces_background_mode(self, monkeypatch):
+        mcp = FastMCP("test")
+        captured: dict[str, object] = {}
+
+        class _cfg:
+            alias = "alias"
+            shell = HostShell.BASH
+
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_client_context",
+            lambda: SimpleNamespace(
+                classification="local",
+                profile={"block_timeout_exec": 60},
+            ),
+        )
+
+        async def _fake_auto_promote(exec_fn, **kwargs):
+            captured["block_timeout"] = kwargs["block_timeout"]
+            captured["task_type"] = kwargs["task_type"]
+            return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
+
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "run_task",
+            {"host": "test-host", "command": "sleep 60", "persistent": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert captured["block_timeout"] == 0
+        assert captured["task_type"] == "service"
+        assert result["persistent"] is True
+
+    @pytest.mark.asyncio
+    async def test_stop_task_graceful_escalates_after_sigint(self, monkeypatch):
+        mcp = FastMCP("test")
+        events: list[str] = []
+
+        class _Ledger:
+            def update(self, task_id, **fields):
+                events.append(f"ledger:{task_id}:{fields['status']}")
+
+        async def _fake_send_keys(task_id, keys):
+            events.append(f"send:{task_id}:{keys}")
+
+        async def _fake_sleep(seconds):
+            events.append(f"sleep:{seconds}")
+
+        async def _fake_list_windows():
+            return [{"name": "task-deadbeef"}]
+
+        async def _fake_kill(task_id):
+            events.append(f"kill:{task_id}")
+
+        monkeypatch.setattr("maestro.tools.fleet.send_keys", _fake_send_keys)
+        monkeypatch.setattr("maestro.tools.fleet.asyncio.sleep", _fake_sleep)
+        monkeypatch.setattr("maestro.tools.fleet.list_windows", _fake_list_windows)
+        monkeypatch.setattr("maestro.tools.fleet.kill_window", _fake_kill)
+        monkeypatch.setattr("maestro.tools.fleet._save_registry", lambda: events.append("save"))
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
+
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "stop_task",
+            {"task_id": "deadbeef", "graceful": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "killed"
+        assert result["graceful"] is True
+        assert events == [
+            "send:deadbeef:C-c",
+            "sleep:3",
+            "kill:deadbeef",
+            "save",
+            "ledger:deadbeef:killed",
+        ]
 
 
 # ---------------------------------------------------------------------------
