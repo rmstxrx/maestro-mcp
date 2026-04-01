@@ -50,7 +50,7 @@ _AGENT_CLI_PATTERNS = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_READ_WRITE_MAX_BYTES = 4096
+_READ_WRITE_MAX_BYTES = 16384
 _READ_WRITE_TIMEOUT = 10
 
 
@@ -455,7 +455,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def read(host: str, path: str) -> str:
-        """Read a small file from a fleet host (≤4 KB, 10 s timeout).
+        """Read a small file from a fleet host (≤16 KB, 10 s timeout).
 
         Returns file content directly. For larger files, use the
         transfer relay (prepare_relay + curl pull).
@@ -491,7 +491,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def write(host: str, path: str, content: str) -> str:
-        """Write a small file to a fleet host (≤4 KB, 10 s timeout).
+        """Write a small file to a fleet host (≤16 KB, 10 s timeout).
 
         Content is piped via stdin — no shell escaping issues.
         For larger files, use the transfer relay (prepare_relay + curl push).
