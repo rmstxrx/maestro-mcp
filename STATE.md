@@ -6,15 +6,17 @@
 
 ## Current Focus
 
-**ADR-0009 is implemented on `feat/adr-0009-tool-surface-refactor`.** The tool surface now matches the 11-tool target: renamed task/file/orchestration tools, tmux-only `run_task`, curl-prepared transfer helpers, and `read_task_output`.
+**ADR-0009 landed and deployed.** The 11-tool surface is live on Cellar, verified across all fleet hosts. Full smoke test passed: transfer round-trips across 4 hosts (3 OSes), tmux auto-promote, graceful stop, persistent services, read_task_output with full= curl mode.
 
 ### Recent Commits
 
 ```text
+1e20e1c Merge feat/adr-0009-tool-surface-refactor: 11-tool surface refactor
+de1550d docs: phase 4 — rewrite CLAUDE.md, STATE.md for ADR-0009
 a1a512e feat: phase 3 — transfer_pull_file, transfer_push_file, read_task_output, task_result extraction
 222da15 refactor: phase 2 — rename tools, merge service into run_task, unify exec through tmux
 f1509a8 refactor: phase 1 — remove zombie tools (observe, steer, poll, gemini_sessions)
-3f4332a docs: add critical rule 9 — Claude.ai deferred tool loading
+0a2b3f8 docs: ADR-0009 — tool surface refactor specification
 ```
 
 ### Tool Inventory (11 tools)
@@ -34,40 +36,48 @@ f1509a8 refactor: phase 1 — remove zombie tools (observe, steer, poll, gemini_
 | Repo (git clone) | `/volume2/docker/maestro/repo/` |
 | Config (.env, hosts.yaml, ssh/, cloudflared/) | `/volume2/docker/maestro/config/` |
 | Persistent state (oauth, ledger, task output) | `/volume2/docker/maestro/state/` |
-| Containers | `maestro` + `maestro-cloudflared` |
-| Update workflow | `cd repo && git pull && docker compose up -d --build` |
+| Container | `maestro` (python:3.12-slim) |
+| Tunnel | Host-native cloudflared systemd service |
+| Update workflow | `cd repo && git pull && docker compose build --no-cache && docker compose up -d --force-recreate` |
 
 ### Fleet Topology
 
 | Host | Role | Status |
 |---|---|---|
-| Hub | `is_local: true`, orchestration container host | Docker, always-on |
-| GPU-server | Compute leaf, agent dispatch target | GPU workstation |
-| Win-server | Compute leaf, PowerShell/Windows-native target | GPU workstation |
-| Macbook | Compute leaf, agent dispatch target | Laptop |
-| Win-server-WSL | Bash-compatible leaf via Win-server | WSL2 Ubuntu |
+| Cellar (Hub) | `is_local: true`, Maestro container host | Docker, always-on |
+| Apollyon | Compute leaf, Maestro dev repo, agent dispatch target | DGX Spark |
+| Eden | Windows-native leaf | RTX 5090, PowerShell |
+| Eden-WSL | Bash-compatible leaf via Eden | WSL2 Ubuntu |
+| Judas | Compute leaf, agent dispatch target | MBP M3 Max |
 
 ## Active Branches
 
 | Branch | Status |
 |---|---|
-| `feat/adr-0009-tool-surface-refactor` | Active implementation branch for the ADR-0009 tool surface refactor. |
-| `main` | Stable baseline before ADR-0009 deployment. |
+| `main` | Active. ADR-0009 merged and deployed. |
 
 ## Blockers
 
-- None in the repo. Deployment to Hub and any AGENTS.md follow-up are separate steps.
+- None.
 
 ## What's Next
 
-1. Deploy the ADR-0009 branch to Hub and verify the live MCP tool list matches the 11-tool surface.
-2. Update repo/root AGENTS guidance separately if the operator still wants the `read_task_output` / `stop_task` wording reflected there.
-3. Exercise the staged pull/push flow end-to-end against a real remote host after deployment.
+1. Clean up stale `feat/adr-0009-tool-surface-refactor` branch after confirming no regressions.
+2. Monitor staged file cleanup (/tmp/maestro/staged/) TTL behavior over the next few days.
+3. Consider whether `/tasks/{id}/result` HTTP endpoint is still needed now that `read_task_output` covers the use case via MCP.
 
 ## Completed (recent)
 
-- Removed zombie registrations: `observe`, `steer`, `poll`, `gemini_sessions`.
-- Renamed the task/file/orchestration tools to the ADR-0009 surface.
-- Merged `service` into `run_task(persistent=True)` and routed all `command=` execution through tmux + auto-promote.
-- Added curl-prepared `transfer_pull_file`, `transfer_push_file`, and `read_task_output(full=True)` paths that keep file bytes out of MCP results.
-- Split `task_result` into `maestro/task_result.py`.
+- **ADR-0009 full implementation** — 14→11 tools, all phases deployed and verified.
+- Removed zombie tools: `observe`, `steer`, `poll`, `gemini_sessions`.
+- Renamed all tools to category+action convention (_file, _task, _agent).
+- Merged `service` into `run_task(persistent=True)`.
+- Unified all execution through tmux + auto-promote. No more raw SSH blocking.
+- Added curl-prepared `transfer_pull_file`, `transfer_push_file` (files never in MCP context).
+- Added `read_task_output` with preview/tail/head/full modes.
+- `stop_task(graceful=True)` sends SIGINT before killing.
+- Extracted `task_result` to its own module.
+- `current_tasks` no longer exposes container-internal paths.
+- AGENTS.md updated on all fleet hosts (rules 10-12).
+- CLAUDE.md rewritten with quick reference card, decision trees, Cellar/Maestro identity callout.
+- 62/62 tests passing.
