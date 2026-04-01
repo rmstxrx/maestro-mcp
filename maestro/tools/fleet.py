@@ -403,8 +403,8 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     async def read_file(host: str, path: str) -> str:
         """Read a small file from a fleet host (≤16 KB, 10 s timeout).
 
-        Returns file content directly. For larger files, use the
-        transfer relay (prepare_relay + curl pull).
+        Returns file content directly. For larger files, use
+        transfer_pull_file(host, remote_path).
 
         This is an orchestrator tool — dispatched agents use their
         native filesystem instead."""
@@ -440,7 +440,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         """Write a small file to a fleet host (≤16 KB, 10 s timeout).
 
         Content is piped via stdin — no shell escaping issues.
-        For larger files, use the transfer relay (prepare_relay + curl push).
+        For larger files, use transfer_push_file(host, remote_path).
 
         This is an orchestrator tool — dispatched agents use their
         native filesystem instead."""

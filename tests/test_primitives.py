@@ -287,8 +287,10 @@ class TestMaestroConfig:
 
 class TestCurrentTasksTool:
     @pytest.mark.asyncio
-    async def test_returns_compact_filtered_rows(self, monkeypatch):
+    async def test_returns_compact_filtered_rows(self, monkeypatch, tmp_path):
         now = datetime.now(timezone.utc)
+        output_path = tmp_path / "output.txt"
+        output_path.write_text("captured output", encoding="utf-8")
 
         class _Ledger:
             def query(self, *, status=None, agent=None, host=None, last=10):
@@ -307,7 +309,7 @@ class TestCurrentTasksTool:
                         dispatched_at=now - timedelta(minutes=12),
                         completed_at=now - timedelta(minutes=7),
                         return_code=0,
-                        output_file="/tmp/output.txt",
+                        output_file=str(output_path),
                         result_url="https://example.test/tasks/abc123/result",
                     )
                 ]
@@ -332,10 +334,150 @@ class TestCurrentTasksTool:
                     "dispatched_at": "12m ago",
                     "completed_at": (now - timedelta(minutes=7)).isoformat(),
                     "return_code": 0,
-                    "output_file": "/tmp/output.txt",
-                    "result_url": "https://example.test/tasks/abc123/result",
+                    "output_available": True,
+                    "output_hint": "Use read_task_output('abc123') to read.",
                 }
             ]
+        }
+
+
+class TestTransferTools:
+    @pytest.mark.asyncio
+    async def test_transfer_pull_file_returns_staged_curl(self, monkeypatch):
+        async def _fake_pull(host, remote_path):
+            assert host == "apollyon"
+            assert remote_path == "/tmp/example.txt"
+            return {
+                "status": "staged",
+                "host": host,
+                "remote_path": remote_path,
+                "bytes": 12,
+                "filename": "example.txt",
+                "curl": "curl -s -o example.txt ...",
+            }
+
+        monkeypatch.setattr("maestro.relay.transfer_pull_impl", _fake_pull)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "transfer_pull_file",
+            {"host": "apollyon", "remote_path": "/tmp/example.txt"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "staged"
+        assert result["bytes"] == 12
+        assert result["filename"] == "example.txt"
+
+    @pytest.mark.asyncio
+    async def test_transfer_push_file_returns_ready_curl(self, monkeypatch):
+        async def _fake_push(host, remote_path):
+            assert host == "eden-wsl"
+            assert remote_path == "/tmp/config.yaml"
+            return {
+                "status": "ready",
+                "host": host,
+                "remote_path": remote_path,
+                "curl": "curl -s -F 'file=@<LOCAL_FILE>' ...",
+            }
+
+        monkeypatch.setattr("maestro.relay.transfer_push_prep", _fake_push)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "transfer_push_file",
+            {"host": "eden-wsl", "remote_path": "/tmp/config.yaml"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "ready"
+        assert "curl" in result
+
+
+class TestReadTaskOutputTool:
+    @pytest.mark.asyncio
+    async def test_returns_preview_for_captured_output(self, monkeypatch, tmp_path):
+        output_path = tmp_path / "task.txt"
+        output_path.write_text("line 1\nline 2\n", encoding="utf-8")
+
+        class _Ledger:
+            def get(self, task_id):
+                assert task_id == "abc123"
+                return TaskLedgerEntry(
+                    task_id="abc123",
+                    agent="exec",
+                    host="test-host",
+                    prompt="echo test",
+                    status="done",
+                    client_class="local",
+                    dispatched_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                    completed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                    return_code=0,
+                    output_file=str(output_path),
+                )
+
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool("read_task_output", {"task_id": "abc123"})
+
+        result = json.loads(call_result["result"])
+        assert result["task_id"] == "abc123"
+        assert result["status"] == "done"
+        assert result["bytes"] == output_path.stat().st_size
+        assert result["content_preview"] == "line 1\nline 2\n"
+        assert result["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_full_mode_returns_download_curl(self, monkeypatch, tmp_path):
+        output_path = tmp_path / "task.txt"
+        output_path.write_text("full output", encoding="utf-8")
+
+        class _Ledger:
+            def get(self, task_id):
+                return TaskLedgerEntry(
+                    task_id=task_id,
+                    agent="exec",
+                    host="test-host",
+                    prompt="echo test",
+                    status="done",
+                    client_class="local",
+                    dispatched_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                    completed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                    return_code=0,
+                    output_file=str(output_path),
+                )
+
+        async def _fake_pull(host, remote_path):
+            assert host == "hub"
+            assert remote_path == str(output_path)
+            return {
+                "status": "staged",
+                "bytes": 11,
+                "filename": "task.txt",
+                "curl": "curl -s -o task.txt ...",
+            }
+
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
+        monkeypatch.setattr("maestro.hosts._local_host_name", lambda: "hub")
+        monkeypatch.setattr("maestro.relay.transfer_pull_impl", _fake_pull)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "read_task_output",
+            {"task_id": "abc123", "full": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result == {
+            "task_id": "abc123",
+            "status": "done",
+            "bytes": 11,
+            "curl": "curl -s -o task.txt ...",
         }
 
 

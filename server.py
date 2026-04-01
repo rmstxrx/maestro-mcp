@@ -35,7 +35,8 @@ from maestro.hosts import (
 )
 from maestro.local import _local_run, configure_local
 from maestro.mux import configure_mux
-from maestro.relay import configure_relay, task_result, transfer_push, transfer_pull
+from maestro.relay import configure_relay, transfer_push, transfer_pull
+from maestro.task_result import task_result
 from maestro.tools.fleet import register_fleet_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
