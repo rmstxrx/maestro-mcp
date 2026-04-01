@@ -275,11 +275,6 @@ class TestOrchestraTruncate:
 # ---------------------------------------------------------------------------
 
 class TestMaestroConfig:
-    def test_orchestra_output_dir_is_env_overridable(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("MAESTRO_ORCHESTRA_OUTPUT_DIR", str(tmp_path))
-        config = MaestroConfig.from_env()
-        assert config.orchestra_output_dir == tmp_path
-
     def test_trusted_client_ids_are_loaded_from_env(self, monkeypatch):
         monkeypatch.setenv("MAESTRO_TRUSTED_CLIENT_IDS", " alpha, beta ,, gamma ")
         config = MaestroConfig.from_env()
@@ -289,52 +284,6 @@ class TestMaestroConfig:
 # ---------------------------------------------------------------------------
 # Fleet tools
 # ---------------------------------------------------------------------------
-
-class TestGeminiSessions:
-    @pytest.mark.asyncio
-    async def test_wraps_success_output(self, monkeypatch):
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
-
-        async def _fake_run(host, command, timeout):
-            assert host == "test-host"
-            assert command == "gemini --list-sessions"
-            assert timeout == 15
-            return 0, "session-1\nsession-2"
-
-        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
-
-        result = json.loads(call_result["result"])
-        assert result == {
-            "host": "test-host",
-            "sessions": "session-1\nsession-2",
-        }
-
-    @pytest.mark.asyncio
-    async def test_wraps_error_output(self, monkeypatch):
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
-
-        async def _fake_run(host, command, timeout):
-            assert host == "test-host"
-            assert command == "gemini --list-sessions"
-            assert timeout == 15
-            return 1, "gemini not installed"
-
-        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
-
-        result = json.loads(call_result["result"])
-        assert result == {
-            "host": "test-host",
-            "error": "gemini not installed",
-        }
-
 
 class TestTasksTool:
     @pytest.mark.asyncio
@@ -388,46 +337,6 @@ class TestTasksTool:
                 }
             ]
         }
-
-
-class TestPollTool:
-    @pytest.mark.asyncio
-    async def test_returns_metadata_only_for_running_task(self, monkeypatch):
-        dispatched_at = datetime.now(timezone.utc) - timedelta(seconds=90)
-
-        class _Ledger:
-            def get(self, task_id):
-                assert task_id == "abc123"
-                return TaskLedgerEntry(
-                    task_id="abc123",
-                    agent="codex",
-                    host="test-host",
-                    prompt="Fix the issue",
-                    status="running",
-                    client_class="local",
-                    dispatched_at=dispatched_at,
-                    output_file="/tmp/output.txt",
-                    result_url="https://example.test/tasks/abc123/result",
-                )
-
-        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("poll", {"task_id": "abc123"})
-
-        result = json.loads(call_result["result"])
-        assert result["task_id"] == "abc123"
-        assert result["agent"] == "codex"
-        assert result["host"] == "test-host"
-        assert result["status"] == "running"
-        assert result["dispatched_at"] == dispatched_at.isoformat()
-        assert result["completed_at"] is None
-        assert result["return_code"] is None
-        assert result["output_file"] == "/tmp/output.txt"
-        assert result["result_url"] == "https://example.test/tasks/abc123/result"
-        assert 89.0 <= result["elapsed_seconds"] <= 91.0
-        assert "output_preview" not in result
 
 
 class TestOrchestraRunCli:

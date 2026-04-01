@@ -1242,36 +1242,3 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                     row["overtime"] = elapsed > entry.expected_runtime
             rows.append(row)
         return json.dumps({"tasks": rows}, ensure_ascii=False)
-
-    @mcp.tool()
-    async def poll(task_id: str) -> str:
-        """Poll a specific task for latest status."""
-        from maestro.tools.orchestra import get_task_ledger
-
-        ledger = get_task_ledger()
-        if ledger is None:
-            return json.dumps({"error": "Task ledger is not configured"})
-
-        entry = ledger.get(task_id)
-        if entry is None:
-            return json.dumps({"error": "Task not found", "task_id": task_id})
-
-        result = {
-            "task_id": entry.task_id,
-            "agent": entry.agent,
-            "host": entry.host,
-            "status": entry.status,
-            "prompt": entry.prompt,
-            "dispatched_at": entry.dispatched_at.isoformat(),
-            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
-            "return_code": entry.return_code,
-            "output_file": entry.output_file,
-            "result_url": entry.result_url,
-        }
-
-        if entry.status == "running":
-            result["elapsed_seconds"] = round(
-                (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds(),
-                1,
-            )
-        return json.dumps(result)

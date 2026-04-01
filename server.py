@@ -192,11 +192,11 @@ def _build_instructions(transport: str = "http") -> str:
             "  - Remote fleet hosts (listed below)\n"
             "  - Agent dispatch (codex, gemini, claude) to any host including local\n"
             "  - Fleet status, transfer, add_host, reconnect_host, list_ssh_hosts, agent_status\n"
-            "  - Orchestra tools: prepare_relay, poll, read_output, tasks\n\n"
+            "  - Orchestra tools: prepare_relay, tasks\n\n"
             "Remote fleet hosts:\n" + remote_block
         )
 
-    dispatch_rule = "All dispatch tools return a task_id. Use poll(task_id) for results."
+    dispatch_rule = "All dispatch tools return a task_id. Use tasks() for status."
     host_list = ", ".join(HOSTS.keys())
     instructions = f"Hosts: {host_list}. {dispatch_rule}"
     if len(instructions) <= 300:

@@ -229,50 +229,6 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
-    async def gemini_sessions(host: str) -> str:
-        """List Gemini CLI sessions on a host."""
-        if block := _check_local_self_reference(host):
-            return block
-        try:
-            _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-
-        rc, output = await _orchestra_run_cli(host, "gemini --list-sessions", timeout=15)
-        if rc != 0:
-            return json.dumps({"host": host, "error": output})
-        return json.dumps({"host": host, "sessions": output})
-
-
-    @mcp.tool()
-    async def observe(task_id: str, lines: int = 50) -> str:
-        """Capture live output from a running task's tmux pane (~50 lines).
-
-        Control-plane tool for inspecting dispatched agents and services
-        mid-run. Returns the current screen state, not cumulative output.
-        For bulk output retrieval, use relay-pull of the outbox file."""
-        from maestro.mux import capture_pane
-        try:
-            output = await capture_pane(task_id, lines=lines)
-            return json.dumps({"task_id": task_id, "lines": lines, "output": output})
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
-    async def steer(task_id: str, keys: str) -> str:
-        """Send keystrokes to a running task's tmux pane.
-
-        Control-plane tool for interacting with dispatched agents —
-        approval prompts, Ctrl+C (send as 'C-c'), input text.
-        Pure control signal, no data payload."""
-        from maestro.mux import send_keys
-        try:
-            await send_keys(task_id, keys)
-            return json.dumps({"task_id": task_id, "keys_sent": len(keys), "status": "ok"})
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
     async def status(host: str = "", agents: bool = False) -> str:
         """Fleet health check with auto-reconnect and optional agent discovery (ADR-0007).
 
