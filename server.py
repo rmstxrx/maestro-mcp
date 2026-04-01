@@ -186,19 +186,22 @@ def _build_instructions(transport: str = "http") -> str:
             f"You are running locally on {local_name}"
             + (f" ({local_desc})" if local_desc else "")
             + ".\n\n"
-            "CRITICAL: Do NOT use Maestro run_task/read_file/write_file to target "
+            "CRITICAL: Do NOT use Maestro run_task/read_file/write_file/transfer_* to target "
             + (local_name or "this host") + ".\n"
             "You have native tools (Bash, filesystem) that are faster and more capable.\n"
             "Maestro will REJECT local-targeting commands from local agents.\n\n"
             "Use Maestro ONLY for:\n"
             "  - Remote fleet hosts (listed below)\n"
-            "  - Agent dispatch (codex, gemini, claude) to any host including local\n"
+            "  - Agent dispatch via dispatch_agent to any host including local\n"
             "  - Fleet status and remote task/file operations\n"
-            "  - Orchestra tools: prepare_relay, current_tasks\n\n"
+            "  - Orchestra tools: current_tasks, read_task_output, prepare_relay\n\n"
             "Remote fleet hosts:\n" + remote_block
         )
 
-    dispatch_rule = "All dispatch tools return a task_id. Use current_tasks() for status."
+    dispatch_rule = (
+        "All dispatch tools return a task_id. "
+        "Use current_tasks() and read_task_output() for status and output."
+    )
     host_list = ", ".join(HOSTS.keys())
     instructions = f"Hosts: {host_list}. {dispatch_rule}"
     if len(instructions) <= 300:
