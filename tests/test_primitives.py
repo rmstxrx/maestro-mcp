@@ -275,11 +275,6 @@ class TestOrchestraTruncate:
 # ---------------------------------------------------------------------------
 
 class TestMaestroConfig:
-    def test_orchestra_output_dir_is_env_overridable(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("MAESTRO_ORCHESTRA_OUTPUT_DIR", str(tmp_path))
-        config = MaestroConfig.from_env()
-        assert config.orchestra_output_dir == tmp_path
-
     def test_trusted_client_ids_are_loaded_from_env(self, monkeypatch):
         monkeypatch.setenv("MAESTRO_TRUSTED_CLIENT_IDS", " alpha, beta ,, gamma ")
         config = MaestroConfig.from_env()
@@ -290,56 +285,12 @@ class TestMaestroConfig:
 # Fleet tools
 # ---------------------------------------------------------------------------
 
-class TestGeminiSessions:
+class TestCurrentTasksTool:
     @pytest.mark.asyncio
-    async def test_wraps_success_output(self, monkeypatch):
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
-
-        async def _fake_run(host, command, timeout):
-            assert host == "test-host"
-            assert command == "gemini --list-sessions"
-            assert timeout == 15
-            return 0, "session-1\nsession-2"
-
-        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
-
-        result = json.loads(call_result["result"])
-        assert result == {
-            "host": "test-host",
-            "sessions": "session-1\nsession-2",
-        }
-
-    @pytest.mark.asyncio
-    async def test_wraps_error_output(self, monkeypatch):
-        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: object())
-
-        async def _fake_run(host, command, timeout):
-            assert host == "test-host"
-            assert command == "gemini --list-sessions"
-            assert timeout == 15
-            return 1, "gemini not installed"
-
-        monkeypatch.setattr("maestro.tools.fleet._orchestra_run_cli", _fake_run)
-
-        mcp = FastMCP("test")
-        _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("gemini_sessions", {"host": "test-host"})
-
-        result = json.loads(call_result["result"])
-        assert result == {
-            "host": "test-host",
-            "error": "gemini not installed",
-        }
-
-
-class TestTasksTool:
-    @pytest.mark.asyncio
-    async def test_returns_compact_filtered_rows(self, monkeypatch):
+    async def test_returns_compact_filtered_rows(self, monkeypatch, tmp_path):
         now = datetime.now(timezone.utc)
+        output_path = tmp_path / "output.txt"
+        output_path.write_text("captured output", encoding="utf-8")
 
         class _Ledger:
             def query(self, *, status=None, agent=None, host=None, last=10):
@@ -358,7 +309,7 @@ class TestTasksTool:
                         dispatched_at=now - timedelta(minutes=12),
                         completed_at=now - timedelta(minutes=7),
                         return_code=0,
-                        output_file="/tmp/output.txt",
+                        output_file=str(output_path),
                         result_url="https://example.test/tasks/abc123/result",
                     )
                 ]
@@ -368,7 +319,7 @@ class TestTasksTool:
         mcp = FastMCP("test")
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
-            "tasks",
+            "current_tasks",
             {"status": "done", "agent": "codex", "host": "test-host", "last": 5},
         )
 
@@ -383,51 +334,151 @@ class TestTasksTool:
                     "dispatched_at": "12m ago",
                     "completed_at": (now - timedelta(minutes=7)).isoformat(),
                     "return_code": 0,
-                    "output_file": "/tmp/output.txt",
-                    "result_url": "https://example.test/tasks/abc123/result",
+                    "output_available": True,
+                    "output_hint": "Use read_task_output('abc123') to read.",
                 }
             ]
         }
 
 
-class TestPollTool:
+class TestTransferTools:
     @pytest.mark.asyncio
-    async def test_returns_metadata_only_for_running_task(self, monkeypatch):
-        dispatched_at = datetime.now(timezone.utc) - timedelta(seconds=90)
+    async def test_transfer_pull_file_returns_staged_curl(self, monkeypatch):
+        async def _fake_pull(host, remote_path):
+            assert host == "apollyon"
+            assert remote_path == "/tmp/example.txt"
+            return {
+                "status": "staged",
+                "host": host,
+                "remote_path": remote_path,
+                "bytes": 12,
+                "filename": "example.txt",
+                "curl": "curl -s -o example.txt ...",
+            }
+
+        monkeypatch.setattr("maestro.relay.transfer_pull_impl", _fake_pull)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "transfer_pull_file",
+            {"host": "apollyon", "remote_path": "/tmp/example.txt"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "staged"
+        assert result["bytes"] == 12
+        assert result["filename"] == "example.txt"
+
+    @pytest.mark.asyncio
+    async def test_transfer_push_file_returns_ready_curl(self, monkeypatch):
+        async def _fake_push(host, remote_path):
+            assert host == "eden-wsl"
+            assert remote_path == "/tmp/config.yaml"
+            return {
+                "status": "ready",
+                "host": host,
+                "remote_path": remote_path,
+                "curl": "curl -s -F 'file=@<LOCAL_FILE>' ...",
+            }
+
+        monkeypatch.setattr("maestro.relay.transfer_push_prep", _fake_push)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "transfer_push_file",
+            {"host": "eden-wsl", "remote_path": "/tmp/config.yaml"},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "ready"
+        assert "curl" in result
+
+
+class TestReadTaskOutputTool:
+    @pytest.mark.asyncio
+    async def test_returns_preview_for_captured_output(self, monkeypatch, tmp_path):
+        output_path = tmp_path / "task.txt"
+        output_path.write_text("line 1\nline 2\n", encoding="utf-8")
 
         class _Ledger:
             def get(self, task_id):
                 assert task_id == "abc123"
                 return TaskLedgerEntry(
                     task_id="abc123",
-                    agent="codex",
+                    agent="exec",
                     host="test-host",
-                    prompt="Fix the issue",
-                    status="running",
+                    prompt="echo test",
+                    status="done",
                     client_class="local",
-                    dispatched_at=dispatched_at,
-                    output_file="/tmp/output.txt",
-                    result_url="https://example.test/tasks/abc123/result",
+                    dispatched_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                    completed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                    return_code=0,
+                    output_file=str(output_path),
                 )
 
         monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
 
         mcp = FastMCP("test")
         _register_all_tools(mcp)
-        _, call_result = await mcp.call_tool("poll", {"task_id": "abc123"})
+        _, call_result = await mcp.call_tool("read_task_output", {"task_id": "abc123"})
 
         result = json.loads(call_result["result"])
         assert result["task_id"] == "abc123"
-        assert result["agent"] == "codex"
-        assert result["host"] == "test-host"
-        assert result["status"] == "running"
-        assert result["dispatched_at"] == dispatched_at.isoformat()
-        assert result["completed_at"] is None
-        assert result["return_code"] is None
-        assert result["output_file"] == "/tmp/output.txt"
-        assert result["result_url"] == "https://example.test/tasks/abc123/result"
-        assert 89.0 <= result["elapsed_seconds"] <= 91.0
-        assert "output_preview" not in result
+        assert result["status"] == "done"
+        assert result["bytes"] == output_path.stat().st_size
+        assert result["content_preview"] == "line 1\nline 2\n"
+        assert result["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_full_mode_returns_download_curl(self, monkeypatch, tmp_path):
+        output_path = tmp_path / "task.txt"
+        output_path.write_text("full output", encoding="utf-8")
+
+        class _Ledger:
+            def get(self, task_id):
+                return TaskLedgerEntry(
+                    task_id=task_id,
+                    agent="exec",
+                    host="test-host",
+                    prompt="echo test",
+                    status="done",
+                    client_class="local",
+                    dispatched_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                    completed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                    return_code=0,
+                    output_file=str(output_path),
+                )
+
+        async def _fake_pull(host, remote_path):
+            assert host == "hub"
+            assert remote_path == str(output_path)
+            return {
+                "status": "staged",
+                "bytes": 11,
+                "filename": "task.txt",
+                "curl": "curl -s -o task.txt ...",
+            }
+
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
+        monkeypatch.setattr("maestro.hosts._local_host_name", lambda: "hub")
+        monkeypatch.setattr("maestro.relay.transfer_pull_impl", _fake_pull)
+
+        mcp = FastMCP("test")
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "read_task_output",
+            {"task_id": "abc123", "full": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result == {
+            "task_id": "abc123",
+            "status": "done",
+            "bytes": 11,
+            "curl": "curl -s -o task.txt ...",
+        }
 
 
 class TestOrchestraRunCli:
@@ -517,13 +568,21 @@ class TestDispatchGuard:
         assert fleet_tools._check_agent_dispatch_bypass("tmux send-keys -t gemini-abc 'hello' Enter") is None
 
     @pytest.mark.asyncio
-    async def test_exec_uses_staged_mode(self, monkeypatch):
+    async def test_run_task_uses_client_block_timeout(self, monkeypatch, tmp_path):
         mcp = FastMCP("test")
         captured: dict[str, object] = {}
 
         class _cfg:
             alias = "alias"
             shell = HostShell.BASH
+
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_client_context",
+            lambda: SimpleNamespace(
+                classification="remote",
+                profile={"block_timeout_exec": 5},
+            ),
+        )
 
         async def _fake_window(task_id, *_, **kwargs):
             captured["kwargs"] = kwargs
@@ -533,10 +592,15 @@ class TestDispatchGuard:
             captured["agent"] = kwargs["agent"]
             captured["prompt"] = kwargs["prompt"]
             captured["block_timeout"] = kwargs["block_timeout"]
+            captured["task_type"] = kwargs["task_type"]
             await exec_fn()
             return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
 
         monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_output_path",
+            lambda task_id: tmp_path / f"{task_id}.txt",
+        )
         async def _fake_wait(task_id, timeout=300):
             return 0
 
@@ -545,7 +609,7 @@ class TestDispatchGuard:
         monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
         _register_all_tools(mcp)
         _, call_result = await mcp.call_tool(
-            "exec",
+            "run_task",
             {"host": "test-host", "task_id": "task-id"},
         )
 
@@ -553,8 +617,89 @@ class TestDispatchGuard:
         assert "staged" not in captured["kwargs"]
         assert captured["agent"] == "exec"
         assert captured["prompt"] == "task-id"
-        assert captured["block_timeout"] == 0
+        assert captured["block_timeout"] == 5
+        assert captured["task_type"] == "run"
         assert result["task_id"] == "task-id"
+
+    @pytest.mark.asyncio
+    async def test_run_task_persistent_forces_background_mode(self, monkeypatch):
+        mcp = FastMCP("test")
+        captured: dict[str, object] = {}
+
+        class _cfg:
+            alias = "alias"
+            shell = HostShell.BASH
+
+        monkeypatch.setattr(
+            "maestro.tools.fleet.get_client_context",
+            lambda: SimpleNamespace(
+                classification="local",
+                profile={"block_timeout_exec": 60},
+            ),
+        )
+
+        async def _fake_auto_promote(exec_fn, **kwargs):
+            captured["block_timeout"] = kwargs["block_timeout"]
+            captured["task_type"] = kwargs["task_type"]
+            return json.dumps({"auto_promoted": True, "task_id": kwargs["task_id"]})
+
+        monkeypatch.setattr("maestro.tools.fleet._resolve_host", lambda host: _cfg())
+        monkeypatch.setattr("maestro.tools.fleet._auto_promote", _fake_auto_promote)
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "run_task",
+            {"host": "test-host", "command": "sleep 60", "persistent": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert captured["block_timeout"] == 0
+        assert captured["task_type"] == "service"
+        assert result["persistent"] is True
+
+    @pytest.mark.asyncio
+    async def test_stop_task_graceful_escalates_after_sigint(self, monkeypatch):
+        mcp = FastMCP("test")
+        events: list[str] = []
+
+        class _Ledger:
+            def update(self, task_id, **fields):
+                events.append(f"ledger:{task_id}:{fields['status']}")
+
+        async def _fake_send_keys(task_id, keys):
+            events.append(f"send:{task_id}:{keys}")
+
+        async def _fake_sleep(seconds):
+            events.append(f"sleep:{seconds}")
+
+        async def _fake_list_windows():
+            return [{"name": "task-deadbeef"}]
+
+        async def _fake_kill(task_id):
+            events.append(f"kill:{task_id}")
+
+        monkeypatch.setattr("maestro.tools.fleet.send_keys", _fake_send_keys)
+        monkeypatch.setattr("maestro.tools.fleet.asyncio.sleep", _fake_sleep)
+        monkeypatch.setattr("maestro.tools.fleet.list_windows", _fake_list_windows)
+        monkeypatch.setattr("maestro.tools.fleet.kill_window", _fake_kill)
+        monkeypatch.setattr("maestro.tools.fleet._save_registry", lambda: events.append("save"))
+        monkeypatch.setattr("maestro.tools.orchestra.get_task_ledger", lambda: _Ledger())
+
+        _register_all_tools(mcp)
+        _, call_result = await mcp.call_tool(
+            "stop_task",
+            {"task_id": "deadbeef", "graceful": True},
+        )
+
+        result = json.loads(call_result["result"])
+        assert result["status"] == "killed"
+        assert result["graceful"] is True
+        assert events == [
+            "send:deadbeef:C-c",
+            "sleep:3",
+            "kill:deadbeef",
+            "save",
+            "ledger:deadbeef:killed",
+        ]
 
 
 # ---------------------------------------------------------------------------

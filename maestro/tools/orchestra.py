@@ -819,6 +819,7 @@ async def _auto_promote(
     output_holder: list[Path | None] | None = None,
     task_id: str | None = None,
     expected_runtime: int | None = None,
+    task_type: str = "",
 ) -> str:
     """Run execute_fn with adaptive blocking.
 
@@ -842,6 +843,7 @@ async def _auto_promote(
         dispatched_at=started_at,
         output_file=output_file,
         expected_runtime=expected_runtime,
+        task_type=task_type,
     )
 
     work_task = asyncio.create_task(execute_fn())
@@ -926,21 +928,31 @@ async def _auto_promote(
     async def _monitor() -> None:
         try:
             result = await work_task
-            ts.status = "done"
-            ts.result_json = result
+            if ts.status != "killed":
+                ts.status = "done"
+                ts.result_json = result
         except asyncio.CancelledError:
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": "cancelled", "task_id": task_id, "agent": agent,
-            })
+            if ts.status != "killed":
+                ts.status = "failed"
+                ts.result_json = json.dumps({
+                    "error": "cancelled", "task_id": task_id, "agent": agent,
+                })
         except Exception as exc:
-            logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": str(exc), "task_id": task_id, "agent": agent,
-            })
+            if ts.status != "killed":
+                logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
+                ts.status = "failed"
+                ts.result_json = json.dumps({
+                    "error": str(exc), "task_id": task_id, "agent": agent,
+                })
         finally:
-            ts.finished_at = datetime.now(timezone.utc)
+            if ts.status == "killed" and ts.result_json is None:
+                ts.result_json = json.dumps({
+                    "task_id": task_id,
+                    "agent": agent,
+                    "host": host,
+                    "status": "killed",
+                })
+            ts.finished_at = ts.finished_at or datetime.now(timezone.utc)
             ts._done_event.set()
             _complete_ledger_entry(
                 task_id=task_id,
@@ -1046,7 +1058,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             raise ValueError(f"Unknown agent: {agent}")
 
     @mcp.tool()
-    async def dispatch(
+    async def dispatch_agent(
         host: str,
         agent: str,
         prompt: str,
@@ -1081,12 +1093,12 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                    No model or effort flags. Use sparingly.
 
         TASK ROUTING — before calling dispatch, ask:
-          • Is this a simple file read, ls, cat, or grep? → Use exec, not dispatch.
+          • Is this a simple file read, ls, cat, or grep? → Use run_task, not dispatch_agent.
           • Is this code implementation? → codex.
           • Is this review, research, or reading a large file? → gemini.
           • Is this ambiguous and cross-domain? → claude.
 
-        Returns {auto_promoted: true, task_id}. Use tasks() for status.
+        Returns {auto_promoted: true, task_id}. Use current_tasks() for status.
         Timeout: 6h hard ceiling (system policy).
         expected_runtime: your honest estimate (seconds). Recorded verbatim.
         Validates model and reasoning_effort against the agent catalog."""
@@ -1175,6 +1187,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             task_id=task_id,
             expected_runtime=ert,
             output_file_factory=get_output_path,
+            task_type="dispatch",
         )
 
         if not val_warnings:
@@ -1186,7 +1199,11 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def prepare_relay() -> str:
-        """Get an ephemeral bearer token for the HTTP transfer relay and task result endpoints. Valid for 1 hour. Use with: curl -H "Authorization: Bearer <token>" on /transfer/push, /transfer/pull, /tasks/{id}/result."""
+        """Get an ephemeral bearer token for direct relay or task-result HTTP calls.
+
+        Rarely needed: transfer_pull_file and transfer_push_file prepare auth
+        automatically. Use this for direct /tasks/{id}/result polling or other
+        custom relay workflows."""
         import secrets as _s
         from maestro.relay import register_ephemeral_token as _reg
 
@@ -1195,7 +1212,53 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"value": value, "ttl_seconds": 3600})
 
     @mcp.tool()
-    async def tasks(
+    async def transfer_pull_file(host: str, remote_path: str) -> str:
+        """Stage a fleet file server-side and return a ready-to-run curl command."""
+        from maestro.relay import transfer_pull_impl
+
+        try:
+            result = await transfer_pull_impl(host, remote_path)
+        except FileNotFoundError as exc:
+            return json.dumps({
+                "error": "not_found",
+                "host": host,
+                "remote_path": remote_path,
+                "detail": str(exc),
+            })
+        except ValueError as exc:
+            return json.dumps({
+                "error": "validation_error",
+                "host": host,
+                "remote_path": remote_path,
+                "detail": str(exc),
+            })
+        except RuntimeError as exc:
+            return json.dumps({
+                "error": "transfer_failed",
+                "host": host,
+                "remote_path": remote_path,
+                "detail": str(exc),
+            })
+        return json.dumps(result, ensure_ascii=False)
+
+    @mcp.tool()
+    async def transfer_push_file(host: str, remote_path: str) -> str:
+        """Prepare an authenticated curl command for uploading a local file."""
+        from maestro.relay import transfer_push_prep
+
+        try:
+            result = await transfer_push_prep(host, remote_path)
+        except ValueError as exc:
+            return json.dumps({
+                "error": "validation_error",
+                "host": host,
+                "remote_path": remote_path,
+                "detail": str(exc),
+            })
+        return json.dumps(result, ensure_ascii=False)
+
+    @mcp.tool()
+    async def current_tasks(
         status: str | None = None,
         agent: str | None = None,
         host: str | None = None,
@@ -1229,8 +1292,12 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 "dispatched_at": _format_relative_time(entry.dispatched_at, now),
                 "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
                 "return_code": entry.return_code,
-                "output_file": entry.output_file,
-                "result_url": entry.result_url,
+                "output_available": bool(entry.output_file and Path(entry.output_file).exists()),
+                "output_hint": (
+                    f"Use read_task_output('{entry.task_id}') to read."
+                    if entry.output_file and Path(entry.output_file).exists()
+                    else "No captured output available for this task."
+                ),
             }
             if entry.task_type:
                 row["task_type"] = entry.task_type
@@ -1244,9 +1311,37 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         return json.dumps({"tasks": rows}, ensure_ascii=False)
 
     @mcp.tool()
-    async def poll(task_id: str) -> str:
-        """Poll a specific task for latest status."""
-        from maestro.tools.orchestra import get_task_ledger
+    async def read_task_output(
+        task_id: str,
+        tail: int | None = None,
+        head: int | None = None,
+        full: bool = False,
+    ) -> str:
+        """Read or download captured task output by task ID."""
+        if tail is not None and head is not None:
+            return json.dumps({
+                "error": "validation_error",
+                "detail": "Provide tail or head, not both.",
+                "task_id": task_id,
+            })
+        if full and (tail is not None or head is not None):
+            return json.dumps({
+                "error": "validation_error",
+                "detail": "full=True cannot be combined with tail or head.",
+                "task_id": task_id,
+            })
+        if tail is not None and tail <= 0:
+            return json.dumps({
+                "error": "validation_error",
+                "detail": "tail must be > 0",
+                "task_id": task_id,
+            })
+        if head is not None and head <= 0:
+            return json.dumps({
+                "error": "validation_error",
+                "detail": "head must be > 0",
+                "task_id": task_id,
+            })
 
         ledger = get_task_ledger()
         if ledger is None:
@@ -1255,23 +1350,67 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
         entry = ledger.get(task_id)
         if entry is None:
             return json.dumps({"error": "Task not found", "task_id": task_id})
+        if not entry.output_file:
+            return json.dumps({
+                "error": "output_unavailable",
+                "task_id": task_id,
+                "status": entry.status,
+                "detail": "No captured output is available for this task.",
+            })
 
-        result = {
-            "task_id": entry.task_id,
-            "agent": entry.agent,
-            "host": entry.host,
+        output_path = Path(entry.output_file)
+        if not output_path.exists():
+            return json.dumps({
+                "error": "output_unavailable",
+                "task_id": task_id,
+                "status": entry.status,
+                "detail": "Captured output file not found.",
+            })
+
+        byte_count = output_path.stat().st_size
+
+        if full:
+            from maestro.hosts import _local_host_name
+            from maestro.relay import transfer_pull_impl
+
+            local_host = _local_host_name()
+            if not local_host:
+                return json.dumps({
+                    "error": "not_configured",
+                    "task_id": task_id,
+                    "detail": "No local host is configured for staged downloads.",
+                })
+            result = await transfer_pull_impl(local_host, str(output_path))
+            return json.dumps({
+                "task_id": task_id,
+                "status": entry.status,
+                "bytes": result["bytes"],
+                "curl": result["curl"],
+            }, ensure_ascii=False)
+
+        content = output_path.read_text(encoding="utf-8", errors="replace")
+        base: dict[str, Any] = {
+            "task_id": task_id,
             "status": entry.status,
-            "prompt": entry.prompt,
-            "dispatched_at": entry.dispatched_at.isoformat(),
-            "completed_at": entry.completed_at.isoformat() if entry.completed_at else None,
-            "return_code": entry.return_code,
-            "output_file": entry.output_file,
-            "result_url": entry.result_url,
         }
 
+        if tail is not None or head is not None:
+            lines = content.splitlines()
+            requested = tail if tail is not None else head
+            selected = lines[-requested:] if tail is not None else lines[:requested]
+            base["lines_requested"] = requested
+            base["content"] = "\n".join(selected)
+            if entry.status == "running":
+                base["bytes_so_far"] = byte_count
+            return json.dumps(base, ensure_ascii=False)
+
+        preview_limit = 2000
+        base["bytes"] = byte_count
+        base["content_preview"] = content[:preview_limit]
+        base["truncated"] = len(content) > preview_limit
+        base["hint"] = (
+            "Use tail= or head= for targeted reads, or full=True to download the complete file."
+        )
         if entry.status == "running":
-            result["elapsed_seconds"] = round(
-                (datetime.now(timezone.utc) - entry.dispatched_at).total_seconds(),
-                1,
-            )
-        return json.dumps(result)
+            base["bytes_so_far"] = byte_count
+        return json.dumps(base, ensure_ascii=False)

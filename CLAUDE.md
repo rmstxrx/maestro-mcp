@@ -1,153 +1,177 @@
 # Maestro MCP — Developer Guide
 
-Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It turns a collection of SSH-accessible machines into a unified workspace with Hub-local tmux for execution and completion detection (ADR-0007).
+Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It runs inside a Docker container on Cellar and uses Hub-local tmux for all task execution and tracking.
 
 ## Architecture
 
-All task execution uses **Hub-local tmux**: every `run`, `dispatch`, or `service` creates a tmux window on the Hub that runs `ssh host 'command'` inside it. Maestro captures output and completion status locally — no network crossing needed.
+All task execution uses Hub-local tmux: every `run_task(...)` and `dispatch_agent(...)` creates a tmux window on the Hub. Commands are staged into `/tmp/maestro/inbox/`, executed inside SSH sessions, and tracked in the persistent ledger.
 
-- **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server (stdio or streamable-http).
-- **Core Package (`maestro/`):**
-    - **`mux.py`:** Hub-local tmux primitives — `create_task_window`, `wait_for_completion`, `kill_window`, `list_windows`. Output at `/root/.maestro/task_output/`.
-    - **`tools/fleet.py`:** Fleet tools: `run`, `read`, `write`, `transfer`, `status`, `stop`, `service`.
-    - **`tools/orchestra.py`:** Orchestra tools: `dispatch`, `tasks`, `read_output`, `prepare_relay`. Plus task ledger, auto-promote, scope prefix, agent output management.
-    - **`hosts.py`:** Fleet topology management and `hosts.yaml` parsing. Per-host `allowed_dirs` enforcement.
-    - **`transport.py`:** Persistent SSH ControlMaster lifecycle.
-    - **`local.py`:** Zero-overhead execution for the hub machine (`is_local: true`).
-    - **`relay.py`:** HTTP endpoints for file transfers and task result retrieval.
-    - **`client.py`:** Client classification and per-client execution profiles.
-    - **`config.py`:** Environment-based configuration (`MaestroConfig`).
-    - **`oauth_state.py`:** Atomic JSON persistence for OAuth state.
+- **Entry Point (`server.py`):** Configures FastMCP, sets up OAuth, wires modules, and starts the server.
+- **`maestro/mux.py`:** Hub-local tmux primitives (`stage_script`, `create_task_window`, `wait_for_completion`, `kill_window`).
+- **`maestro/tools/fleet.py`:** Fleet tools: `run_task`, `read_file`, `write_file`, `orchestra_status`, `stop_task`.
+- **`maestro/tools/orchestra.py`:** Orchestra tools: `dispatch_agent`, `current_tasks`, `read_task_output`, `transfer_pull_file`, `transfer_push_file`, `prepare_relay`. Also owns the task registry, task ledger, auto-promote, and scope prefix.
+- **`maestro/relay.py`:** HTTP transfer handlers, bearer auth, ephemeral tokens, and server-side staging for out-of-band downloads/uploads.
+- **`maestro/task_result.py`:** `/tasks/{id}/result` HTTP handler.
+- **`maestro/hosts.py`:** Fleet topology, host registry, allowed-dir enforcement, shell-aware command wrapping.
+- **`maestro/transport.py`:** SSH ControlMaster lifecycle and SCP helpers.
+- **`maestro/local.py`:** Zero-overhead local execution for the hub host (`is_local: true`).
+- **`maestro/client.py`:** Client classification and per-client block timeout profiles.
+- **`maestro/config.py`:** Environment-backed configuration (`MaestroConfig`).
+- **`maestro/oauth_state.py`:** Atomic JSON persistence for OAuth state.
+
+## Cellar vs Maestro
+
+Cellar is the NAS hardware. Maestro is the Docker container running on Cellar. These are not the same thing.
+
+Task output, the task ledger, and relay staging live inside the Maestro container. Tools like `current_tasks`, `read_task_output`, and `transfer_pull_file` exist so callers never need to reason about container paths directly.
 
 ## Tool Surface (11 tools)
 
-### Fleet I/O (4)
+### Quick Reference Card
 
-| Tool | Purpose |
-|---|---|
-| `run` | Execute a command or script on a host. 300s ceiling. Ledger-tracked. |
-| `read` | Read a file from a host. Ledger-tracked. |
-| `write` | Write a file to a host. Ledger-tracked. |
-| `transfer` | SCP file to/from a host. Ledger-tracked. |
+| Category | Tool | Use when |
+|---|---|---|
+| File I/O | `read_file` | Quick inline peek at a remote file, up to 16 KB. |
+| File I/O | `write_file` | Quick inline write of small text content, up to 16 KB. |
+| File I/O | `transfer_pull_file` | Pull any larger file out-of-band via a ready-made curl command. |
+| File I/O | `transfer_push_file` | Push any larger local file out-of-band via a ready-made curl command. |
+| Task Lifecycle | `run_task` | Execute a command or pre-staged script on a host, always through tmux. |
+| Task Lifecycle | `stop_task` | Stop a running task, optionally graceful with `graceful=True`. |
+| Task Lifecycle | `current_tasks` | Query recent ledger entries and running-task status. |
+| Task Lifecycle | `read_task_output` | Preview, tail, head, or download captured task output by `task_id`. |
+| Orchestration | `dispatch_agent` | Launch Codex, Gemini, or Claude as a background task. |
+| Orchestration | `orchestra_status` | Fleet connectivity and optional agent CLI availability checks. |
+| Infrastructure | `prepare_relay` | Get a raw relay token for direct HTTP workflows not covered by the transfer tools. |
 
-### Task Dispatch (2)
+## Decision Trees
 
-| Tool | Purpose |
-|---|---|
-| `dispatch` | Start codex/gemini/claude (oneshot). 6h ceiling. |
-| `service` | Start a long-running process (vLLM, Jupyter, etc.). No ceiling. |
+### Reading a file from a fleet host
 
-### Task Lifecycle (3)
+```text
+Need to peek at contents and reason about them inline?
+  <= 16 KB  -> read_file(host, path)
+  > 16 KB   -> transfer_pull_file(host, path) -> run curl -> view locally
 
-| Tool | Purpose |
-|---|---|
-| `tasks` | Query the ledger. Surfaces overtime flags. Filter by status/agent/host/type. |
-| `stop` | Kill a task (kills tmux window → SSH → remote process). |
-| `read_output` | Read completed task output from Hub disk. |
+Need the file in this sandbox (to edit, diff, or push elsewhere)?
+  Any size  -> transfer_pull_file(host, path) -> run curl
+```
 
-### Infrastructure (2)
+### Writing a file to a fleet host
 
-| Tool | Purpose |
-|---|---|
-| `status` | Fleet health, auto-reconnect, optional agent CLI discovery (`agents=True`). |
-| `prepare_relay` | Ephemeral transfer/task-result token (1h TTL). |
+```text
+Small inline content already in context?
+  <= 16 KB  -> write_file(host, path, content)
+
+Larger, or file already on disk in this sandbox?
+  Any size  -> transfer_push_file(host, path) -> fill in local path -> run curl
+```
+
+### Getting task output
+
+```text
+Need task status?
+  -> current_tasks(status="running")
+
+Need a quick look?
+  -> read_task_output(task_id)
+  -> read_task_output(task_id, tail=50)
+
+Need the full output file in this sandbox?
+  -> read_task_output(task_id, full=True)
+     Returns a curl command. No file bytes enter MCP context.
+```
+
+### Running things
+
+```text
+Quick command (git status, ls, cat)?
+  -> run_task(host, command="git status")
+     Returns inline if it finishes within the client block timeout,
+     else returns {task_id}
+
+Long script already staged in /tmp/maestro/inbox/?
+  -> run_task(host, task_id="abc123")
+
+Long-running service (vLLM, Jupyter, training loop)?
+  -> run_task(host, command="...", persistent=True, capture=True, label="vllm")
+
+Need an AI agent instead of a shell command?
+  -> dispatch_agent(host, agent="codex", prompt="...", working_dir="...")
+```
 
 ## Key Patterns
 
 ### 1. Hub-Local Tmux (ADR-0007)
 
-Every task is a tmux window on the Hub. The command inside each window is an SSH session to the target host. Completion is detected via `tmux wait-for` — a zero-CPU synchronization primitive.
-
-```
-Hub tmux window → SSH session → remote process
-stop → local tmux operations → relayed through SSH
-```
-
-Only Maestro creates tmux sessions. Agents run foreground inside Maestro-owned windows.
+Every task is a tmux window on the Hub. The command inside the window is an SSH session to the target host. Completion is detected locally with `tmux wait-for`.
 
 ### 2. Auto-Promote (block_timeout)
 
-Execution tools use `_auto_promote()` for long-running tasks:
-- **Inline:** Try to finish within `block_timeout` (client-dependent: 5s remote, 60s local).
-- **Background:** If timeout exceeds, task continues in tmux. Returns `{task_id}`.
-- **Monitoring:** Use `tasks()` for status with overtime flags and read log/output files for progress.
+- `run_task(..., persistent=False)` tries to finish inline within `block_timeout_exec`, then auto-promotes into the registry if it runs longer.
+- `run_task(..., persistent=True)` always returns immediately with a `task_id`.
+- `dispatch_agent(...)` always returns immediately with a `task_id`.
+- Monitor with `current_tasks` and inspect output with `read_task_output`.
 
-Client profiles (from `client.py`):
-- **remote** (Claude.ai via Cloudflare): `block_timeout_agent=0` (always dispatch), `block_timeout_exec=5`
-- **local** (localhost): `block_timeout_agent=30`, `block_timeout_exec=60`
-- **lan** (198.51.100.*): `block_timeout_agent=10`, `block_timeout_exec=20`
-- **stdio** (Claude Code): `block_timeout_agent=30`, `block_timeout_exec=60`
+Client profiles from `client.py`:
+
+- `remote`: `block_timeout_agent=0`, `block_timeout_exec=5`
+- `local`: `block_timeout_agent=30`, `block_timeout_exec=60`
+- `lan`: `block_timeout_agent=10`, `block_timeout_exec=20`
+- `stdio`: `block_timeout_agent=30`, `block_timeout_exec=60`
 
 ### 3. System-Policy Timeouts
 
-No tool exposes a timeout parameter. Timeouts are set in `MaestroConfig`:
-- `run_ceiling = 300` (5 min hard kill)
-- `dispatch_ceiling = 21600` (6h, env: `MAESTRO_DISPATCH_CEILING`)
-- `service_overtime_advisory = 86400` (24h informational flag)
+- `run_ceiling = 300` for non-persistent `run_task`
+- `dispatch_ceiling = 21600` (6h) for `dispatch_agent`
+- `service_overtime_advisory = 86400` (24h) for persistent tasks
 
-The `expected_runtime` parameter is a caller hint recorded verbatim in the ledger. Tasks are flagged overtime at exactly the declared value — no hidden multipliers.
+`expected_runtime` is recorded as caller-declared metadata. It is not a caller-controlled timeout.
 
 ### 4. Universal Ledger
 
-Every operation that touches a remote host gets a ledger entry — execution, file I/O, transfers. The `tasks` tool surfaces all entries with overtime flags for running tasks.
+Every remote operation that becomes a tracked task records metadata in the task ledger. `current_tasks` hides container-internal paths and exposes task-oriented guidance instead.
 
-Ledger fields: `task_id`, `agent`, `host`, `prompt`, `status`, `task_type`, `expected_runtime`, `client_class`, `dispatched_at`, `completed_at`, `return_code`, `output_file`, `result_url`.
+### 5. Files Never Pass Through MCP
 
-### 5. Agent Supervision
-
-ADR-0008 removed `observe` and `steer` from the MCP surface due transport reliability concerns.
-
-For production monitoring, prefer:
-- **Service monitoring:** start long-running work with `service(..., capture=True)` and read stable log files with periodic `run` calls.
-- **Agent progress:** start agents with `dispatch`, then check completion via `tasks(status=\"running\")`, and fetch final output through `read_output(file_path)`.
-
-`dispatch` is now one-shot only.
+`transfer_pull_file`, `transfer_push_file`, and `read_task_output(full=True)` return curl commands only. File bytes stay on HTTP, not in MCP tool results.
 
 ### 6. Dispatch Guard
 
-`run` rejects commands that look like raw agent CLI invocations (regex pattern). Use `dispatch` instead.
+`run_task` rejects raw `codex`, `gemini`, or `claude` CLI dispatches that look like agent launches. Use `dispatch_agent` instead.
 
-### 7. Double-Entry Output
+### 7. Context Budget Awareness
 
-Agent outputs live on both the target machine (project history, indefinite) and the Hub (replica, 90-day retention). Either copy can recover the other.
+- Use `read_file` / `write_file` only for small inline text.
+- Use `transfer_pull_file` / `transfer_push_file` for anything larger or binary.
+- Use `read_task_output` for previews and targeted reads.
+- Use `read_task_output(full=True)` when the whole output file is needed locally.
 
-### 8. Context Budget Awareness
+### 8. Scope Prefix
 
-Tool responses consume LLM context tokens.
-- **Surgical Reads:** Use `read` with `head` or `tail` parameters.
-- **Large Files:** Use `transfer` or the relay (`prepare_relay` + curl push/pull).
-- **Orchestra Output:** Only a preview (max 1500 chars) is returned inline. Use `read_output` for targeted inspection.
-- **Task Results:** Retrieve via HTTP (`result_url`) or `read_output`.
-
-### 9. Scope Prefix
-
-All agent dispatches prepend `AGENT_SCOPE_PREFIX`, directing agents to read `~/Development/General/AGENTS.md` for fleet conduct rules.
+All agent dispatches prepend `AGENT_SCOPE_PREFIX`, directing agents to read `~/Development/General/AGENTS.md` before they start.
 
 ## Deployment (Hub)
 
-Maestro runs as a Docker container on the Hub (NAS appliance, 198.51.100.2). The Hub is the fleet hub (`is_local: true`). All other hosts are SSH targets.
+Maestro runs as a Docker container on the Hub (Cellar, `is_local: true`). The repo on Cellar is a deployment target, not a development workspace.
 
-**Development** happens on GPU-server (`/home/user/Development/maestro-mcp`). The Hub repo (`/volume2/docker/maestro/repo`) is a **read-only deployment target** — it only pulls from GitHub and rebuilds. No agent may be dispatched with `working_dir` pointing to the Maestro repo on the Hub.
-
-```
+```text
 GPU-server (dev)                  GitHub                    Hub (deploy)
   edit + commit
-  git push origin main    →    origin/main    ←    git pull
-                                                  docker compose build --no-cache
-                                                  docker compose up -d --force-recreate
+  git push origin main    ->    origin/main    <-    git pull
+                                                 docker compose build --no-cache
+                                                 docker compose up -d --force-recreate
 ```
 
-```
+```text
 /volume2/docker/maestro/
-├── repo/          # git clone (Dockerfile, docker-compose.yml, source)
-├── config/        # .env, hosts.yaml, ssh/, cloudflared/
-└── state/         # Persistent: oauth_state.json, task_ledger.json, task_output/
+|- repo/          # git clone (Dockerfile, docker-compose.yml, source)
+|- config/        # .env, hosts.yaml, ssh/, cloudflared/
+`- state/         # Persistent: oauth_state.json, task_ledger.json, task_output/
 ```
 
-Task output persists at `state/task_output/` via the Docker volume mount `../state:/root/.maestro`.
+Task output persists through the Docker volume mount `../state:/root/.maestro`.
 
 ```bash
-# Deploy from Hub (after pushing from GPU-server)
 cd /volume2/docker/maestro/repo
 git pull && docker compose build --no-cache && docker compose up -d --force-recreate
 ```
@@ -156,37 +180,37 @@ Wait 15-30s after rebuild and poll `/.well-known/oauth-authorization-server` for
 
 ## Critical Rules
 
-1. **Don't kill the Maestro container** via Maestro tools — it terminates the connection with no recovery path.
-2. **Always use `docker compose restart`** — cloudflared shares maestro's network namespace.
-3. **`MAESTRO_ISSUER_URL` must be set** in the Hub's config `.env`.
-4. **Agent dispatch must go through `dispatch`.** Never invoke agent CLIs via `run`. The dispatch guard will block it.
-5. **Transfer relay tokens are valid for 1 hour.** Call `prepare_relay` once per session.
-6. **Only Maestro creates tmux sessions.** No tool creates remote tmux sessions.
-7. **Timeouts are system policy.** `expected_runtime` is an honest declaration, not a control parameter.
-8. **hosts.yaml is gitignored.** Use `hosts.example.yaml` as a template.
+1. **Do not kill the Maestro container** via Maestro tools. That terminates the MCP connection.
+2. **Use `docker compose restart` when restarting services.** `cloudflared` shares Maestro's network namespace.
+3. **`MAESTRO_ISSUER_URL` must be set** for HTTP mode.
+4. **Agent dispatch must go through `dispatch_agent`.** Never invoke agent CLIs via `run_task`.
+5. **Prefer `transfer_pull_file` and `transfer_push_file`.** `prepare_relay` is for direct HTTP or custom workflows.
+6. **Only Maestro creates tmux sessions.** Agents never create remote tmux.
+7. **Timeouts are system policy.** `expected_runtime` is a declaration, not a knob.
+8. **`hosts.yaml` is gitignored.** Use `hosts.example.yaml` as the template.
 
 ## Environment Variables
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `MAESTRO_ISSUER_URL` | **Yes (HTTP)** | `https://localhost:8222` | Public URL for OAuth discovery. |
-| `MAESTRO_AUTHORIZE_PIN_HASH` | **Yes (HTTP)** | — | SHA-256 hex digest of approval PIN. |
-| `MAESTRO_TRANSFER_TOKEN` | Yes | — | Master secret for HMAC transfer auth. |
-| `MAESTRO_DISPATCH_CEILING` | No | `21600` | Agent dispatch hard ceiling (seconds). |
-| `MAESTRO_MAX_TASKS_PER_HOST` | No | `10` | Soft per-host concurrent task limit. |
-| `MAESTRO_TRUSTED_CLIENT_IDS` | No | — | Comma-separated auto-approve client IDs. |
-| `MAESTRO_LAN_ORIGINS` | No | — | LAN origins for OAuth URL rewriting. |
-| `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Dirs that transfer relay may access. |
-| `MAESTRO_ORCHESTRA_OUTPUT_DIR` | No | `~/.maestro/outputs` | Agent output directory. |
-| `MAESTRO_TASK_LEDGER_PATH` | No | `~/.maestro/task_ledger.json` | Persistent task ledger. |
+| `MAESTRO_ISSUER_URL` | **Yes (HTTP)** | `https://localhost:8222` | Public URL for OAuth discovery and relay URLs. |
+| `MAESTRO_AUTHORIZE_PIN_HASH` | **Yes (HTTP)** | — | SHA-256 hex digest of the approval PIN. |
+| `MAESTRO_TRANSFER_TOKEN` | Yes | — | Master secret for relay auth. |
+| `MAESTRO_DISPATCH_CEILING` | No | `21600` | Agent dispatch hard ceiling in seconds. |
+| `MAESTRO_MAX_TASKS_PER_HOST` | No | `10` | Soft per-host concurrency limit. |
+| `MAESTRO_TRUSTED_CLIENT_IDS` | No | — | Comma-separated auto-approved OAuth client IDs. |
+| `MAESTRO_LAN_ORIGINS` | No | — | LAN origins allowed for OAuth URL rewriting. |
+| `MAESTRO_TRANSFER_ALLOWED_DIRS` | No | `~/` | Allowed local paths for relay reads/writes. |
+| `MAESTRO_TASK_LEDGER_PATH` | No | `~/.maestro/task_ledger.json` | Persistent task ledger path. |
 | `SSH_TIMEOUT` | No | `300` | Default SSH command timeout. |
 
 ## Naming & Organization
 
-Follow the fleet naming convention: `~/Development/General/docs/fleet-naming-convention.md`. Three domains:
-- **Maestro** — The system. The MCP server and everything it governs.
-- **Orchestra** — The performers. AI agents and their coordination.
-- **Fleet** — The infrastructure. Physical/virtual machines, SSH transport, file operations.
+Follow the fleet naming convention in `~/Development/General/docs/fleet-naming-convention.md`.
+
+- **Maestro**: the MCP server and orchestration system.
+- **Orchestra**: the agents and task supervision layer.
+- **Fleet**: the machines, SSH transport, and file operations.
 
 ## Agent Conduct
 
@@ -195,8 +219,9 @@ All dispatched agents must read `~/Development/General/AGENTS.md` before startin
 ## Development
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python server.py --transport stdio
-pytest tests/
+pytest tests/ -v
 ```

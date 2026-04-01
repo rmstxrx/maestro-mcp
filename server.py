@@ -35,7 +35,8 @@ from maestro.hosts import (
 )
 from maestro.local import _local_run, configure_local
 from maestro.mux import configure_mux
-from maestro.relay import configure_relay, task_result, transfer_push, transfer_pull
+from maestro.relay import configure_relay, transfer_push, transfer_pull
+from maestro.task_result import task_result
 from maestro.tools.fleet import register_fleet_tools
 from maestro.tools.orchestra import (
     TASK_REGISTRY,
@@ -185,18 +186,22 @@ def _build_instructions(transport: str = "http") -> str:
             f"You are running locally on {local_name}"
             + (f" ({local_desc})" if local_desc else "")
             + ".\n\n"
-            "CRITICAL: Do NOT use Maestro exec/script/read/write to target " + (local_name or "this host") + ".\n"
+            "CRITICAL: Do NOT use Maestro run_task/read_file/write_file/transfer_* to target "
+            + (local_name or "this host") + ".\n"
             "You have native tools (Bash, filesystem) that are faster and more capable.\n"
             "Maestro will REJECT local-targeting commands from local agents.\n\n"
             "Use Maestro ONLY for:\n"
             "  - Remote fleet hosts (listed below)\n"
-            "  - Agent dispatch (codex, gemini, claude) to any host including local\n"
-            "  - Fleet status, transfer, add_host, reconnect_host, list_ssh_hosts, agent_status\n"
-            "  - Orchestra tools: prepare_relay, poll, read_output, tasks\n\n"
+            "  - Agent dispatch via dispatch_agent to any host including local\n"
+            "  - Fleet status and remote task/file operations\n"
+            "  - Orchestra tools: current_tasks, read_task_output, prepare_relay\n\n"
             "Remote fleet hosts:\n" + remote_block
         )
 
-    dispatch_rule = "All dispatch tools return a task_id. Use poll(task_id) for results."
+    dispatch_rule = (
+        "All dispatch tools return a task_id. "
+        "Use current_tasks() and read_task_output() for status and output."
+    )
     host_list = ", ".join(HOSTS.keys())
     instructions = f"Hosts: {host_list}. {dispatch_rule}"
     if len(instructions) <= 300:

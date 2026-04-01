@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import secrets
+import shlex
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse, FileResponse
@@ -38,9 +43,14 @@ _TASK_LOOKUP: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None
 
 _TRANSFER_ALLOWED_DIRS: list[Path] = []
 _EPHEMERAL_TOKENS: dict[str, float] = {}  # token → expiry_timestamp
+_STAGED_CLEANUPS: dict[str, asyncio.Task[None]] = {}
 _SYSTEM_DIRS = frozenset({
     "/etc", "/proc", "/sys", "/dev", "/boot", "/sbin", "/bin", "/usr", "/lib", "/var",
 })
+_STAGED_DIR = Path("/tmp/maestro/staged")
+_STAGED_TTL_SECONDS = 300
+
+
 def _is_maestro_path(path: str) -> bool:
     normalized = path.strip()
     return (
@@ -71,6 +81,143 @@ def _cfg() -> MaestroConfig:
     if _CONFIG is None:
         raise RuntimeError("relay not configured")
     return _CONFIG
+
+
+def _relay_local_host() -> str:
+    from maestro.hosts import HOSTS
+
+    for name, config in HOSTS.items():
+        if getattr(config, "is_local", False):
+            return name
+    raise RuntimeError("relay staging requires a configured local host")
+
+
+def _build_relay_url(path: str, **query: str) -> str:
+    base = _cfg().issuer_url.rstrip("/")
+    return f"{base}{path}?{urlencode(query)}"
+
+
+def _register_transfer_token(ttl: int = _STAGED_TTL_SECONDS) -> str:
+    token = secrets.token_urlsafe(32)
+    register_ephemeral_token(token, ttl=ttl)
+    return token
+
+
+def _schedule_staged_cleanup(path: Path, ttl: int = _STAGED_TTL_SECONDS) -> None:
+    key = str(path)
+    existing = _STAGED_CLEANUPS.pop(key, None)
+    if existing is not None:
+        existing.cancel()
+
+    async def _cleanup() -> None:
+        try:
+            await asyncio.sleep(ttl)
+        except asyncio.CancelledError:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        finally:
+            _STAGED_CLEANUPS.pop(key, None)
+
+    _STAGED_CLEANUPS[key] = asyncio.create_task(_cleanup())
+
+
+async def transfer_pull_impl(host: str, remote_path: str) -> dict[str, Any]:
+    """Stage a fleet file locally and return a ready-to-run curl command."""
+    assert _RESOLVE_HOST and _SCP_RUN
+
+    try:
+        config = _RESOLVE_HOST(host)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+    path_err = _validate_transfer_path(remote_path, config.is_local)
+    if path_err:
+        raise ValueError(f"path rejected: {path_err}")
+
+    filename = Path(remote_path).name or "download"
+    staged_name = f"{secrets.token_hex(8)}_{filename}"
+    _STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    staged_path = _STAGED_DIR / staged_name
+
+    if config.is_local:
+        source = Path(remote_path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"{remote_path} not found")
+        byte_count = source.stat().st_size
+        if byte_count > _cfg().max_transfer_size:
+            raise ValueError(
+                f"file exceeds {_cfg().max_transfer_size // (1024 * 1024)}MB limit"
+            )
+        shutil.copyfile(source, staged_path)
+    else:
+        result = await _SCP_RUN(host, remote_path, str(staged_path), upload=False)
+        if not result.startswith("[OK]"):
+            staged_path.unlink(missing_ok=True)
+            raise RuntimeError(result)
+        byte_count = staged_path.stat().st_size
+        if byte_count > _cfg().max_transfer_size:
+            staged_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"file exceeds {_cfg().max_transfer_size // (1024 * 1024)}MB limit"
+            )
+
+    token = _register_transfer_token()
+    _schedule_staged_cleanup(staged_path)
+    url = _build_relay_url(
+        "/transfer/pull",
+        host=_relay_local_host(),
+        remote_path=str(staged_path),
+    )
+    _audit(
+        "transfer_pull_staged",
+        host=host,
+        path=remote_path,
+        staged_path=str(staged_path),
+        bytes=byte_count,
+    )
+    return {
+        "status": "staged",
+        "host": host,
+        "remote_path": remote_path,
+        "bytes": byte_count,
+        "filename": filename,
+        "curl": (
+            f"curl -s -o {shlex.quote(filename)} "
+            f"-H 'Authorization: Bearer {token}' '{url}'"
+        ),
+    }
+
+
+async def transfer_push_prep(host: str, remote_path: str) -> dict[str, Any]:
+    """Prepare an authenticated curl command for relay uploads."""
+    assert _RESOLVE_HOST
+
+    try:
+        config = _RESOLVE_HOST(host)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+    path_err = _validate_transfer_path(remote_path, config.is_local)
+    if path_err:
+        raise ValueError(f"path rejected: {path_err}")
+
+    token = _register_transfer_token()
+    url = _build_relay_url(
+        "/transfer/push",
+        host=host,
+        remote_path=remote_path,
+    )
+    _audit("transfer_push_prepared", host=host, path=remote_path)
+    return {
+        "status": "ready",
+        "host": host,
+        "remote_path": remote_path,
+        "curl": (
+            f"curl -s -F 'file=@<LOCAL_FILE>' "
+            f"-H 'Authorization: Bearer {token}' '{url}'"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -356,52 +503,3 @@ async def transfer_pull(request: Request) -> Response:
         except Exception as e:
             Path(tmp_path).unlink(missing_ok=True)
             return JSONResponse({"error": "pull_failed", "detail": str(e)}, status_code=500)
-
-
-# ---------------------------------------------------------------------------
-# Task result endpoint — zero-token-cost result retrieval
-# ---------------------------------------------------------------------------
-
-async def task_result(request: Request) -> Response:
-    """Return task result via HTTP, enabling bash_tool wait loops.
-
-    GET /tasks/{task_id}/result
-    Authorization: Bearer <daily-HMAC-token>
-
-    Returns:
-        200 — task complete, body is the result JSON
-        202 — task still running, body has status + elapsed
-        404 — unknown task_id
-        410 — task was evicted from registry
-    """
-    if not _transfer_auth_ok(request):
-        return _auth_error()
-
-    if _TASK_LOOKUP is None:
-        return JSONResponse(
-            {"error": "not_configured", "detail": "task lookup not available"},
-            status_code=503,
-        )
-
-    task_id = request.path_params.get("task_id", "")
-    if not task_id:
-        return JSONResponse(
-            {"error": "bad_request", "detail": "task_id path parameter required"},
-            status_code=400,
-        )
-
-    result = await _TASK_LOOKUP(task_id)
-    if result is None:
-        return JSONResponse(
-            {"error": "not_found", "detail": f"task '{task_id}' not found or evicted"},
-            status_code=404,
-        )
-
-    status = result.get("status", "unknown")
-
-    if status == "running":
-        return JSONResponse(result, status_code=202)
-
-    # done, failed, timeout — return full result
-    _audit("task_result_retrieved", task_id=task_id, status=status)
-    return JSONResponse(result, status_code=200)

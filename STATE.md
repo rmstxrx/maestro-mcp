@@ -1,28 +1,31 @@
 # STATE.md — maestro-mcp
 
-**Last Updated:** 2026-03-28
+**Last Updated:** 2026-04-01
 
 ---
 
 ## Current Focus
 
-**ADR-0007 landed (Phases 1–3).** Taxonomy cleanup, tmux multiplexer layer, and mux tools are deployed. Phase 4 (agent interop) is deferred pending a concrete use case.
+**ADR-0009 is implemented on `feat/adr-0009-tool-surface-refactor`.** The tool surface now matches the 11-tool target: renamed task/file/orchestration tools, tmux-only `run_task`, curl-prepared transfer helpers, and `read_task_output`.
 
 ### Recent Commits
 
-```
+```text
+a1a512e feat: phase 3 — transfer_pull_file, transfer_push_file, read_task_output, task_result extraction
+222da15 refactor: phase 2 — rename tools, merge service into run_task, unify exec through tmux
+f1509a8 refactor: phase 1 — remove zombie tools (observe, steer, poll, gemini_sessions)
 3f4332a docs: add critical rule 9 — Claude.ai deferred tool loading
-6dd4270 fix: neutralize mux tool docstrings for Claude.ai intent classifier
-fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
-63782e8 feat: ADR-0007 Phase 3 — persistent windows, mux tools, orchestra wiring
-0265c62 feat: ADR-0007 Phase 2 — mux.py tmux multiplexer layer
-15c364f refactor: ADR-0007 Phase 1 — taxonomy cleanup, split fleet/orchestra tools
 ```
 
-### Tool Inventory (23 tools)
+### Tool Inventory (11 tools)
 
-**Tool count (13 → 11):** `observe`/`steer` removed under ADR-0008.
-**Active tool surface (11):** `run`, `read`, `write`, `transfer`, `status`, `stop`, `service`, `dispatch`, `tasks`, `read_output`, `prepare_relay`.
+**File I/O (4):** `read_file`, `write_file`, `transfer_pull_file`, `transfer_push_file`
+
+**Task Lifecycle (4):** `run_task`, `stop_task`, `current_tasks`, `read_task_output`
+
+**Orchestration (2):** `dispatch_agent`, `orchestra_status`
+
+**Infrastructure (1):** `prepare_relay`
 
 ### Deployment (Hub)
 
@@ -30,42 +33,41 @@ fb07303 fix: dispatch guard false positive on tmux commands, rename mux tools
 |---|---|
 | Repo (git clone) | `/volume2/docker/maestro/repo/` |
 | Config (.env, hosts.yaml, ssh/, cloudflared/) | `/volume2/docker/maestro/config/` |
-| Persistent state (oauth, ledger) | `/volume2/docker/maestro/state/` |
-| Containers | `maestro` (python:3.12-slim) + `maestro-cloudflared` (Alpine + cloudflared) |
+| Persistent state (oauth, ledger, task output) | `/volume2/docker/maestro/state/` |
+| Containers | `maestro` + `maestro-cloudflared` |
 | Update workflow | `cd repo && git pull && docker compose up -d --build` |
 
 ### Fleet Topology
 
 | Host | Role | Status |
 |---|---|---|
-| Hub | Hub (`is_local: true`), orchestration only | Docker, always-on |
-| GPU-server | Compute leaf, agent dispatch target | GPU workstation, GPU workloads |
-| Win-server | Compute leaf, agent dispatch target | GPU workstation, PowerShell |
+| Hub | `is_local: true`, orchestration container host | Docker, always-on |
+| GPU-server | Compute leaf, agent dispatch target | GPU workstation |
+| Win-server | Compute leaf, PowerShell/Windows-native target | GPU workstation |
 | Macbook | Compute leaf, agent dispatch target | Laptop |
-| Win-server-WSL | Compute leaf (proxy through Win-server) | WSL2 Ubuntu on Win-server |
+| Win-server-WSL | Bash-compatible leaf via Win-server | WSL2 Ubuntu |
 
 ## Active Branches
 
 | Branch | Status |
-|--------|--------|
-| `main` | Active development. ADR-0007 Phases 1–3 + bug fixes landed. |
+|---|---|
+| `feat/adr-0009-tool-surface-refactor` | Active implementation branch for the ADR-0009 tool surface refactor. |
+| `main` | Stable baseline before ADR-0009 deployment. |
 
 ## Blockers
 
-- None.
+- None in the repo. Deployment to Hub and any AGENTS.md follow-up are separate steps.
 
 ## What's Next
 
-1. **ADR-0007 Phase 4 — Agent interop (deferred).** Infrastructure is in place (named windows, mux tools), but cross-agent observation needs deliberate design around coordination and scope. Not a checklist item — revisit when a concrete use case demands it.
-2. **Stale items from previous cycles:**
-   - Set `MAESTRO_DEFAULT_REPO` in `.env` to a real path (or remove the config field).
-   - Delete stale remote branch `feat/adr-0004-0005-pin-rotation` if fully merged.
-   - Delete old `task_registry.json` on Hub if present (in-memory registry handles HTTP result endpoint).
+1. Deploy the ADR-0009 branch to Hub and verify the live MCP tool list matches the 11-tool surface.
+2. Update repo/root AGENTS guidance separately if the operator still wants the `read_task_output` / `stop_task` wording reflected there.
+3. Exercise the staged pull/push flow end-to-end against a real remote host after deployment.
 
 ## Completed (recent)
 
-- Output directory migrated: `~/.agent-orchestra/outputs/` → `~/.maestro/outputs/` on GPU-server. Old directory removed.
-- Dispatch guard regex anchored to start-of-command (fixed tmux false positives).
-- Mux tools renamed (`spawn`→`mux_start`, etc.) with neutral docstrings.
-- Critical Rule 9 added to CLAUDE.md: Claude.ai deferred tool loading via Tool Search.
-- 68/68 tests passing.
+- Removed zombie registrations: `observe`, `steer`, `poll`, `gemini_sessions`.
+- Renamed the task/file/orchestration tools to the ADR-0009 surface.
+- Merged `service` into `run_task(persistent=True)` and routed all `command=` execution through tmux + auto-promote.
+- Added curl-prepared `transfer_pull_file`, `transfer_push_file`, and `read_task_output(full=True)` paths that keep file bytes out of MCP results.
+- Split `task_result` into `maestro/task_result.py`.

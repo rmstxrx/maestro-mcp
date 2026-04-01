@@ -24,13 +24,19 @@ from maestro.mux import (
     create_task_window,
     get_output_path,
     kill_window,
+    list_windows,
+    send_keys,
     stage_script,
     wait_for_completion,
     TMUX_SESSION,
 )
 from maestro.tools.orchestra import (
+    TASK_REGISTRY,
+    _REGISTRY_LOCK,
     _auto_promote,
     _orchestra_run_cli,
+    _orchestra_truncate,
+    _save_registry,
 )
 from maestro.transport import (
     _async_run,
@@ -121,11 +127,11 @@ def _check_agent_dispatch_bypass(command: str) -> str | None:
         "error": "agent_dispatch_bypass",
         "blocked": True,
         "detected_agent": agent,
-        "recommended_tool": agent,
+        "recommended_tool": "dispatch_agent",
         "message": (
             f"Detected a raw {agent} CLI dispatch with prompt/model flags. "
-            f"Use the {agent} dispatch tool instead so Maestro applies the scope prefix, "
-            f"records the task in the ledger, and builds the correct CLI arguments."
+            "Use dispatch_agent instead so Maestro applies the scope prefix, "
+            "records the task in the ledger, and builds the correct CLI arguments."
         ),
     })
 
@@ -140,140 +146,122 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
 
     # --- Fleet tools ---
 
-    # --- ADR-0007: Hub-local execution via exec ---
-
-    _INLINE_EXEC_MAX_TIMEOUT = 20
+    # --- ADR-0009: unified task execution via run_task ---
 
     @mcp.tool()
-    async def exec(
+    async def run_task(
         host: str,
         task_id: str = "",
         command: str = "",
         cwd: str | None = None,
         expected_runtime: int | None = None,
         sudo: bool = False,
+        persistent: bool = False,
+        capture: bool = False,
+        label: str = "",
     ) -> str:
-        """Execute a command on a fleet host. Two modes:
+        """Execute a command or staged script on a fleet host via tmux.
 
-        Inline mode (command=): Runs via SSH with a hard 20 s timeout.
-        Returns stdout/stderr directly. For quick commands (git status,
-        ls, cat, pip install). No tmux, no ledger, no polling.
+        Provide exactly one of command or task_id.
+        command= stages the script internally before execution.
+        task_id= runs a pre-staged script from /tmp/maestro/inbox/.
 
-        Staged mode (task_id=): Triggers a pre-staged script at
-        /tmp/maestro/inbox/<task_id>.sh. Runs in tmux, returns task_id
-        for polling. For long-running tasks.
-
-        Provide exactly one of task_id or command."""
+        Non-persistent tasks try to finish within the client profile's
+        block_timeout_exec window, then auto-promote into the task ledger.
+        Persistent tasks always return immediately and run until stopped."""
         if block := _check_local_self_reference(host):
             return block
         if not task_id and not command:
-            return json.dumps({"error": "validation_error", "detail": "Provide either task_id (staged) or command (inline)."})
+            return json.dumps({
+                "error": "validation_error",
+                "detail": "Provide either task_id (staged) or command.",
+            })
         if task_id and command:
             return json.dumps({"error": "validation_error", "detail": "Provide task_id or command, not both."})
         try:
             cfg = _resolve_host(host)
         except ValueError as e:
             return _structured_error("validation_error", host, str(e))
-
-        # --- Inline mode: synchronous SSH, hard timeout, no tmux ---
         if command:
-            if sudo:
-                cmd = f"sudo sh -c {_shell_quote(command)}"
-            else:
-                cmd = command
-            if cwd:
-                cmd = f"cd {_shell_quote(cwd)} && {cmd}"
+            if bypass := _check_agent_dispatch_bypass(command):
+                return bypass
 
-            rc, stdout, stderr = await _raw_ssh(
-                host, cmd, timeout=_INLINE_EXEC_MAX_TIMEOUT,
-            )
-            result: dict[str, Any] = {
-                "host": host,
-                "mode": "inline",
-                "exit_code": rc,
-            }
-            if stdout:
-                result["stdout"] = stdout
-            if stderr:
-                result["stderr"] = stderr
-            if rc == -1 and "timeout" in stderr.lower():
-                result["error"] = "timeout"
-                result["detail"] = f"Command exceeded {_INLINE_EXEC_MAX_TIMEOUT}s hard limit."
-            return json.dumps(result)
-
-        # --- Staged mode: tmux window, async, poll for result ---
         ctx = get_client_context()
-        ert = expected_runtime if expected_runtime is not None else config.default_expected_runtime_run
-
-        async def _execute() -> str:
-            await create_task_window(
-                task_id,
-                cfg.alias,
-                tee=False,
-                cwd=cwd,
-                sudo=sudo,
-                shell=cfg.shell,
-            )
-            rc = await wait_for_completion(task_id, timeout=config.run_ceiling)
-            return json.dumps({"task_id": task_id, "host": host, "return_code": rc})
-
-        return await _auto_promote(
-            _execute,
-            block_timeout=0,
-            agent="exec",
-            host=host,
-            prompt=task_id,
-            client_class=ctx.classification,
-            task_id=task_id,
-            expected_runtime=ert,
+        effective_task_id = task_id or secrets.token_hex(8)
+        block_timeout = 0 if persistent else int(
+            ctx.profile.get("block_timeout_exec", config.block_timeout_default)
+        )
+        tee_output = capture or not persistent
+        task_type = "service" if persistent else "run"
+        ert = expected_runtime if expected_runtime is not None else (
+            config.service_overtime_advisory if persistent else config.default_expected_runtime_run
         )
 
+        async def _execute() -> str:
+            if command:
+                script_content = f"#!/bin/bash\n{command}\n"
+                await stage_script(
+                    effective_task_id,
+                    cfg.alias,
+                    script_content,
+                    cfg.shell,
+                )
+            await create_task_window(
+                effective_task_id,
+                cfg.alias,
+                tee=tee_output,
+                cwd=cwd,
+                sudo=sudo,
+                stream=True,
+                shell=cfg.shell,
+            )
+            rc = await wait_for_completion(
+                effective_task_id,
+                timeout=None if persistent else config.run_ceiling,
+            )
+            result: dict[str, Any] = {
+                "task_id": effective_task_id,
+                "host": host,
+                "return_code": rc,
+                "persistent": persistent,
+                "capture": tee_output,
+            }
+            if label:
+                result["label"] = label
+            if tee_output:
+                output_path = get_output_path(effective_task_id)
+                raw_output = ""
+                if output_path.exists():
+                    raw_output = output_path.read_text(encoding="utf-8", errors="replace")
+                preview, was_truncated = _orchestra_truncate(raw_output, max_len=config.max_inline_output)
+                result["output"] = preview
+                result["truncated"] = was_truncated
+            return json.dumps(result)
+
+        result = await _auto_promote(
+            _execute,
+            block_timeout=block_timeout,
+            agent="exec",
+            host=host,
+            prompt=(label or command or effective_task_id)[:200],
+            client_class=ctx.classification,
+            task_id=effective_task_id,
+            expected_runtime=ert,
+            output_file_factory=get_output_path if tee_output else None,
+            task_type=task_type,
+        )
+        if not persistent:
+            return result
+
+        payload = json.loads(result)
+        payload["persistent"] = True
+        payload["capture"] = tee_output
+        if label:
+            payload["label"] = label
+        return json.dumps(payload)
+
     @mcp.tool()
-    async def gemini_sessions(host: str) -> str:
-        """List Gemini CLI sessions on a host."""
-        if block := _check_local_self_reference(host):
-            return block
-        try:
-            _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-
-        rc, output = await _orchestra_run_cli(host, "gemini --list-sessions", timeout=15)
-        if rc != 0:
-            return json.dumps({"host": host, "error": output})
-        return json.dumps({"host": host, "sessions": output})
-
-
-    @mcp.tool()
-    async def observe(task_id: str, lines: int = 50) -> str:
-        """Capture live output from a running task's tmux pane (~50 lines).
-
-        Control-plane tool for inspecting dispatched agents and services
-        mid-run. Returns the current screen state, not cumulative output.
-        For bulk output retrieval, use relay-pull of the outbox file."""
-        from maestro.mux import capture_pane
-        try:
-            output = await capture_pane(task_id, lines=lines)
-            return json.dumps({"task_id": task_id, "lines": lines, "output": output})
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
-    async def steer(task_id: str, keys: str) -> str:
-        """Send keystrokes to a running task's tmux pane.
-
-        Control-plane tool for interacting with dispatched agents —
-        approval prompts, Ctrl+C (send as 'C-c'), input text.
-        Pure control signal, no data payload."""
-        from maestro.mux import send_keys
-        try:
-            await send_keys(task_id, keys)
-            return json.dumps({"task_id": task_id, "keys_sent": len(keys), "status": "ok"})
-        except RuntimeError as e:
-            return json.dumps({"error": str(e), "task_id": task_id})
-
-    @mcp.tool()
-    async def status(host: str = "", agents: bool = False) -> str:
+    async def orchestra_status(host: str = "", agents: bool = False) -> str:
         """Fleet health check with auto-reconnect and optional agent discovery (ADR-0007).
 
         Probes connectivity for all hosts (or a single host if specified).
@@ -348,7 +336,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     # --- ADR-0007: Task lifecycle tools ---
 
     @mcp.tool()
-    async def stop(task_id: str) -> str:
+    async def stop_task(task_id: str, graceful: bool = False) -> str:
         """Kill a running task (ADR-0007).
 
         Kills the Hub-local tmux window. The SSH session inside it dies,
@@ -368,97 +356,55 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
             return json.dumps({"error": "Cannot kill the tmux session", "task_id": task_id})
 
         try:
-            await kill_window(task_id)
+            if graceful:
+                await send_keys(task_id, "C-c")
+                await asyncio.sleep(3)
+                windows = await list_windows()
+                if any(window.get("name") == window_name for window in windows):
+                    await kill_window(task_id)
+            else:
+                await kill_window(task_id)
+
+            completed_at = datetime.now(timezone.utc)
+
+            async with _REGISTRY_LOCK:
+                ts = TASK_REGISTRY.get(task_id)
+                if ts is not None:
+                    ts.status = "killed"
+                    ts.finished_at = completed_at
+                    ts.result_json = json.dumps({
+                        "task_id": task_id,
+                        "agent": ts.agent,
+                        "host": ts.host,
+                        "status": "killed",
+                        "graceful": graceful,
+                    })
+                    ts._done_event.set()
+            _save_registry()
 
             # Update ledger
             from maestro.tools.orchestra import get_task_ledger
             ledger = get_task_ledger()
             if ledger:
-                from datetime import datetime, timezone
-                ledger.update(task_id, status="killed", completed_at=datetime.now(timezone.utc))
+                ledger.update(task_id, status="killed", completed_at=completed_at)
 
             return json.dumps({
                 "task_id": task_id,
                 "status": "killed",
+                "graceful": graceful,
                 "window": window_name,
             })
         except RuntimeError as e:
             return json.dumps({"error": str(e), "task_id": task_id})
 
-    @mcp.tool()
-    async def service(
-        host: str,
-        command: str,
-        label: str = "",
-        cwd: str | None = None,
-        capture: bool = False,
-    ) -> str:
-        """Start a long-running process on a host (ADR-0007).
-
-        For services like vLLM, Jupyter, training runs, or any process
-        that runs indefinitely. No hard ceiling — runs until stopped.
-
-        The service can be monitored by reading its log file with periodic
-        run(host, "tail -50 <log_path>") calls. Stop with stop(task_id).
-
-        capture: if True, tee output to disk (caution: service logs grow).
-        Recommended: keep capture=True and monitor via `run`.
-
-        Overtime advisory at 24h (configurable). This is informational, not
-        a kill signal.
-
-        Returns immediately with {task_id} — always background."""
-        try:
-            cfg = _resolve_host(host)
-        except ValueError as e:
-            return _structured_error("validation_error", host, str(e))
-
-        task_id = secrets.token_hex(8)
-        ctx = get_client_context()
-
-        script_content = f"#!/bin/bash\n{command}\n"
-        await stage_script(task_id, cfg.alias, script_content, cfg.shell)
-        await create_task_window(
-            task_id,
-            cfg.alias,
-            tee=capture,
-            cwd=cwd,
-            stream=True,
-            shell=cfg.shell,
-        )
-
-        # Record in ledger
-        from maestro.tools.orchestra import _record_ledger_entry
-        from datetime import datetime, timezone as tz
-        _record_ledger_entry(
-            task_id=task_id,
-            agent="service",
-            host=host,
-            prompt=(label or command[:200]),
-            status="running",
-            client_class=ctx.classification,
-            dispatched_at=datetime.now(tz.utc),
-            output_file=get_output_path(task_id) if capture else None,
-            expected_runtime=config.service_overtime_advisory,
-            task_type="service",
-        )
-
-        return json.dumps({
-            "task_id": task_id,
-            "host": host,
-            "label": label or command[:80],
-            "capture": capture,
-            "hint": "Read output logs with run(...) for progress, stop(task_id) to kill.",
-        })
-
     # --- ADR-0007: Direct file I/O (orchestrator only) ---
 
     @mcp.tool()
-    async def read(host: str, path: str) -> str:
+    async def read_file(host: str, path: str) -> str:
         """Read a small file from a fleet host (≤16 KB, 10 s timeout).
 
-        Returns file content directly. For larger files, use the
-        transfer relay (prepare_relay + curl pull).
+        Returns file content directly. For larger files, use
+        transfer_pull_file(host, remote_path).
 
         This is an orchestrator tool — dispatched agents use their
         native filesystem instead."""
@@ -490,11 +436,11 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
         })
 
     @mcp.tool()
-    async def write(host: str, path: str, content: str) -> str:
+    async def write_file(host: str, path: str, content: str) -> str:
         """Write a small file to a fleet host (≤16 KB, 10 s timeout).
 
         Content is piped via stdin — no shell escaping issues.
-        For larger files, use the transfer relay (prepare_relay + curl push).
+        For larger files, use transfer_push_file(host, remote_path).
 
         This is an orchestrator tool — dispatched agents use their
         native filesystem instead."""
