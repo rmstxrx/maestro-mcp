@@ -7,7 +7,7 @@
 #   description: human-readable description (shown in tool instructions)
 #
 # Optional:
-#   shell: bash (default) or powershell
+#   shell: bash (default)
 #   is_local: true if this is the hub machine (direct execution, no SSH)
 #   display_name: override the display name (defaults to the YAML key)
 #   allowed_dirs: list of directory prefixes for agent dispatch (codex/claude/gemini)
@@ -30,13 +30,8 @@ hosts:
     alias: ssh-macbook
     description: "MacBook Pro, on the go"
 
-  windows-pc:
-    alias: ssh-winpc
-    description: "Windows 11, PowerShell"
-    shell: powershell
+  dev-wsl:
+    alias: ssh-dev-wsl
+    description: "WSL2 Ubuntu on Windows workstation, GPU passthrough"
     allowed_dirs:
-      - "C:\\Users\\user\\Development"
-
-  windows-wsl:
-    alias: ssh-winpc-wsl
-    description: "WSL2 on windows-pc (ProxyJump)"
+      - "/home/user/Development"
