@@ -38,6 +38,7 @@ from maestro.tools.orchestra import (
     _orchestra_truncate,
     _save_registry,
 )
+from maestro.relay import transfer_pull_impl
 from maestro.transport import (
     _async_run,
     _check_control_master,
@@ -403,8 +404,9 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
     async def read_file(host: str, path: str) -> str:
         """Read a small file from a fleet host (≤16 KB, 10 s timeout).
 
-        Returns file content directly. For larger files, use
-        transfer_pull_file(host, remote_path).
+        Returns file content directly. When the file exceeds 16 KB, returns
+        a truncated preview and, if relay staging succeeds, a curl command
+        for downloading the full file.
 
         This is an orchestrator tool — dispatched agents use their
         native filesystem instead."""
@@ -427,13 +429,25 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 "stderr": stderr.strip(),
             })
 
-        return json.dumps({
+        stdout_bytes = len(stdout.encode())
+        truncated = stdout_bytes >= _READ_WRITE_MAX_BYTES
+        result = {
             "host": host,
             "path": path,
-            "bytes": len(stdout.encode()),
-            "truncated": len(stdout.encode()) >= _READ_WRITE_MAX_BYTES,
+            "bytes": stdout_bytes,
+            "truncated": truncated,
             "content": stdout,
-        })
+        }
+        if truncated:
+            try:
+                relay_info = await transfer_pull_impl(host, path)
+                result["curl"] = relay_info["curl"]
+                result["full_bytes"] = relay_info["bytes"]
+            except Exception:
+                pass  # Relay staging failed — still return the truncated content
+            result["hint"] = "Use tail= or head= for targeted reads, or full=True to download the complete file."
+
+        return json.dumps(result)
 
     @mcp.tool()
     async def write_file(host: str, path: str, content: str) -> str:

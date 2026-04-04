@@ -27,6 +27,21 @@ logger = logging.getLogger("maestro")
 audit_logger = logging.getLogger("maestro-audit")
 
 
+def _categorize_scp_error(result: str) -> str:
+    lower = result.lower()
+    if "connection refused" in lower:
+        return "connection_refused"
+    if "timed out" in lower or "timeout" in lower:
+        return "ssh_timeout"
+    if "no such file" in lower or "not found" in lower:
+        return "file_not_found"
+    if "permission denied" in lower:
+        return "permission_denied"
+    if "host key" in lower:
+        return "host_key_error"
+    return "scp_failed"
+
+
 def _audit(event: str, **kwargs: Any) -> None:
     entry = {"ts": time.time(), "event": event, **kwargs}
     audit_logger.info(json.dumps(entry))
@@ -430,7 +445,10 @@ async def transfer_push(request: Request) -> Response:
                     "path": remote_path, "bytes": len(content_bytes),
                 })
             else:
-                return JSONResponse({"error": "scp_failed", "detail": result}, status_code=502)
+                return JSONResponse(
+                    {"error": _categorize_scp_error(result), "detail": result},
+                    status_code=422,
+                )
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -486,7 +504,10 @@ async def transfer_pull(request: Request) -> Response:
             result = await _SCP_RUN(host, remote_path, tmp_path, upload=False)
             if not result.startswith("[OK]"):
                 Path(tmp_path).unlink(missing_ok=True)
-                return JSONResponse({"error": "scp_failed", "detail": result}, status_code=502)
+                return JSONResponse(
+                    {"error": _categorize_scp_error(result), "detail": result},
+                    status_code=422,
+                )
             if Path(tmp_path).stat().st_size > cfg.max_transfer_size:
                 Path(tmp_path).unlink(missing_ok=True)
                 return JSONResponse(
