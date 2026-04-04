@@ -206,6 +206,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                     cfg.alias,
                     script_content,
                     cfg.shell,
+                    is_local=getattr(cfg, "is_local", False),
                 )
             await create_task_window(
                 effective_task_id,
@@ -215,6 +216,7 @@ def register_fleet_tools(mcp: object, config: MaestroConfig) -> None:
                 sudo=sudo,
                 stream=True,
                 shell=cfg.shell,
+                is_local=getattr(cfg, "is_local", False),
             )
             rc = await wait_for_completion(
                 effective_task_id,

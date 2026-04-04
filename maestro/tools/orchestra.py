@@ -1139,7 +1139,13 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
 
         async def _execute() -> str:
             script_content = f"#!/bin/bash\n{cli_cmd}\n"
-            await stage_script(task_id, host_cfg.alias, script_content, host_cfg.shell)
+            await stage_script(
+                task_id,
+                host_cfg.alias,
+                script_content,
+                host_cfg.shell,
+                is_local=getattr(host_cfg, "is_local", False),
+            )
             output_file = await create_task_window(
                 task_id,
                 host_cfg.alias,
@@ -1147,6 +1153,7 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
                 cwd=working_dir,
                 stream=True,
                 shell=host_cfg.shell,
+                is_local=getattr(host_cfg, "is_local", False),
             )
             rc = await wait_for_completion(task_id, timeout=config.dispatch_ceiling)
 

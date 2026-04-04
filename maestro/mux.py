@@ -103,6 +103,7 @@ def _build_staged_wrapper(
     sudo: bool = False,
     stream: bool = False,
     shell: HostShell = HostShell.BASH,
+    is_local: bool = False,
 ) -> str:
     """Build wrapper that executes a pre-staged script from /tmp/maestro/inbox."""
     output_file = OUTPUT_DIR / f"{task_id}.txt"
@@ -124,7 +125,10 @@ def _build_staged_wrapper(
         remote_parts.append(f"{{ {exec_cmd}; }} > {outbox_out} 2>&1; _RC=$?; echo $_RC > {outbox_rc}; exit $_RC")
     remote_cmd = " && ".join(remote_parts)
 
-    ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
+    if is_local:
+        ssh_cmd = f"bash -c {shlex.quote(remote_cmd)}"
+    else:
+        ssh_cmd = f"ssh {shlex.quote(ssh_alias)} {shlex.quote(remote_cmd)}"
 
     lines = ["#!/bin/bash"]
     if tee:
@@ -142,12 +146,22 @@ async def stage_script(
     ssh_alias: str,
     content: str,
     shell: HostShell = HostShell.BASH,
+    *,
+    is_local: bool = False,
 ) -> None:
     """Write a script to the remote host's /tmp/maestro/inbox via SSH.
 
     Used by dispatch and service to pre-stage their commands before
     triggering execution via create_task_window.
     """
+    if is_local:
+        inbox = Path(f"/tmp/maestro/inbox/{task_id}.sh")
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_text(content, encoding="utf-8")
+        inbox.chmod(0o755)
+        logger.debug("mux: staged script %s locally (%d bytes)", str(inbox), len(content))
+        return
+
     inbox_path = f"/tmp/maestro/inbox/{task_id}.sh"
     if shell == HostShell.POWERSHELL:
         cmd = (
@@ -193,6 +207,7 @@ async def create_task_window(
     sudo: bool = False,
     stream: bool = False,
     shell: HostShell = HostShell.BASH,
+    is_local: bool = False,
 ) -> Path | None:
     """Create a Hub-local tmux window that SSHes to the target host.
 
@@ -208,6 +223,7 @@ async def create_task_window(
         sudo=sudo,
         stream=stream,
         shell=shell,
+        is_local=is_local,
     )
 
     # Write wrapper to temp file and run it in a new tmux window
