@@ -1036,7 +1036,8 @@ def register_orchestra_tools(mcp: object, config: MaestroConfig) -> None:
             approval_flag = f"--approval-mode {shlex.quote(effective_approval)} "
             resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
             return (
-                f"gemini -p {escaped} --output-format json "
+                f"gemini -p {escaped} "
+                f"--include-directories ~/Development/General "
                 f"{model_flag}{approval_flag}{resume_flag}"
                 f"< /dev/null"  # stdin EOF: prevents readStdin() hang in non-TTY
             )
