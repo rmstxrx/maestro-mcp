@@ -1,4 +1,27 @@
-# STATE.md — maestro-mcp
+# DORMANT — Maestro v1 (maestro-mcp) superseded by Maestro v2
+
+> **This repo is the archived v1 of the Maestro orchestrator. Active
+> development has moved to `~/Development/maestro/` (v2).**
+>
+> Dormant as of: 2026-04-14.
+
+## Where development moved
+
+| Asset | Current home |
+|-------|--------------|
+| Active Maestro source | `~/Development/maestro/` (v2 — see its STATE.md) |
+| Production deployment | Cellar, container `maestro-v2`, port 8222, tunnel `maestro.rmstxrx.dev` |
+| Deploy repo on Cellar | `/volume2/docker/maestro-v2/repo/` |
+| v1 container | Archived, not running |
+
+The content below describes maestro-mcp (v1) as of 2026-04-01. Preserved for
+reference — the 11-tool surface, decision trees, and ADR-0009 design still
+read as a coherent snapshot of v1's operating model, and some of it carried
+forward into v2. Do not develop against this repo.
+
+---
+
+# STATE.md — maestro-mcp (v1, historical)
 
 **Last Updated:** 2026-04-01
 

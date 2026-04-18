@@ -1,4 +1,16 @@
-# Maestro MCP — Developer Guide
+# DORMANT — Maestro v1 (maestro-mcp) superseded by Maestro v2
+
+> **This repo is the archived v1 of the Maestro orchestrator. Active
+> development happens in `~/Development/maestro/` (v2). Do not develop here.**
+>
+> Dormant as of: 2026-04-14.
+
+See `STATE.md` for the v1→v2 migration pointers. The guide below is preserved
+for reference — much of the v1 design carried forward into v2 unchanged.
+
+---
+
+# Maestro MCP — Developer Guide (v1, historical)
 
 Maestro is a multi-host machine fleet orchestration layer and AI agent orchestra, exposed via the Model Context Protocol (MCP). It runs inside a Docker container on Cellar and uses Hub-local tmux for all task execution and tracking.
 
